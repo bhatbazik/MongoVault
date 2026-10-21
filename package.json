@@ -1,0 +1,54 @@
+{
+  "name": "mongodb-backup-service",
+  "version": "1.0.0",
+  "description": "Production MongoDB backup daemon with S3/R2 streaming, client-side encryption, automated restore drills, and Prometheus metrics",
+  "main": "src/index.js",
+  "bin": {
+    "mongodb-backup": "./src/index.js"
+  },
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js daemon",
+    "backup": "node src/index.js backup",
+    "restore": "node src/index.js restore",
+    "verify": "node src/index.js verify",
+    "list": "node src/index.js list",
+    "prune": "node src/index.js prune",
+    "drill": "node src/index.js drill",
+    "key:generate": "node src/index.js key:generate",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": [
+    "mongodb",
+    "backup",
+    "restore",
+    "s3",
+    "r2",
+    "cloudflare-r2",
+    "encryption",
+    "prometheus",
+    "streaming"
+  ],
+  "author": "bhatbazik",
+  "license": "MIT",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1114.0",
+    "@aws-sdk/lib-storage": "^3.1114.0",
+    "dotenv": "^17.4.2",
+    "mongodb": "^7.7.0",
+    "node-cron": "^4.6.0",
+    "nodemailer": "^9.0.5",
+    "pino": "^10.4.0",
+    "prom-client": "^15.1.3",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.13.0",
+    "globals": "^17.13.0",
+    "pino-pretty": "^13.2.0",
+    "prettier": "^3.9.10",
+    "vitest": "^5.0.5"
+  }
+}
