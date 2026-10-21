@@ -1,0 +1,78 @@
+import { listBackups, manifestKey, scopeOf } from "./catalog.js";
+
+const ORPHAN_AGE_MS = 60 * 60 * 1000;
+
+const PERIODS = {
+  keepDaily: ({ year, month, day }) => `${year}-${month}-${day}`,
+  keepWeekly: isoWeek,
+  keepMonthly: ({ year, month }) => `${year}-${month}`,
+};
+
+export function planRetention(backups, policy, timeZone) {
+  const sorted = [...backups].sort((a, b) => b.createdAt - a.createdAt);
+  const keep = new Set(sorted.slice(0, Math.max(policy.keepLast ?? 0, 1)).map((b) => b.key));
+
+  for (const [rule, period] of Object.entries(PERIODS)) {
+    const limit = policy[rule] ?? 0;
+    const seen = new Set();
+    for (const backup of sorted) {
+      if (seen.size >= limit) break;
+      const bucket = period(zonedDate(backup.createdAt, timeZone));
+      if (!seen.has(bucket)) {
+        seen.add(bucket);
+        keep.add(backup.key);
+      }
+    }
+  }
+
+  return {
+    keep: sorted.filter((backup) => keep.has(backup.key)),
+    remove: sorted.filter((backup) => !keep.has(backup.key)),
+  };
+}
+
+export async function prune({ config, storage, logger }, { dryRun = false, now = Date.now() } = {}) {
+  if (!config.retention) {
+    throw new Error("No retention policy configured. Set one of the RETENTION_KEEP_* variables.");
+  }
+
+  const backups = await listBackups(storage, scopeOf(config));
+  const { keep, remove } = planRetention(
+    backups.filter((backup) => backup.complete),
+    config.retention,
+    config.schedule.timezone,
+  );
+  const orphans = backups.filter((b) => !b.complete && now - b.createdAt > ORPHAN_AGE_MS);
+  const targets = [...remove, ...orphans];
+
+  if (!dryRun) {
+    for (const backup of targets) {
+      await storage.remove(manifestKey(backup.key));
+      await storage.remove(backup.key);
+      logger.debug({ key: backup.key }, "Removed backup");
+    }
+  }
+
+  logger.info({ kept: keep.length, removed: targets.length, dryRun }, "Retention policy applied");
+  return { keep, remove: targets };
+}
+
+function zonedDate(date, timeZone) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(date);
+  const value = (type) => parts.find((part) => part.type === type).value;
+  return { year: value("year"), month: value("month"), day: value("day") };
+}
+
+function isoWeek({ year, month, day }) {
+  const date = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)));
+  const weekday = date.getUTCDay() || 7;
+  date.setUTCDate(date.getUTCDate() + 4 - weekday);
+  const weekYear = date.getUTCFullYear();
+  const week = Math.ceil(((date - Date.UTC(weekYear, 0, 1)) / 86_400_000 + 1) / 7);
+  return `${weekYear}-W${String(week).padStart(2, "0")}`;
+}
