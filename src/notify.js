@@ -1,0 +1,132 @@
+import nodemailer from "nodemailer";
+import { formatBytes, formatDuration } from "./format.js";
+
+export function createNotifier(config, logger) {
+  const { notifications } = config;
+
+  const mailer = notifications.email
+    ? nodemailer.createTransport({
+        host: notifications.email.host,
+        port: notifications.email.port,
+        secure: notifications.email.secure,
+        auth:
+          notifications.email.user && notifications.email.password
+            ? {
+                user: notifications.email.user,
+                pass: notifications.email.password,
+              }
+            : undefined,
+      })
+    : null;
+
+  async function sendEmail({ subject, text }) {
+    if (!mailer || !notifications.email) return;
+    try {
+      await mailer.sendMail({
+        from: notifications.email.from,
+        to: notifications.email.to.join(", "),
+        subject,
+        text,
+      });
+    } catch (error) {
+      logger.error({ err: error }, "Failed to send email notification");
+    }
+  }
+
+  async function postJson(url, payload) {
+    if (!url) return;
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) {
+        logger.warn({ status: response.status, url }, "Webhook notification returned non-2xx status");
+      }
+    } catch (error) {
+      logger.error({ err: error, url }, "Failed to deliver webhook notification");
+    }
+  }
+
+  async function pingHeartbeat(ok, message) {
+    if (!notifications.heartbeatUrl) return;
+    try {
+      const target = ok
+        ? notifications.heartbeatUrl
+        : `${notifications.heartbeatUrl.replace(/\/+$/, "")}/fail`;
+      await fetch(target, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain" },
+        body: message ?? (ok ? "ok" : "failed"),
+      });
+    } catch (error) {
+      logger.error({ err: error }, "Failed to ping heartbeat endpoint");
+    }
+  }
+
+  return {
+    async notifySuccess(event, data) {
+      await pingHeartbeat(true, `${event} succeeded`);
+
+      if (!notifications.onSuccess) return;
+
+      const title = `MongoDB Backup Successful: ${data.database}`;
+      const summary = [
+        `Event: ${event}`,
+        `Database: ${data.database}`,
+        `Archive: ${data.key}`,
+        `Size: ${formatBytes(data.size)}`,
+        `Duration: ${formatDuration(data.durationMs)}`,
+        `Collections: ${Object.keys(data.collections || {}).length}`,
+        `SHA-256: ${data.sha256}`,
+        `Encrypted: ${Boolean(data.encryption)}`,
+      ].join("\n");
+
+      await Promise.allSettled([
+        sendEmail({ subject: title, text: summary }),
+        notifications.slackWebhookUrl
+          ? postJson(notifications.slackWebhookUrl, {
+              text: `*${title}*\n\`\`\`${summary}\`\`\``,
+            })
+          : Promise.resolve(),
+        notifications.webhookUrl
+          ? postJson(notifications.webhookUrl, {
+              event,
+              status: "success",
+              data,
+            })
+          : Promise.resolve(),
+      ]);
+    },
+
+    async notifyFailure(event, error, context = {}) {
+      await pingHeartbeat(false, error.message);
+
+      const title = `MongoDB Backup Failed: ${context.database || config.mongo.database}`;
+      const summary = [
+        `Event: ${event}`,
+        `Database: ${context.database || config.mongo.database}`,
+        `Error: ${error.message}`,
+        error.stack ? `\nStack:\n${error.stack}` : "",
+      ].join("\n");
+
+      await Promise.allSettled([
+        sendEmail({ subject: title, text: summary }),
+        notifications.slackWebhookUrl
+          ? postJson(notifications.slackWebhookUrl, {
+              text: `*${title}*\n\`\`\`${summary}\`\`\``,
+            })
+          : Promise.resolve(),
+        notifications.webhookUrl
+          ? postJson(notifications.webhookUrl, {
+              event,
+              status: "failure",
+              error: error.message,
+              context,
+            })
+          : Promise.resolve(),
+      ]);
+    },
+  };
+}
