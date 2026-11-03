@@ -1,15 +1,20 @@
 export const MANIFEST_SUFFIX = ".manifest.json";
-export const MANIFEST_VERSION = 1;
+export const MANIFEST_VERSION = 2;
 
 const ARCHIVE = /\.archive\.gz(\.enc)?$/;
 const STAMP = /(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z\.archive/;
+
+export function isClusterScope(database) {
+  return !database || database === "*" || database === "all";
+}
 
 export function scopeOf(config) {
   return { prefix: config.storage.prefix, database: config.mongo.database };
 }
 
 export function databasePrefix({ prefix, database }) {
-  return `${[prefix, database].filter(Boolean).join("/")}/`;
+  const target = isClusterScope(database) ? "_cluster" : database;
+  return `${[prefix, target].filter(Boolean).join("/")}/`;
 }
 
 export function archiveKey(scope, date, { encrypted }) {
