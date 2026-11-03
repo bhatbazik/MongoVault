@@ -45,11 +45,19 @@ export async function prune({ config, storage, logger }, { dryRun = false, now =
   const orphans = backups.filter((b) => !b.complete && now - b.createdAt > ORPHAN_AGE_MS);
   const targets = [...remove, ...orphans];
 
-  if (!dryRun) {
+  if (!dryRun && targets.length > 0) {
+    const keysToDelete = [];
     for (const backup of targets) {
-      await storage.remove(manifestKey(backup.key));
-      await storage.remove(backup.key);
-      logger.debug({ key: backup.key }, "Removed backup");
+      keysToDelete.push(manifestKey(backup.key), backup.key);
+      logger.debug({ key: backup.key }, "Marked backup for deletion");
+    }
+
+    if (typeof storage.removeMany === "function") {
+      await storage.removeMany(keysToDelete);
+    } else {
+      for (const key of keysToDelete) {
+        await storage.remove(key);
+      }
     }
   }
 

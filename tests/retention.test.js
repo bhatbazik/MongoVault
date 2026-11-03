@@ -1,5 +1,6 @@
+import pino from "pino";
 import { describe, expect, it } from "vitest";
-import { planRetention } from "../src/retention.js";
+import { planRetention, prune } from "../src/retention.js";
 
 describe("retention", () => {
   function makeBackup(iso) {
@@ -44,5 +45,35 @@ describe("retention", () => {
     );
 
     expect(plan.remove.map((b) => b.createdAt.toISOString())).toContain("2026-03-01T02:00:00.000Z");
+  });
+
+  it("uses batch deletion (removeMany) during prune execution", async () => {
+    const deletedKeys = [];
+    const mockStorage = {
+      async *list() {
+        yield { key: "mongodb/prod/2026-03-01/20260301T000000Z.archive.gz", size: 100 };
+        yield { key: "mongodb/prod/2026-03-01/20260301T000000Z.archive.gz.manifest.json", size: 10 };
+        yield { key: "mongodb/prod/2026-03-02/20260302T000000Z.archive.gz", size: 100 };
+        yield { key: "mongodb/prod/2026-03-02/20260302T000000Z.archive.gz.manifest.json", size: 10 };
+      },
+      async removeMany(keys) {
+        deletedKeys.push(...keys);
+      },
+    };
+
+    const config = {
+      mongo: { database: "prod" },
+      storage: { prefix: "mongodb" },
+      schedule: { timezone: "UTC" },
+      retention: { keepLast: 1 },
+    };
+
+    const logger = pino({ level: "silent" });
+    const result = await prune({ config, storage: mockStorage, logger });
+
+    expect(result.keep).toHaveLength(1);
+    expect(result.remove).toHaveLength(1);
+    expect(deletedKeys).toContain("mongodb/prod/2026-03-01/20260301T000000Z.archive.gz");
+    expect(deletedKeys).toContain("mongodb/prod/2026-03-01/20260301T000000Z.archive.gz.manifest.json");
   });
 });
