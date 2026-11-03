@@ -94,7 +94,7 @@ describe("backup and restore pipeline", () => {
     };
   }
 
-  it("runs unencrypted backup, verifies, and restores successfully", async () => {
+  it("runs unencrypted backup, verifies, and restores successfully with zero disk", async () => {
     const rawGzip = gzipSync(Buffer.from("dummy-mongodb-archive-payload"));
     const { tools, getCapturedRestore } = createMockTools(rawGzip);
 
@@ -121,6 +121,10 @@ describe("backup and restore pipeline", () => {
     );
     expect(restored.restored).toBe(15);
     expect(getCapturedRestore()).toEqual(rawGzip);
+
+    // Verify zero temporary files left on disk
+    const files = await fs.readdir(tmpDir);
+    expect(files).toHaveLength(0);
   });
 
   it("runs client-side encrypted backup and verifies/restores with key", async () => {
@@ -150,6 +154,10 @@ describe("backup and restore pipeline", () => {
     );
     expect(restored.restored).toBe(15);
     expect(getCapturedRestore()).toEqual(rawGzip);
+
+    // Verify zero temporary files left on disk
+    const files = await fs.readdir(tmpDir);
+    expect(files).toHaveLength(0);
   });
 
   it("fails verification if object data is corrupted in storage", async () => {
@@ -190,5 +198,35 @@ describe("backup and restore pipeline", () => {
 
     const manifest = await runBackup({ config, storage: mockStorage, logger, tools });
     expect(manifest.oplog).toBe(true);
+  });
+
+  it("supports cluster-wide backup when database is *", async () => {
+    const rawGzip = gzipSync(Buffer.from("cluster-payload"));
+    const mockDump = async () => ({
+      stdout: Readable.from(rawGzip),
+      done: Promise.resolve({
+        collections: { "db1.users": 100, "db2.orders": 200 },
+      }),
+    });
+
+    const config = {
+      mongo: { uri: "mongodb://localhost", database: "*", excludeCollections: [] },
+      storage: { prefix: "backups" },
+      workDir: tmpDir,
+      timeoutMs: 5000,
+      encryptionKey: null,
+      schedule: { timezone: "UTC" },
+    };
+
+    const manifest = await runBackup({
+      config,
+      storage: mockStorage,
+      logger,
+      tools: { mongodump: mockDump },
+    });
+
+    expect(manifest.key).toContain("backups/_cluster/");
+    expect(manifest.collections["db1.users"]).toBe(100);
+    expect(manifest.collections["db2.orders"]).toBe(200);
   });
 });

@@ -44,8 +44,9 @@ export async function runBackup({ config, storage, logger, signal, tools = { mon
     ]);
 
     if (Object.keys(collections).length === 0) {
-      throw new Error(
-        `mongodump did not dump any collections. Check that database "${config.mongo.database}" exists.`,
+      log.warn(
+        { database: config.mongo.database },
+        "mongodump completed with 0 collections (empty database or collections had 0 documents)",
       );
     }
 
