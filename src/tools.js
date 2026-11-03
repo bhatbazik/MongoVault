@@ -7,17 +7,32 @@ import { formatDuration } from "./format.js";
 
 const KILL_GRACE_MS = 10_000;
 const TAIL_LINES = 40;
-const DUMPED = /done dumping ([^.\s]+)\.(\S+) \((\d+) documents?\)/;
-const RESTORED = /(\d+) document\(s\) restored successfully\. (\d+) document\(s\) failed to restore/;
+const DUMPED = /(?:done dumping|dumped)\s+["']?([^.\s"']+)["']?\.["']?(\S+?)["']?\s+\(([\d,]+)\s+documents?\)/i;
+const RESTORED = /([\d,]+)\s+document\(s\)\s+restored\s+successfully\.\s+([\d,]+)\s+document\(s\)\s+failed/i;
+
+export function isClusterDatabase(database) {
+  return !database || database === "*" || database === "all";
+}
 
 export function parseDumpLine(line) {
   const match = DUMPED.exec(line);
-  return match ? { database: match[1], collection: match[2], documents: Number(match[3]) } : null;
+  return match
+    ? {
+        database: match[1],
+        collection: match[2],
+        documents: Number(match[3].replace(/,/g, "")),
+      }
+    : null;
 }
 
 export function parseRestoreLine(line) {
   const match = RESTORED.exec(line);
-  return match ? { restored: Number(match[1]), failed: Number(match[2]) } : null;
+  return match
+    ? {
+        restored: Number(match[1].replace(/,/g, "")),
+        failed: Number(match[2].replace(/,/g, "")),
+      }
+    : null;
 }
 
 export function runTool(command, args, { stdio, signal, timeoutMs, onLine = () => {} }) {
@@ -92,7 +107,7 @@ export async function mongodump({
   const configFile = await writeUriConfig(workDir, uri);
   const args = [`--config=${configFile}`];
 
-  if (database && database !== "*" && database !== "all") {
+  if (!isClusterDatabase(database)) {
     args.push(`--db=${database}`);
   }
   for (const name of excludeCollections) {
@@ -115,7 +130,12 @@ export async function mongodump({
     onLine: (line) => {
       logger?.debug({ tool: "mongodump" }, line);
       const dumped = parseDumpLine(line);
-      if (dumped) collections[dumped.collection] = dumped.documents;
+      if (dumped) {
+        const key = isClusterDatabase(database)
+          ? `${dumped.database}.${dumped.collection}`
+          : dumped.collection;
+        collections[key] = dumped.documents;
+      }
     },
   });
 
