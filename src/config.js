@@ -41,7 +41,7 @@ const timezone = z.string().refine(
 const schema = z
   .object({
     MONGODB_URI: z.string().min(1),
-    MONGODB_DATABASE: z.string().min(1),
+    MONGODB_DATABASE: z.string().default("*"),
     MONGODB_EXCLUDE_COLLECTIONS: list,
     MONGODB_OPLOG: flag(false),
     MONGODB_PARALLEL_COLLECTIONS: z.coerce.number().int().min(1).max(32).default(2),
@@ -49,7 +49,7 @@ const schema = z
     S3_BUCKET: z.string().min(1),
     S3_ACCESS_KEY_ID: z.string().min(1),
     S3_SECRET_ACCESS_KEY: z.string().min(1),
-    S3_ENDPOINT: z.url().optional(),
+    S3_ENDPOINT: z.string().url().optional(),
     S3_REGION: z.string().optional(),
     S3_FORCE_PATH_STYLE: flag(false),
     S3_PREFIX: z.string().default("mongodb"),
@@ -81,22 +81,15 @@ const schema = z
     SMTP_FROM: z.string().optional(),
     SMTP_TO: list,
 
-    SLACK_WEBHOOK_URL: z.url().optional(),
-    WEBHOOK_URL: z.url().optional(),
-    HEARTBEAT_URL: z.url().optional(),
+    SLACK_WEBHOOK_URL: z.string().url().optional(),
+    WEBHOOK_URL: z.string().url().optional(),
+    HEARTBEAT_URL: z.string().url().optional(),
     NOTIFY_ON_SUCCESS: flag(true),
 
     HTTP_PORT: z.coerce.number().int().min(0).max(65535).default(8080),
     LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace"]).default("info"),
   })
   .superRefine((env, ctx) => {
-    if (!env.S3_ENDPOINT && !env.R2_ACCOUNT_ID) {
-      ctx.addIssue({
-        code: "custom",
-        path: ["S3_ENDPOINT"],
-        message: "Set S3_ENDPOINT or R2_ACCOUNT_ID",
-      });
-    }
     if (env.SMTP_HOST && (!env.SMTP_FROM || env.SMTP_TO.length === 0)) {
       ctx.addIssue({
         code: "custom",
@@ -149,6 +142,11 @@ function toConfig(env) {
   };
   const retentionEnabled = Object.values(retention).some((value) => value > 0);
 
+  let endpoint = env.S3_ENDPOINT;
+  if (!endpoint && env.R2_ACCOUNT_ID) {
+    endpoint = `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
+  }
+
   return {
     mongo: {
       uri: env.MONGODB_URI,
@@ -159,8 +157,8 @@ function toConfig(env) {
     },
     storage: {
       bucket: env.S3_BUCKET,
-      endpoint: env.S3_ENDPOINT ?? `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
-      region: env.S3_REGION ?? (env.R2_ACCOUNT_ID ? "auto" : "us-east-1"),
+      endpoint,
+      region: env.S3_REGION ?? (env.R2_ACCOUNT_ID ? "auto" : (process.env.AWS_REGION || "us-east-1")),
       forcePathStyle: env.S3_FORCE_PATH_STYLE,
       accessKeyId: env.S3_ACCESS_KEY_ID,
       secretAccessKey: env.S3_SECRET_ACCESS_KEY,

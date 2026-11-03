@@ -25,6 +25,20 @@ describe("config", () => {
     expect(config.encryptionKey).toBeNull();
   });
 
+  it("loads native AWS S3 configuration without S3_ENDPOINT or R2_ACCOUNT_ID", () => {
+    const { S3_ENDPOINT, ...nativeAwsEnv } = minimalValidEnv;
+    const config = loadConfig({ ...nativeAwsEnv, S3_REGION: "eu-west-2" });
+    expect(config.storage.endpoint).toBeUndefined();
+    expect(config.storage.region).toBe("eu-west-2");
+    expect(config.storage.bucket).toBe("my-bucket");
+  });
+
+  it("defaults MONGODB_DATABASE to * for cluster-wide backup when omitted", () => {
+    const { MONGODB_DATABASE, ...clusterEnv } = minimalValidEnv;
+    const config = loadConfig(clusterEnv);
+    expect(config.mongo.database).toBe("*");
+  });
+
   it("supports Cloudflare R2 endpoint derivation from account ID", () => {
     const { S3_ENDPOINT, ...rest } = minimalValidEnv;
     const config = loadConfig({ ...rest, R2_ACCOUNT_ID: "acct123" });
