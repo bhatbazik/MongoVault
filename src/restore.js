@@ -1,12 +1,8 @@
-import { randomUUID } from "node:crypto";
-import { createReadStream, createWriteStream } from "node:fs";
-import fs from "node:fs/promises";
-import path from "node:path";
 import { Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createGunzip } from "node:zlib";
 import { linkedController, settleAll } from "./abort.js";
-import { readManifest, resolveBackup, scopeOf } from "./catalog.js";
+import { isClusterScope, readManifest, resolveBackup, scopeOf } from "./catalog.js";
 import { createDecryptor } from "./crypto.js";
 import { DigestStream } from "./digest.js";
 import { mongorestore } from "./tools.js";
@@ -96,54 +92,52 @@ export async function restoreBackup(
   const source = manifest?.database ?? config.mongo.database;
   const target = database ?? source;
   const shouldReplayOplog = oplogReplay ?? Boolean(manifest?.oplog);
-  const file = path.join(config.workDir, `restore-${randomUUID()}.tmp`);
+  const isCluster = isClusterScope(source);
 
   if (!checksum) log.warn("Backup has no checksum; restoring without an integrity check");
-  await fs.mkdir(config.workDir, { recursive: true });
 
+  const controller = linkedController(signal);
   try {
-    log.info("Downloading backup");
+    const restore = await tools.mongorestore({
+      uri,
+      workDir: config.workDir,
+      nsInclude: isCluster || target === source ? undefined : `${source}.*`,
+      nsFrom: isCluster || target === source ? undefined : `${source}.*`,
+      nsTo: isCluster || target === source ? undefined : `${target}.*`,
+      drop,
+      oplogReplay: shouldReplayOplog,
+      oplogLimit,
+      parallelCollections: parallelCollections ?? config.mongo.parallelCollections,
+      timeoutMs: config.timeoutMs,
+      signal: controller.signal,
+      logger: log,
+    });
+
+    log.info({ source, target, drop }, "Streaming restore pipeline from storage (zero-disk)");
     const digest = new DigestStream();
-    await pipeline(
-      await storage.download(key, { signal }),
-      digest,
-      createWriteStream(file, { mode: 0o600 }),
-      { signal },
-    );
+    const downloadStream = await storage.download(key, { signal: controller.signal });
+
+    const [summary] = await settleAll(controller, [
+      restore.done,
+      pipeline(
+        downloadStream,
+        digest,
+        ...decryptStage(config, manifest),
+        restore.stdin,
+        { signal: controller.signal },
+      ),
+    ]);
+
     assertChecksum(key, checksum, digest.digest());
-    log.info({ size: digest.bytes }, "Download verified");
-
-    const controller = linkedController(signal);
-    try {
-      const restore = await tools.mongorestore({
-        uri,
-        workDir: config.workDir,
-        nsInclude: target === source ? undefined : `${source}.*`,
-        nsFrom: target === source ? undefined : `${source}.*`,
-        nsTo: target === source ? undefined : `${target}.*`,
-        drop,
-        oplogReplay: shouldReplayOplog,
-        oplogLimit,
-        parallelCollections: parallelCollections ?? config.mongo.parallelCollections,
-        timeoutMs: config.timeoutMs,
-        signal: controller.signal,
-        logger: log,
-      });
-
-      log.info({ source, target, drop }, "Restoring");
-      const [summary] = await settleAll(controller, [
-        restore.done,
-        pipeline(createReadStream(file), ...decryptStage(config, manifest), restore.stdin, {
-          signal: controller.signal,
-        }),
-      ]);
-
-      log.info({ restored: summary.restored, target }, "Restore completed");
-      return { key, source, target, restored: summary.restored, manifest };
-    } finally {
-      controller.dispose();
+    if (manifest && manifest.size !== digest.bytes) {
+      throw new IntegrityError(
+        `Size mismatch for ${key}: expected ${manifest.size}, got ${digest.bytes}`,
+      );
     }
+
+    log.info({ restored: summary.restored, target }, "Restore completed");
+    return { key, source, target, restored: summary.restored, manifest };
   } finally {
-    await fs.rm(file, { force: true });
+    controller.dispose();
   }
 }
