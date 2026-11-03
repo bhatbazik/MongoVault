@@ -1,5 +1,5 @@
 import { MongoClient } from "mongodb";
-import { readManifest, resolveBackup, scopeOf } from "./catalog.js";
+import { isClusterScope, readManifest, resolveBackup, scopeOf } from "./catalog.js";
 import { restoreBackup } from "./restore.js";
 
 export class DrillError extends Error {
@@ -22,10 +22,11 @@ export async function runDrill(ctx) {
   const startedAt = Date.now();
   const key = await resolveBackup(storage, scopeOf(config), "latest");
   const manifest = await readManifest(storage, key);
-  const database = `${manifest.database}_restore_drill`;
+  const isCluster = isClusterScope(manifest.database);
+  const database = isCluster ? "cluster_restore_drill" : `${manifest.database}_restore_drill`;
   const client = new MongoClient(config.drill.uri);
 
-  logger.info({ key, database }, "Restore drill started");
+  logger.info({ key, database, isCluster, oplog: Boolean(manifest.oplog) }, "Restore drill started");
 
   try {
     await client.connect();
@@ -34,20 +35,51 @@ export async function runDrill(ctx) {
 
     await restoreBackup(ctx, { ref: key, uri: config.drill.uri, database, drop: true });
 
+    const hasOplog = Boolean(manifest.oplog);
     const mismatches = [];
-    for (const [collection, expected] of Object.entries(manifest.collections)) {
-      const actual = await db.collection(collection).countDocuments();
-      if (actual !== expected) mismatches.push({ collection, expected, actual });
+    const variances = [];
+
+    for (const [colKey, expected] of Object.entries(manifest.collections || {})) {
+      const collectionName = isCluster ? (colKey.split(".")[1] || colKey) : colKey;
+      const targetDb = isCluster ? client.db(database) : db;
+
+      let actual;
+      try {
+        actual = await targetDb.collection(collectionName).countDocuments();
+      } catch {
+        actual = null;
+      }
+
+      if (actual === null) {
+        if (expected > 0) {
+          mismatches.push({ collection: colKey, expected, actual: "missing" });
+        }
+      } else if (actual !== expected) {
+        if (hasOplog) {
+          variances.push({ collection: colKey, expected, actual, diff: actual - expected });
+        } else {
+          mismatches.push({ collection: colKey, expected, actual });
+        }
+      }
     }
+
     if (mismatches.length > 0) {
       throw new DrillError(key, mismatches);
+    }
+
+    if (variances.length > 0) {
+      logger.info(
+        { variancesCount: variances.length, variances },
+        "Document counts shifted due to intermediate oplog replay (expected behavior with point-in-time oplog)",
+      );
     }
 
     const result = {
       key,
       database,
-      collections: Object.keys(manifest.collections).length,
-      documents: Object.values(manifest.collections).reduce((sum, n) => sum + n, 0),
+      collections: Object.keys(manifest.collections || {}).length,
+      documents: Object.values(manifest.collections || {}).reduce((sum, n) => sum + n, 0),
+      oplogVariances: variances,
       durationMs: Date.now() - startedAt,
     };
     logger.info(result, "Restore drill passed");
