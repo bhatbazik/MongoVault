@@ -38,13 +38,16 @@ A streaming MongoDB backup daemon and CLI tool with S3/Cloudflare R2 multipart u
 
 ### Highlights
 
-- **Zero-disk streaming pipeline:** Streams `mongodump` archive output directly into S3 multipart uploads through an in-flight hashing and encryption pipeline via Node.js backpressured streams. A 50 GB database requires 0 bytes of temporary disk space.
-- **Client-side envelope encryption:** Archives are encrypted with a unique per-backup data key using AES-256-GCM, wrapped by a master key and stored inside an authenticated sidecar manifest.
-- **Automated restore drills:** Periodically restores the latest backup to an isolated staging or throwaway database, compares collection-by-collection document counts against backup-time stats, and alerts on discrepancies.
-- **Grandfather-Father-Son (GFS) retention:** Automated pruning supports `keep-last`, `keep-daily`, `keep-weekly`, and `keep-monthly` policies natively without relying solely on cloud bucket lifecycle rules.
-- **Integrity verification:** Performs full SHA-256 metadata round-trip checks and stream decompression verification without writing archives to disk.
-- **Process security & isolation:** Passes connection credentials to child processes through temporary file descriptors (`mode 0600`) to avoid leaking connection strings in `ps aux`.
-- **Prometheus & dead-man's switch:** Exposes standard `/metrics` and `/healthz` HTTP endpoints and pings dead-man's switch services (e.g. Healthchecks.io) to catch silent daemon crashes.
+- **Zero-disk streaming pipeline (Backup & Restore):** Streams `mongodump` archive output directly into S3 multipart uploads and streams downloads directly into `mongorestore` stdin through in-flight hashing and encryption transforms. A 100 GB database requires 0 bytes of temporary disk space during both backup and restore.
+- **Chunked AEAD Envelope Encryption (`aes-256-gcm-chunked`):** Archives are encrypted in 64 KB frames, each with an independent nonce and 128-bit authentication tag. Tampering, corruption, or stream truncation is detected immediately at the corrupted frame, aborting before corrupt data reaches the restore target. Backward-compatible with legacy single-block AES-GCM.
+- **Cluster-Wide & Multi-Database Backups:** Back up entire clusters (`MONGODB_DATABASE=*`) or individual databases. Collections are automatically namespaced (`database.collection`) to avoid collisions.
+- **Distributed S3 & Atomic Local Locking:** Hybrid lease locking coordinates multiple daemon instances across Kubernetes pods or Docker containers via S3 object leases with automatic heartbeat renewal, while atomic POSIX rename prevents local TOCTOU race conditions.
+- **High-Throughput Batch Pruning:** Prunes retention targets using S3 `DeleteObjectsCommand` batch requests (up to 1,000 objects per API call) instead of sequential deletes.
+- **Automated Restore Drills:** Periodically restores the latest backup to an isolated staging database, verifies collection accessibility, and accounts for point-in-time oplog write shifts to eliminate false alarms.
+- **Native AWS S3, Cloudflare R2, & MinIO:** Works out-of-the-box with AWS S3 regional endpoints, Cloudflare R2, or MinIO.
+- **Grandfather-Father-Son (GFS) Retention:** Automated pruning supports `keep-last`, `keep-daily`, `keep-weekly`, and `keep-monthly` policies natively without relying solely on cloud bucket lifecycle rules.
+- **Process Security & Isolation:** Passes connection credentials to child processes through temporary file descriptors (`mode 0600`) to avoid leaking connection strings in `ps aux`.
+- **Prometheus & Dead-Man's Switch:** Exposes standard `/metrics` and `/healthz` HTTP endpoints and pings dead-man's switch services (e.g. Healthchecks.io) to catch silent daemon crashes.
 
 ---
 
@@ -290,9 +293,9 @@ Each archive is accompanied by an authenticated JSON manifest written upon succe
 
 Backing up multi-gigabyte or 100 GB+ databases on small VPS hosts (e.g. 1 vCPU, 1 GB RAM, 10 GB disk) requires deliberate resource boundaries:
 
-1. **Zero Temporary Disk Usage:**
-   - Traditional backup scripts buffer dumps to `/tmp` before uploading. A 100 GB database on a 20 GB disk will crash with `ENOSPC`.
-   - `mongodb-backup-service` pipes `mongodump` stdout directly through in-memory cryptographic and hashing transforms straight into S3/R2 multipart uploads without touching local disk.
+1. **Zero Temporary Disk Usage (Backup & Restore):**
+   - Traditional backup scripts buffer dumps or restore archives to `/tmp`. A 100 GB database on a 20 GB disk will crash with `ENOSPC`.
+   - `mongodb-backup-service` pipes `mongodump` stdout directly through in-memory cryptographic and hashing transforms straight into S3/R2 multipart uploads without touching local disk. During restore, it streams directly from S3 through chunk-authenticated decryptors into `mongorestore` stdin with 0 bytes saved to disk.
 
 2. **Strict Stream Backpressure (`highWaterMark`):**
    - If `mongodump` produces data faster than your network uplink can send it, Node.js streams buffer data in heap memory.
