@@ -118,6 +118,7 @@ export async function runCli(config, argv = process.argv.slice(2)) {
         ...config,
         mongo: {
           ...config.mongo,
+          database: values.database || config.mongo.database,
           oplog: values.oplog || config.mongo.oplog,
           parallelCollections: values.parallel
             ? Number(values.parallel)

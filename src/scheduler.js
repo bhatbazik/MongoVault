@@ -1,12 +1,14 @@
 import path from "node:path";
 import cron from "node-cron";
 import { runBackup } from "./backup.js";
+import { databasePrefix, scopeOf } from "./catalog.js";
 import { runDrill } from "./drill.js";
-import { acquireLock } from "./lock.js";
+import { acquireHybridLock } from "./lock.js";
 import { prune } from "./retention.js";
 
 export function createScheduler({ config, storage, logger, notifier, metrics }) {
   const lockFile = path.join(config.workDir, ".backup.lock");
+  const distLockKey = `${databasePrefix(scopeOf(config))}.locks/backup.lock.json`;
   let activeBackupPromise = null;
   let activeAbortController = null;
   let isShuttingDown = false;
@@ -23,9 +25,16 @@ export function createScheduler({ config, storage, logger, notifier, metrics }) 
   async function executeBackup() {
     if (isShuttingDown) return;
 
-    const release = await acquireLock(lockFile, { staleAfterMs: config.timeoutMs + 60_000 });
+    const release = await acquireHybridLock({
+      file: lockFile,
+      storage,
+      lockKey: distLockKey,
+      staleAfterMs: config.timeoutMs + 60_000,
+      logger,
+    });
+
     if (!release) {
-      logger.warn("Skipping backup: another process holds the lock");
+      logger.warn("Skipping backup: another process holds the local or distributed lock");
       return;
     }
 
