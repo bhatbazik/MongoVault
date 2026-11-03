@@ -1,8 +1,10 @@
 import { Buffer } from "node:buffer";
+import { createCipheriv, randomBytes } from "node:crypto";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { describe, expect, it } from "vitest";
 import {
+  CHUNKED_ALGORITHM,
   createDecryptor,
   createEncryptor,
   generateKey,
@@ -27,7 +29,7 @@ describe("crypto", () => {
     expect(() => parseKey("short")).toThrow("Encryption key must be 32 bytes");
   });
 
-  it("encrypts and decrypts stream payloads with envelope metadata", async () => {
+  it("encrypts and decrypts stream payloads with chunked AEAD frames", async () => {
     const masterKey = parseKey(generateKey());
     const payload = Buffer.from("Lorem ipsum dolor sit amet, secret mongo database content");
 
@@ -47,7 +49,8 @@ describe("crypto", () => {
 
     const envelope = encryptor.envelope();
     expect(envelope.keyId).toBe(keyId(masterKey));
-    expect(envelope.algorithm).toBe("aes-256-gcm");
+    expect(envelope.algorithm).toBe(CHUNKED_ALGORITHM);
+    expect(envelope.chunkSize).toBe(64 * 1024);
 
     const decipher = createDecryptor(masterKey, envelope);
     const decryptedChunks = [];
@@ -66,13 +69,13 @@ describe("crypto", () => {
     expect(Buffer.concat(decryptedChunks)).toEqual(payload);
   });
 
-  it("fails decryption if auth tag is modified", async () => {
+  it("fails decryption immediately if frame data is tampered with", async () => {
     const masterKey = parseKey(generateKey());
     const encryptor = createEncryptor(masterKey);
     const chunks = [];
 
     await pipeline(
-      Readable.from(Buffer.from("tamper test")),
+      Readable.from(Buffer.from("tamper test payload")),
       encryptor.stream,
       async function* (source) {
         for await (const chunk of source) chunks.push(chunk);
@@ -80,16 +83,78 @@ describe("crypto", () => {
     );
 
     const envelope = encryptor.envelope();
-    const badTag = Buffer.from(envelope.authTag, "base64");
-    badTag[0] ^= 0xff;
-    envelope.authTag = badTag.toString("base64");
+    const encrypted = Buffer.concat(chunks);
+    // Tamper with the last byte (authTag) of the frame
+    encrypted[encrypted.length - 1] ^= 0xff;
 
     const decipher = createDecryptor(masterKey, envelope);
     await expect(
-      pipeline(Readable.from(Buffer.concat(chunks)), decipher, async function* (s) {
+      pipeline(Readable.from(encrypted), decipher, async function* (s) {
         for await (const c of s) yield c;
       }),
     ).rejects.toThrow();
+  });
+
+  it("detects truncated stream missing final frame", async () => {
+    const masterKey = parseKey(generateKey());
+    const encryptor = createEncryptor(masterKey);
+    const chunks = [];
+
+    await pipeline(
+      Readable.from(Buffer.alloc(100_000, "a")),
+      encryptor.stream,
+      async function* (source) {
+        for await (const chunk of source) chunks.push(chunk);
+      },
+    );
+
+    const envelope = encryptor.envelope();
+    const fullEncrypted = Buffer.concat(chunks);
+    // Cut off the second frame (truncation)
+    const truncated = fullEncrypted.subarray(0, 65536 + 5 + 12 + 16);
+
+    const decipher = createDecryptor(masterKey, envelope);
+    await expect(
+      pipeline(Readable.from(truncated), decipher, async function* (s) {
+        for await (const c of s) yield c;
+      }),
+    ).rejects.toThrow(/Truncated AEAD stream/);
+  });
+
+  it("supports backwards compatibility with legacy single-block aes-256-gcm backups", async () => {
+    const masterKey = parseKey(generateKey());
+    const dataKey = randomBytes(32);
+    const iv = randomBytes(12);
+    const cipher = createCipheriv("aes-256-gcm", dataKey, iv);
+    const payload = Buffer.from("legacy database backup content");
+    const ciphertext = Buffer.concat([cipher.update(payload), cipher.final()]);
+    const authTag = cipher.getAuthTag();
+
+    // Wrap dataKey with masterKey using AES-GCM
+    const wrapIv = randomBytes(12);
+    const wrapCipher = createCipheriv("aes-256-gcm", masterKey, wrapIv);
+    const wrappedEnc = Buffer.concat([wrapCipher.update(dataKey), wrapCipher.final()]);
+    const wrappedKey = Buffer.concat([wrapIv, wrapCipher.getAuthTag(), wrappedEnc]).toString("base64");
+
+    const legacyEnvelope = {
+      algorithm: "aes-256-gcm",
+      keyId: keyId(masterKey),
+      wrappedKey,
+      iv: iv.toString("base64"),
+      authTag: authTag.toString("base64"),
+    };
+
+    const decipher = createDecryptor(masterKey, legacyEnvelope);
+    const decrypted = [];
+    await pipeline(
+      Readable.from(ciphertext),
+      decipher,
+      async function* (source) {
+        for await (const chunk of source) decrypted.push(chunk);
+      },
+    );
+
+    expect(Buffer.concat(decrypted)).toEqual(payload);
   });
 
   it("fails decryption if keyId does not match master key", async () => {
