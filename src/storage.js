@@ -1,5 +1,7 @@
+import { randomUUID } from "node:crypto";
 import {
   DeleteObjectCommand,
+  DeleteObjectsCommand,
   GetObjectCommand,
   HeadObjectCommand,
   PutObjectCommand,
@@ -18,14 +20,17 @@ export function createStorage({
   partSizeMb = 32,
   queueSize = 2,
 }) {
-  const client = new S3Client({
-    endpoint,
+  const clientConfig = {
     region,
     forcePathStyle,
     credentials: { accessKeyId, secretAccessKey },
     requestChecksumCalculation: "WHEN_REQUIRED",
     responseChecksumValidation: "WHEN_REQUIRED",
-  });
+  };
+  if (endpoint) {
+    clientConfig.endpoint = endpoint;
+  }
+  const client = new S3Client(clientConfig);
 
   const partSize = Math.max(5, partSizeMb) * 1024 * 1024;
   const concurrency = Math.max(1, queueSize);
@@ -106,6 +111,61 @@ export function createStorage({
 
     async remove(key) {
       await client.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
+    },
+
+    async removeMany(keys) {
+      if (!keys || keys.length === 0) return;
+      const CHUNK_SIZE = 1000;
+      for (let i = 0; i < keys.length; i += CHUNK_SIZE) {
+        const chunk = keys.slice(i, i + CHUNK_SIZE);
+        await client.send(
+          new DeleteObjectsCommand({
+            Bucket: bucket,
+            Delete: {
+              Objects: chunk.map((Key) => ({ Key })),
+              Quiet: true,
+            },
+          }),
+        );
+      }
+    },
+
+    async acquireLock(key, { holder, ttlMs }) {
+      const now = Date.now();
+      const current = await this.getJson(key);
+      if (current && current.expiresAt && current.expiresAt > now) {
+        return null;
+      }
+      const token = randomUUID();
+      const lockData = {
+        token,
+        holder,
+        acquiredAt: new Date(now).toISOString(),
+        expiresAt: now + ttlMs,
+      };
+      await this.putJson(key, lockData);
+      const readBack = await this.getJson(key);
+      if (readBack?.token !== token) {
+        return null;
+      }
+      return token;
+    },
+
+    async refreshLock(key, token, ttlMs) {
+      const current = await this.getJson(key);
+      if (current?.token === token) {
+        current.expiresAt = Date.now() + ttlMs;
+        await this.putJson(key, current);
+        return true;
+      }
+      return false;
+    },
+
+    async releaseLock(key, token) {
+      const current = await this.getJson(key);
+      if (current?.token === token) {
+        await this.remove(key);
+      }
     },
   };
 }
