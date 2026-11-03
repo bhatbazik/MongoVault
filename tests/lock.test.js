@@ -2,7 +2,12 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { acquireLock, readLock } from "../src/lock.js";
+import {
+  acquireDistributedLock,
+  acquireHybridLock,
+  acquireLock,
+  readLock,
+} from "../src/lock.js";
 
 describe("lock", () => {
   let tmpDir;
@@ -58,5 +63,82 @@ describe("lock", () => {
     const release = await acquireLock(lockFile, { staleAfterMs: 60_000 });
     expect(release).toBeTypeOf("function");
     await release();
+  });
+
+  it("supports distributed S3 locking and contention", async () => {
+    const s3State = new Map();
+    const mockStorage = {
+      async acquireLock(key, { holder, ttlMs }) {
+        const current = s3State.get(key);
+        if (current && current.expiresAt > Date.now()) return null;
+        const token = "dist-token-123";
+        s3State.set(key, { token, holder, expiresAt: Date.now() + ttlMs });
+        return token;
+      },
+      async refreshLock(key, token, ttlMs) {
+        const current = s3State.get(key);
+        if (current?.token === token) {
+          current.expiresAt = Date.now() + ttlMs;
+          return true;
+        }
+        return false;
+      },
+      async releaseLock(key, token) {
+        const current = s3State.get(key);
+        if (current?.token === token) s3State.delete(key);
+      },
+    };
+
+    const release1 = await acquireDistributedLock(mockStorage, "prefix/.locks/db.lock.json", {
+      ttlMs: 60_000,
+      heartbeatIntervalMs: 10_000,
+    });
+    expect(release1).toBeTypeOf("function");
+
+    // Second acquisition should fail while first is active
+    const release2 = await acquireDistributedLock(mockStorage, "prefix/.locks/db.lock.json", {
+      ttlMs: 60_000,
+    });
+    expect(release2).toBeNull();
+
+    await release1();
+
+    // Now second acquisition succeeds
+    const release3 = await acquireDistributedLock(mockStorage, "prefix/.locks/db.lock.json", {
+      ttlMs: 60_000,
+    });
+    expect(release3).toBeTypeOf("function");
+    await release3();
+  });
+
+  it("acquires hybrid local and distributed lock", async () => {
+    const s3State = new Map();
+    const mockStorage = {
+      async acquireLock(key, { holder, ttlMs }) {
+        const current = s3State.get(key);
+        if (current && current.expiresAt > Date.now()) return null;
+        const token = "hybrid-token";
+        s3State.set(key, { token, holder, expiresAt: Date.now() + ttlMs });
+        return token;
+      },
+      async releaseLock(key) {
+        s3State.delete(key);
+      },
+    };
+
+    const release = await acquireHybridLock({
+      file: lockFile,
+      storage: mockStorage,
+      lockKey: "prefix/.locks/test.lock.json",
+      staleAfterMs: 60_000,
+    });
+    expect(release).toBeTypeOf("function");
+
+    expect(await readLock(lockFile)).not.toBeNull();
+    expect(s3State.get("prefix/.locks/test.lock.json")).toBeDefined();
+
+    await release();
+    expect(await readLock(lockFile)).toBeNull();
+    expect(s3State.get("prefix/.locks/test.lock.json")).toBeUndefined();
   });
 });

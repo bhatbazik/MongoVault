@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 
 const UNREADABLE_GRACE_MS = 5_000;
@@ -22,8 +23,28 @@ export async function acquireLock(file, { staleAfterMs }) {
   if (!(await isStale(file, staleAfterMs))) {
     return null;
   }
-  await fs.rm(file, { force: true });
-  return acquireLock(file, { staleAfterMs });
+
+  // Atomic stale lock takeover using atomic rename to prevent TOCTOU race
+  const tombstone = `${file}.stale.${randomUUID()}`;
+  try {
+    await fs.rename(file, tombstone);
+    await fs.rm(tombstone, { force: true });
+  } catch {
+    // Another concurrent process already claimed or removed the stale lock
+    return null;
+  }
+
+  // Now safely re-attempt acquisition
+  try {
+    await fs.writeFile(
+      file,
+      JSON.stringify({ pid: process.pid, token, acquiredAt: new Date().toISOString() }),
+      { flag: "wx" },
+    );
+    return () => release(file, token);
+  } catch {
+    return null;
+  }
 }
 
 export async function readLock(file) {
@@ -65,4 +86,78 @@ function isAlive(pid) {
   } catch (error) {
     return error.code === "EPERM";
   }
+}
+
+export async function acquireDistributedLock(
+  storage,
+  lockKey,
+  {
+    holder = `${os.hostname()}:${process.pid}`,
+    ttlMs = 180_000,
+    heartbeatIntervalMs = 30_000,
+    logger,
+  } = {},
+) {
+  if (!storage || typeof storage.acquireLock !== "function") {
+    return null;
+  }
+
+  const token = await storage.acquireLock(lockKey, { holder, ttlMs });
+  if (!token) return null;
+
+  const timer = setInterval(async () => {
+    try {
+      await storage.refreshLock(lockKey, token, ttlMs);
+    } catch (err) {
+      logger?.warn({ err: err.message }, "Failed to refresh distributed S3 lock heartbeat");
+    }
+  }, heartbeatIntervalMs);
+  timer.unref();
+
+  return async function release() {
+    clearInterval(timer);
+    try {
+      await storage.releaseLock(lockKey, token);
+    } catch (err) {
+      logger?.warn({ err: err.message }, "Failed to release distributed S3 lock");
+    }
+  };
+}
+
+export async function acquireHybridLock({
+  file,
+  storage,
+  lockKey,
+  staleAfterMs = 180_000,
+  holder,
+  logger,
+}) {
+  const localRelease = await acquireLock(file, { staleAfterMs });
+  if (!localRelease) {
+    return null;
+  }
+
+  if (storage && lockKey && typeof storage.acquireLock === "function") {
+    try {
+      const distRelease = await acquireDistributedLock(storage, lockKey, {
+        holder,
+        ttlMs: staleAfterMs,
+        logger,
+      });
+
+      if (!distRelease) {
+        await localRelease();
+        return null;
+      }
+
+      return async function releaseAll() {
+        await distRelease().catch(() => {});
+        await localRelease().catch(() => {});
+      };
+    } catch (err) {
+      logger?.warn({ err: err.message }, "Distributed lock attempt failed; relying on local lock");
+    }
+  }
+
+  return localRelease;
 }
