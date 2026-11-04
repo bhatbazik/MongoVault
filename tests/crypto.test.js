@@ -7,9 +7,12 @@ import {
   CHUNKED_ALGORITHM,
   createDecryptor,
   createEncryptor,
+  deriveNonce,
   generateKey,
   keyId,
   parseKey,
+  signManifest,
+  verifyManifest,
 } from "../src/crypto.js";
 
 describe("crypto", () => {
@@ -212,5 +215,43 @@ describe("crypto", () => {
     // Decryptor provided with key ring [newKey, oldKey]
     const decipher = createDecryptor([newKey, oldKey], envelope);
     expect(decipher).toBeDefined();
+  });
+
+  it("rejects out-of-bounds frame indices in deriveNonce to prevent nonce wrap-around", () => {
+    const baseNonce = randomBytes(12);
+    expect(() => deriveNonce(baseNonce, -1)).toThrow("AEAD frame index out of bounds");
+    expect(() => deriveNonce(baseNonce, 0x100000000)).toThrow("AEAD frame index out of bounds");
+  });
+
+  it("signs and verifies manifest HMAC and detects tampering", () => {
+    const masterKey = parseKey(generateKey());
+    const manifest = {
+      version: 2,
+      key: "mongodb/prod/2026-03-10/20260310T020000Z.archive.gz.enc",
+      database: "prod",
+      createdAt: "2026-03-10T02:00:00.000Z",
+      completedAt: "2026-03-10T02:01:00.000Z",
+      size: 1024,
+      sha256: "abc123",
+      compression: "gzip",
+      oplog: false,
+      excludedCollections: [],
+      collections: { users: 50 },
+      encryption: {
+        algorithm: CHUNKED_ALGORITHM,
+        keyId: keyId(masterKey),
+        wrappedKey: "wrapped",
+        iv: "iv",
+        chunkSize: 65536,
+      },
+    };
+
+    manifest.encryption.manifestHmac = signManifest(masterKey, manifest);
+    expect(verifyManifest(masterKey, manifest)).toBe(true);
+
+    // Tamper with oplog flag
+    const tampered = structuredClone(manifest);
+    tampered.oplog = true;
+    expect(() => verifyManifest(masterKey, tampered)).toThrow("Manifest HMAC verification failed");
   });
 });

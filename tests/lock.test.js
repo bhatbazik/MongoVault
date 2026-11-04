@@ -141,4 +141,23 @@ describe("lock", () => {
     expect(await readLock(lockFile)).toBeNull();
     expect(s3State.get("prefix/.locks/test.lock.json")).toBeUndefined();
   });
+
+  it("releases local lock and rethrows if distributed lock fails with storage error", async () => {
+    const failingStorage = {
+      async acquireLock() {
+        throw new Error("S3 network failure");
+      },
+    };
+
+    await expect(
+      acquireHybridLock({
+        file: lockFile,
+        storage: failingStorage,
+        lockKey: "prefix/.locks/test.lock.json",
+        staleAfterMs: 60_000,
+      }),
+    ).rejects.toThrow("S3 network failure");
+
+    expect(await readLock(lockFile)).toBeNull();
+  });
 });

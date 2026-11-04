@@ -93,7 +93,7 @@ export async function acquireDistributedLock(
   lockKey,
   {
     holder = `${os.hostname()}:${process.pid}`,
-    ttlMs = 180_000,
+    ttlMs = 90_000,
     heartbeatIntervalMs = 30_000,
     logger,
   } = {},
@@ -129,6 +129,8 @@ export async function acquireHybridLock({
   storage,
   lockKey,
   staleAfterMs = 180_000,
+  distributedTtlMs = 90_000,
+  heartbeatIntervalMs = 30_000,
   holder,
   logger,
 }) {
@@ -141,7 +143,8 @@ export async function acquireHybridLock({
     try {
       const distRelease = await acquireDistributedLock(storage, lockKey, {
         holder,
-        ttlMs: staleAfterMs,
+        ttlMs: distributedTtlMs,
+        heartbeatIntervalMs,
         logger,
       });
 
@@ -155,7 +158,8 @@ export async function acquireHybridLock({
         await localRelease().catch(() => {});
       };
     } catch (err) {
-      logger?.warn({ err: err.message }, "Distributed lock attempt failed; relying on local lock");
+      await localRelease().catch(() => {});
+      throw err;
     }
   }
 

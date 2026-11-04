@@ -3,7 +3,7 @@ import { pipeline } from "node:stream/promises";
 import { createGunzip } from "node:zlib";
 import { linkedController, settleAll } from "./abort.js";
 import { isClusterScope, readManifest, resolveBackup, scopeOf } from "./catalog.js";
-import { createDecryptor } from "./crypto.js";
+import { createDecryptor, verifyManifest } from "./crypto.js";
 import { DigestStream } from "./digest.js";
 import { mongorestore } from "./tools.js";
 
@@ -21,11 +21,23 @@ async function describeBackup({ config, storage }, ref) {
   if (!manifest && !object) {
     throw new Error(`Backup not found: ${key}`);
   }
+  if (manifest?.key && manifest.key !== key) {
+    throw new IntegrityError(
+      `Manifest key mismatch for ${key}: manifest belongs to ${manifest.key}`,
+    );
+  }
   const checksum = manifest?.sha256 ?? object.metadata.sha256 ?? null;
 
   const keyRing = config.encryptionKeyRing || (config.encryptionKey ? [config.encryptionKey] : []);
-  if (manifest?.encryption && keyRing.length === 0) {
-    throw new Error(`${key} is encrypted, but ENCRYPTION_KEY is not set`);
+  if (manifest?.encryption) {
+    if (keyRing.length === 0) {
+      throw new Error(`${key} is encrypted, but ENCRYPTION_KEY is not set`);
+    }
+    try {
+      verifyManifest(keyRing, manifest);
+    } catch (error) {
+      throw new IntegrityError(error.message);
+    }
   }
   return { key, manifest, checksum };
 }
@@ -83,6 +95,7 @@ export async function restoreBackup(
     uri,
     database,
     drop = false,
+    preVerify = drop,
     oplogReplay,
     oplogLimit,
     parallelCollections,
@@ -93,12 +106,24 @@ export async function restoreBackup(
   const log = logger.child({ key });
   const source = manifest?.database ?? config.mongo.database;
   const target = database ?? source;
-  const shouldReplayOplog = oplogReplay ?? Boolean(manifest?.oplog);
   const isCluster = isClusterScope(source);
+  const isFilteredCluster = isCluster && !isClusterScope(target);
+  const isRenamedDb = !isCluster && target !== source;
+  const hasNamespaceFilter = isFilteredCluster || isRenamedDb;
+
+  if (hasNamespaceFilter && (oplogReplay === true || Boolean(oplogLimit))) {
+    throw new Error(
+      "Cannot use --oplog-replay or --oplog-limit when filtering or renaming target database",
+    );
+  }
+
+  const shouldReplayOplog = hasNamespaceFilter
+    ? false
+    : (oplogReplay ?? (Boolean(oplogLimit) || Boolean(manifest?.oplog)));
 
   if (!checksum) log.warn("Backup has no checksum; restoring without an integrity check");
 
-  if (drop) {
+  if (preVerify) {
     log.info({ ref, drop }, "Pre-verifying backup archive integrity and checksum before dropping collections");
     await verifyBackup(ctx, ref);
   }
@@ -108,9 +133,9 @@ export async function restoreBackup(
     const restore = await tools.mongorestore({
       uri,
       workDir: config.workDir,
-      nsInclude: isCluster || target === source ? undefined : `${source}.*`,
-      nsFrom: isCluster || target === source ? undefined : `${source}.*`,
-      nsTo: isCluster || target === source ? undefined : `${target}.*`,
+      nsInclude: isFilteredCluster ? `${target}.*` : (isRenamedDb ? `${source}.*` : undefined),
+      nsFrom: isRenamedDb ? `${source}.*` : undefined,
+      nsTo: isRenamedDb ? `${target}.*` : undefined,
       drop,
       oplogReplay: shouldReplayOplog,
       oplogLimit,

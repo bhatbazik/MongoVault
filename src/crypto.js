@@ -2,7 +2,9 @@ import {
   createCipheriv,
   createDecipheriv,
   createHash,
+  createHmac,
   randomBytes,
+  timingSafeEqual,
 } from "node:crypto";
 import { Transform } from "node:stream";
 
@@ -13,6 +15,7 @@ export const KEY_LENGTH = 32;
 export const IV_LENGTH = 12;
 export const TAG_LENGTH = 16;
 export const MAX_FRAME_SIZE = 10 * 1024 * 1024; // 10 MB max frame size safety limit
+export const MAX_FRAME_INDEX = 0xffffffff;
 
 export function parseKey(value) {
   const key = /^[0-9a-f]{64}$/i.test(value)
@@ -42,6 +45,9 @@ export function keyId(masterKey) {
 }
 
 export function deriveNonce(baseNonce, frameIndex) {
+  if (!Number.isInteger(frameIndex) || frameIndex < 0 || frameIndex > MAX_FRAME_INDEX) {
+    throw new Error(`AEAD frame index out of bounds: ${frameIndex}`);
+  }
   const nonce = Buffer.from(baseNonce);
   // Store 32-bit frame sequence in the last 4 bytes of 12-byte IV
   nonce.writeUInt32BE(frameIndex >>> 0, 8);
@@ -254,4 +260,49 @@ function unwrap(masterKey, wrapped) {
   const decipher = createDecipheriv(ALGORITHM, masterKey, iv);
   decipher.setAuthTag(tag);
   return Buffer.concat([decipher.update(encrypted), decipher.final()]);
+}
+
+function canonicalManifestPayload(manifest) {
+  const cleanEncryption = manifest.encryption ? { ...manifest.encryption } : null;
+  if (cleanEncryption) {
+    delete cleanEncryption.manifestHmac;
+  }
+  return JSON.stringify({
+    version: manifest.version,
+    key: manifest.key,
+    database: manifest.database,
+    createdAt: manifest.createdAt,
+    completedAt: manifest.completedAt,
+    size: manifest.size,
+    sha256: manifest.sha256,
+    compression: manifest.compression,
+    oplog: Boolean(manifest.oplog),
+    excludedCollections: manifest.excludedCollections ?? [],
+    collections: manifest.collections ?? {},
+    encryption: cleanEncryption,
+  });
+}
+
+export function signManifest(masterKey, manifest) {
+  return createHmac("sha256", masterKey)
+    .update(canonicalManifestPayload(manifest))
+    .digest("hex");
+}
+
+export function verifyManifest(masterKeys, manifest) {
+  if (!manifest?.encryption?.manifestHmac) return true;
+  const keys = Array.isArray(masterKeys) ? masterKeys : [masterKeys];
+  const matchedKey = keys.find((k) => keyId(k) === manifest.encryption.keyId);
+  if (!matchedKey) {
+    const configuredIds = keys.map((k) => keyId(k)).join(", ");
+    throw new Error(
+      `Backup was encrypted with key ${manifest.encryption.keyId}, but configured key ring has: [${configuredIds}]`,
+    );
+  }
+  const expected = Buffer.from(signManifest(matchedKey, manifest), "hex");
+  const actual = Buffer.from(String(manifest.encryption.manifestHmac), "hex");
+  if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) {
+    throw new Error(`Manifest HMAC verification failed for ${manifest.key}: manifest has been tampered with`);
+  }
+  return true;
 }

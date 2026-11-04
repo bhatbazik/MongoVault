@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
@@ -7,7 +8,7 @@ import { formatDuration } from "./format.js";
 
 const KILL_GRACE_MS = 10_000;
 const TAIL_LINES = 40;
-const DUMPED = /(?:done dumping|dumped)\s+["']?([^.\s"']+)["']?\.["']?(\S+?)["']?\s+\(([\d,]+)\s+documents?\)/i;
+const DUMPED = /(?:done dumping|dumped)\s+["']?([^.\s"']+)["']?\.["']?(.+?)["']?\s+\(([\d,]+)\s+documents?\)/i;
 const RESTORED = /([\d,]+)\s+document\(s\)\s+restored\s+successfully\.\s+([\d,]+)\s+document\(s\)\s+failed/i;
 
 export function isClusterDatabase(database) {
@@ -104,10 +105,18 @@ export async function mongodump({
   logger,
   command = "mongodump",
 }) {
-  const configFile = await writeUriConfig(workDir, uri);
+  const isCluster = isClusterDatabase(database);
+  if (oplog && !isCluster) {
+    throw new Error("--oplog mode is only supported on full cluster dumps (database: * or all)");
+  }
+  if (isCluster && excludeCollections.length > 0) {
+    throw new Error("--db is required when --excludeCollection is specified");
+  }
+
+  const { file: configFile, cleanup: cleanupConfig } = await writeUriConfig(workDir, uri);
   const args = [`--config=${configFile}`];
 
-  if (!isClusterDatabase(database)) {
+  if (!isCluster) {
     args.push(`--db=${database}`);
   }
   for (const name of excludeCollections) {
@@ -131,7 +140,7 @@ export async function mongodump({
       logger?.debug({ tool: "mongodump" }, line);
       const dumped = parseDumpLine(line);
       if (dumped) {
-        const key = isClusterDatabase(database)
+        const key = isCluster
           ? `${dumped.database}.${dumped.collection}`
           : dumped.collection;
         collections[key] = dumped.documents;
@@ -141,7 +150,7 @@ export async function mongodump({
 
   return {
     stdout: child.stdout,
-    done: done.finally(() => fs.rm(configFile, { force: true })).then(() => ({ collections })),
+    done: done.finally(cleanupConfig).then(() => ({ collections })),
   };
 }
 
@@ -160,7 +169,14 @@ export async function mongorestore({
   logger,
   command = "mongorestore",
 }) {
-  const configFile = await writeUriConfig(workDir, uri);
+  if (oplogLimit && !oplogReplay) {
+    throw new Error("cannot use --oplogLimit without --oplogReplay enabled");
+  }
+  if (oplogReplay && (nsInclude || (nsFrom && nsTo))) {
+    throw new Error("cannot use --oplogReplay with namespace includes or renames specified");
+  }
+
+  const { file: configFile, cleanup: cleanupConfig } = await writeUriConfig(workDir, uri);
   const args = [`--config=${configFile}`, "--archive", "--gzip"];
   if (nsInclude) args.push(`--nsInclude=${nsInclude}`);
   if (nsFrom && nsTo) args.push(`--nsFrom=${nsFrom}`, `--nsTo=${nsTo}`);
@@ -185,7 +201,7 @@ export async function mongorestore({
   return {
     stdin: child.stdin,
     done: done
-      .finally(() => fs.rm(configFile, { force: true }))
+      .finally(cleanupConfig)
       .then(() => {
         if (summary?.failed > 0) {
           throw new Error(`mongorestore failed to restore ${summary.failed} documents`);
@@ -199,5 +215,18 @@ async function writeUriConfig(workDir, uri) {
   await fs.mkdir(workDir, { recursive: true });
   const file = path.join(workDir, `.${randomUUID()}.yaml`);
   await fs.writeFile(file, `uri: ${JSON.stringify(uri)}\n`, { mode: 0o600 });
-  return file;
+
+  const onExit = () => {
+    try {
+      fsSync.rmSync(file, { force: true });
+    } catch {}
+  };
+  process.once("exit", onExit);
+
+  const cleanup = async () => {
+    process.removeListener("exit", onExit);
+    await fs.rm(file, { force: true });
+  };
+
+  return { file, cleanup };
 }

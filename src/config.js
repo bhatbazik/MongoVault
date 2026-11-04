@@ -128,6 +128,14 @@ const schema = z
         message: "MONGODB_OPLOG can only be used with full cluster backup (MONGODB_DATABASE: * or all)",
       });
     }
+    if (env.MONGODB_EXCLUDE_COLLECTIONS.length > 0 && isClusterScope(env.MONGODB_DATABASE)) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["MONGODB_EXCLUDE_COLLECTIONS"],
+        message:
+          "MONGODB_EXCLUDE_COLLECTIONS cannot be used with full cluster backup (MONGODB_DATABASE: * or all); mongodump requires --db when --excludeCollection is specified",
+      });
+    }
   });
 
 export class ConfigError extends Error {
@@ -191,10 +199,10 @@ function toConfig(env) {
     timeoutMs: env.BACKUP_TIMEOUT_MINUTES * 60_000,
     workDir: env.WORK_DIR,
     encryptionKey: env.ENCRYPTION_KEY ? parseKey(env.ENCRYPTION_KEY) : null,
-    encryptionKeyRing: [
+    encryptionKeyRing: deduplicateKeys([
       ...(env.ENCRYPTION_KEY ? [parseKey(env.ENCRYPTION_KEY)] : []),
       ...(env.ENCRYPTION_KEY_RING ? parseKeyRing(env.ENCRYPTION_KEY_RING) : []),
-    ],
+    ]),
     retention: retentionEnabled ? retention : null,
     drill: env.DRILL_MONGODB_URI ? { uri: env.DRILL_MONGODB_URI, cron: env.DRILL_CRON ?? null } : null,
     notifications: {
@@ -218,4 +226,14 @@ function toConfig(env) {
     http: { port: env.HTTP_PORT },
     logLevel: env.LOG_LEVEL,
   };
+}
+
+function deduplicateKeys(keys) {
+  const seen = new Set();
+  return keys.filter((key) => {
+    const hex = key.toString("hex");
+    if (seen.has(hex)) return false;
+    seen.add(hex);
+    return true;
+  });
 }

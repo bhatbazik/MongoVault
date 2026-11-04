@@ -2,7 +2,7 @@ import { PassThrough } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { linkedController, settleAll } from "./abort.js";
 import { MANIFEST_VERSION, archiveKey, manifestKey, scopeOf } from "./catalog.js";
-import { createEncryptor } from "./crypto.js";
+import { createEncryptor, signManifest } from "./crypto.js";
 import { DigestStream } from "./digest.js";
 import { mongodump } from "./tools.js";
 
@@ -73,6 +73,9 @@ export async function runBackup({ config, storage, logger, signal, tools = { mon
       oplog: Boolean(config.mongo.oplog),
       collections,
     };
+    if (manifest.encryption && config.encryptionKey) {
+      manifest.encryption.manifestHmac = signManifest(config.encryptionKey, manifest);
+    }
     await storage.putJson(manifestKey(key), manifest);
 
     log.info(

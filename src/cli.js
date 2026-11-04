@@ -1,6 +1,6 @@
 import { parseArgs } from "node:util";
 import { runBackup } from "./backup.js";
-import { listBackups, scopeOf } from "./catalog.js";
+import { isClusterScope, listBackups, scopeOf } from "./catalog.js";
 import { generateKey } from "./crypto.js";
 import { runDrill } from "./drill.js";
 import { formatBytes, formatDate, formatDuration } from "./format.js";
@@ -119,6 +119,12 @@ export async function runCli(config, argv = process.argv.slice(2)) {
       const targetOplog = values.oplog || config.mongo.oplog;
       if (targetOplog && !isClusterScope(targetDb)) {
         console.error("Error: --oplog can only be used with full cluster backup (database: * or all)");
+        process.exit(1);
+      }
+      if (isClusterScope(targetDb) && config.mongo.excludeCollections?.length > 0) {
+        console.error(
+          "Error: MONGODB_EXCLUDE_COLLECTIONS cannot be used with full cluster backup (database: * or all)",
+        );
         process.exit(1);
       }
       const backupConfig = {

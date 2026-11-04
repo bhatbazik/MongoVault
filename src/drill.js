@@ -14,7 +14,12 @@ export class DrillError extends Error {
 }
 
 export async function runDrill(ctx) {
-  const { config, storage, logger } = ctx;
+  const {
+    config,
+    storage,
+    logger,
+    createMongoClient = (uri) => new MongoClient(uri),
+  } = ctx;
   if (!config.drill) {
     throw new Error("DRILL_MONGODB_URI is not set");
   }
@@ -31,7 +36,7 @@ export async function runDrill(ctx) {
   const manifest = await readManifest(storage, key);
   const isCluster = isClusterScope(manifest.database);
   const drillTag = `drill_${Date.now()}`;
-  const client = new MongoClient(config.drill.uri);
+  const client = createMongoClient(config.drill.uri);
 
   logger.info({ key, isCluster, oplog: Boolean(manifest.oplog) }, "Restore drill started");
 
@@ -44,14 +49,28 @@ export async function runDrill(ctx) {
       restoredDbs.add(database);
       await client.db(database).dropDatabase();
 
-      await restoreBackup(ctx, { ref: key, uri: config.drill.uri, database, drop: true });
+      await restoreBackup(ctx, {
+        ref: key,
+        uri: config.drill.uri,
+        database,
+        drop: true,
+        preVerify: false,
+      });
 
       const db = client.db(database);
+      const existingCollections = await getExistingCollectionNames(db);
       const hasOplog = Boolean(manifest.oplog);
       const mismatches = [];
       const variances = [];
 
       for (const [colKey, expected] of Object.entries(manifest.collections || {})) {
+        if (existingCollections && !existingCollections.has(colKey)) {
+          if (expected > 0) {
+            mismatches.push({ collection: colKey, expected, actual: "missing" });
+          }
+          continue;
+        }
+
         let actual;
         try {
           actual = await db.collection(colKey).countDocuments();
@@ -64,7 +83,7 @@ export async function runDrill(ctx) {
             mismatches.push({ collection: colKey, expected, actual: "missing" });
           }
         } else if (actual !== expected) {
-          if (hasOplog) {
+          if (hasOplog && actual > 0) {
             variances.push({ collection: colKey, expected, actual, diff: actual - expected });
           } else {
             mismatches.push({ collection: colKey, expected, actual });
@@ -104,7 +123,17 @@ export async function runDrill(ctx) {
       }
 
       // Restore directly onto the dedicated drill MongoDB instance
-      await restoreBackup(ctx, { ref: key, uri: config.drill.uri, drop: true });
+      await restoreBackup(ctx, {
+        ref: key,
+        uri: config.drill.uri,
+        drop: true,
+        preVerify: false,
+      });
+
+      const existingByDb = new Map();
+      for (const dbName of restoredDbs) {
+        existingByDb.set(dbName, await getExistingCollectionNames(client.db(dbName)));
+      }
 
       const hasOplog = Boolean(manifest.oplog);
       const mismatches = [];
@@ -115,6 +144,14 @@ export async function runDrill(ctx) {
         if (firstDot <= 0) continue;
         const dbName = colKey.substring(0, firstDot);
         const colName = colKey.substring(firstDot + 1);
+
+        const existingCollections = existingByDb.get(dbName);
+        if (existingCollections && !existingCollections.has(colName)) {
+          if (expected > 0) {
+            mismatches.push({ collection: colKey, expected, actual: "missing" });
+          }
+          continue;
+        }
 
         let actual;
         try {
@@ -128,7 +165,7 @@ export async function runDrill(ctx) {
             mismatches.push({ collection: colKey, expected, actual: "missing" });
           }
         } else if (actual !== expected) {
-          if (hasOplog) {
+          if (hasOplog && actual > 0) {
             variances.push({ collection: colKey, expected, actual, diff: actual - expected });
           } else {
             mismatches.push({ collection: colKey, expected, actual });
@@ -163,5 +200,15 @@ export async function runDrill(ctx) {
       await client.db(dbName).dropDatabase().catch(() => {});
     }
     await client.close().catch(() => {});
+  }
+}
+
+async function getExistingCollectionNames(db) {
+  if (typeof db.listCollections !== "function") return null;
+  try {
+    const items = await db.listCollections({}, { nameOnly: true }).toArray();
+    return new Set(items.map((item) => item.name));
+  } catch {
+    return null;
   }
 }

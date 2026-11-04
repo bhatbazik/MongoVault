@@ -18,7 +18,7 @@ A streaming MongoDB backup daemon and CLI tool with S3/Cloudflare R2 multipart u
 ┌──────────────┐          │  ┌───────────┐      ┌───────────┐      ┌─────────────────┐  │      ┌─────────────────┐
 │              │ stdout   │  │  Stream   │      │  Digest   │      │  S3 Multipart   │  │ PUT  │  Cloudflare R2  │
 │  mongodump   ├──────────┼─►│ Cipheriv  ├─────►│  Stream   ├─────►│     Upload      ├──┼─────►│     / AWS S3    │
-│              │ (gzip)   │  │(AES-256)  │      │ (SHA-256) │      │  (16MB parts)   │  │      │     / MinIO     │
+│              │ (gzip)   │  │(AES-256)  │      │ (SHA-256) │      │  (32MB parts)   │  │      │     / MinIO     │
 └──────────────┘          │  └───────────┘      └───────────┘      └─────────────────┘  │      └────────┬────────┘
                           │                                                             │               │
                           │  ┌───────────────────────┐     ┌─────────────────────────┐  │               │
@@ -46,7 +46,7 @@ A streaming MongoDB backup daemon and CLI tool with S3/Cloudflare R2 multipart u
 - **Automated Restore Drills:** Periodically restores the latest backup to an isolated staging database, verifies collection accessibility, and accounts for point-in-time oplog write shifts to eliminate false alarms.
 - **Native AWS S3, Cloudflare R2, & MinIO:** Works out-of-the-box with AWS S3 regional endpoints, Cloudflare R2, or MinIO.
 - **Grandfather-Father-Son (GFS) Retention:** Automated pruning supports `keep-last`, `keep-daily`, `keep-weekly`, and `keep-monthly` policies natively without relying solely on cloud bucket lifecycle rules.
-- **Process Security & Isolation:** Passes connection credentials to child processes through temporary file descriptors (`mode 0600`) to avoid leaking connection strings in `ps aux`.
+- **Process Security & Isolation:** Passes connection credentials to child processes through ephemeral `mode 0600` config files with synchronous process-exit cleanup to avoid leaking connection strings in `ps aux`.
 - **Prometheus & Dead-Man's Switch:** Exposes standard `/metrics` and `/healthz` HTTP endpoints and pings dead-man's switch services (e.g. Healthchecks.io) to catch silent daemon crashes.
 
 ---
@@ -262,7 +262,7 @@ Each archive is accompanied by an authenticated JSON manifest written upon succe
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "key": "mongodb/production/2026-03-10/20260310T020000Z.archive.gz.enc",
   "database": "production",
   "createdAt": "2026-03-10T02:00:00.000Z",
@@ -272,13 +272,15 @@ Each archive is accompanied by an authenticated JSON manifest written upon succe
   "sha256": "4b971a82e98fa87c...",
   "compression": "gzip",
   "encryption": {
-    "algorithm": "aes-256-gcm",
+    "algorithm": "aes-256-gcm-chunked",
     "keyId": "9f81a7b3c2e10d4f",
     "wrappedKey": "tGv/F...==",
     "iv": "3aV+...==",
-    "authTag": "c9D1...=="
+    "chunkSize": 65536,
+    "manifestHmac": "8d4c1f0a..."
   },
   "excludedCollections": ["sessions"],
+  "oplog": false,
   "collections": {
     "users": 154200,
     "orders": 894102,

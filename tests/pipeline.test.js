@@ -188,7 +188,7 @@ describe("backup and restore pipeline", () => {
     const { tools } = createMockTools(rawGzip);
 
     const config = {
-      mongo: { uri: "mongodb://localhost", database: "prod", excludeCollections: [], oplog: true },
+      mongo: { uri: "mongodb://localhost", database: "*", excludeCollections: [], oplog: true },
       storage: { prefix: "backups" },
       workDir: tmpDir,
       timeoutMs: 5000,
@@ -198,6 +198,32 @@ describe("backup and restore pipeline", () => {
 
     const manifest = await runBackup({ config, storage: mockStorage, logger, tools });
     expect(manifest.oplog).toBe(true);
+  });
+
+  it("rejects tampered encrypted manifest via HMAC authentication", async () => {
+    const rawGzip = gzipSync(Buffer.from("authenticated-manifest-payload"));
+    const { tools } = createMockTools(rawGzip);
+    const key = parseKey(generateKey());
+
+    const config = {
+      mongo: { uri: "mongodb://localhost", database: "patients", excludeCollections: [] },
+      storage: { prefix: "backups" },
+      workDir: tmpDir,
+      timeoutMs: 5000,
+      encryptionKey: key,
+      schedule: { timezone: "UTC" },
+    };
+
+    const manifest = await runBackup({ config, storage: mockStorage, logger, tools });
+    expect(manifest.encryption.manifestHmac).toBeTypeOf("string");
+
+    // Tamper with collection counts in stored manifest
+    const manifestObj = objects.get(`${manifest.key}.manifest.json`);
+    manifestObj.json.collections.users = 0;
+
+    await expect(
+      verifyBackup({ config, storage: mockStorage, logger }, manifest.key),
+    ).rejects.toThrow(/Manifest HMAC verification failed/);
   });
 
   it("supports cluster-wide backup when database is *", async () => {

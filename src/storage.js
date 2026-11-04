@@ -169,21 +169,15 @@ export function createStorage({
         await client.send(new PutObjectCommand(putParams));
         return token;
       } catch (err) {
-        // PreconditionFailed / 412 or S3 conditional write mismatch
-        if (
-          err.name === "PreconditionFailed" ||
-          err.$metadata?.httpStatusCode === 412 ||
-          err.code === "PreconditionFailed"
-        ) {
+        if (isPreconditionFailed(err)) {
           return null;
         }
-        // Fallback for S3 providers that do not support conditional PutObject headers:
-        // Perform read-back check as safety net
-        const readBack = await this.getJson(key);
-        if (readBack?.data?.token === token) {
-          return token;
+        if (isConditionalHeaderUnsupported(err)) {
+          await this.putJson(key, lockData);
+          const readBack = await this.getJson(key);
+          return readBack?.data?.token === token ? token : null;
         }
-        return null;
+        throw err;
       }
     },
 
@@ -206,7 +200,11 @@ export function createStorage({
           }
           await client.send(new PutObjectCommand(putParams));
           return true;
-        } catch {
+        } catch (err) {
+          if (isConditionalHeaderUnsupported(err)) {
+            await this.putJson(key, updated);
+            return true;
+          }
           return false;
         }
       }
@@ -216,6 +214,21 @@ export function createStorage({
     async releaseLock(key, token) {
       const current = await this.getJson(key);
       if (current?.data?.token === token) {
+        if (current.etag) {
+          try {
+            await client.send(
+              new DeleteObjectCommand({
+                Bucket: bucket,
+                Key: key,
+                IfMatch: `"${current.etag}"`,
+              }),
+            );
+            return;
+          } catch (err) {
+            if (isPreconditionFailed(err)) return;
+            if (!isConditionalHeaderUnsupported(err)) throw err;
+          }
+        }
         await this.remove(key);
       }
     },
@@ -227,5 +240,26 @@ function isNotFound(error) {
     error?.name === "NotFound" ||
     error?.name === "NoSuchKey" ||
     error?.$metadata?.httpStatusCode === 404
+  );
+}
+
+function isPreconditionFailed(error) {
+  const status = error?.$metadata?.httpStatusCode;
+  return (
+    error?.name === "PreconditionFailed" ||
+    error?.code === "PreconditionFailed" ||
+    error?.name === "ConditionalRequestConflict" ||
+    status === 412 ||
+    status === 409
+  );
+}
+
+function isConditionalHeaderUnsupported(error) {
+  const status = error?.$metadata?.httpStatusCode;
+  return (
+    error?.name === "NotImplemented" ||
+    error?.code === "NotImplemented" ||
+    error?.name === "InvalidArgument" ||
+    status === 501
   );
 }

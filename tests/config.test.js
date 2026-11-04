@@ -68,7 +68,17 @@ describe("config", () => {
     ).toThrow("MONGODB_OPLOG can only be used with full cluster backup");
   });
 
-  it("parses ENCRYPTION_KEY_RING for key rotation", () => {
+  it("rejects MONGODB_EXCLUDE_COLLECTIONS with cluster-wide database scope", () => {
+    expect(() =>
+      loadConfig({
+        ...minimalValidEnv,
+        MONGODB_DATABASE: "*",
+        MONGODB_EXCLUDE_COLLECTIONS: "sessions,logs",
+      }),
+    ).toThrow("MONGODB_EXCLUDE_COLLECTIONS cannot be used with full cluster backup");
+  });
+
+  it("parses and deduplicates ENCRYPTION_KEY_RING for key rotation", () => {
     const k1 = "a".repeat(64);
     const k2 = "b".repeat(64);
     const config = loadConfig({
@@ -76,6 +86,6 @@ describe("config", () => {
       ENCRYPTION_KEY: k1,
       ENCRYPTION_KEY_RING: `${k2}, ${k1}`,
     });
-    expect(config.encryptionKeyRing.length).toBe(3);
+    expect(config.encryptionKeyRing.length).toBe(2);
   });
 });
