@@ -3,7 +3,7 @@ import "dotenv/config";
 import { runCli } from "./cli.js";
 import { loadConfig } from "./config.js";
 
-async function main() {
+async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const command = argv[0] || "daemon";
   const effectiveArgv = argv.length === 0 ? ["daemon"] : argv;
@@ -17,7 +17,7 @@ async function main() {
   await runCli(config, effectiveArgv);
 }
 
-main().catch((error) => {
+main().catch((error: any) => {
   if (error.name === "ConfigError") {
     console.error(error.message);
   } else {

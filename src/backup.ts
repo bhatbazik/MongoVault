@@ -6,9 +6,12 @@ import { createEncryptor, signManifest } from "./crypto.js";
 import { DigestStream } from "./digest.js";
 import { formatOplogTimestamp, getOplogBounds } from "./oplog.js";
 import { mongodump } from "./tools.js";
+import type { BackupContext } from "./types/backup.js";
+import type { BackupManifest } from "./types/catalog.js";
+import type { BackupTools } from "./types/tools.js";
 
-export async function runBackup({ config, storage, logger, signal, tools }) {
-  const effectiveTools = tools ?? { mongodump, getOplogBounds };
+export async function runBackup({ config, storage, logger, signal, tools }: BackupContext): Promise<BackupManifest> {
+  const effectiveTools: BackupTools = tools ?? { mongodump, getOplogBounds };
   const startedAt = new Date();
   const encrypted = Boolean(config.encryptionKey);
   const key = archiveKey(scopeOf(config), startedAt, { encrypted });
@@ -35,10 +38,10 @@ export async function runBackup({ config, storage, logger, signal, tools }) {
       logger: log,
     });
 
-    const encryptor = encrypted ? createEncryptor(config.encryptionKey) : null;
+    const encryptor = encrypted && config.encryptionKey ? createEncryptor(config.encryptionKey) : null;
     const digest = new DigestStream();
     const body = new PassThrough({ highWaterMark: 1024 * 1024 });
-    const stages = [dump.stdout, encryptor?.stream, digest, body].filter(Boolean);
+    const stages = [dump.stdout, encryptor?.stream, digest, body].filter(Boolean) as any[];
 
     const [{ collections }] = await settleAll(controller, [
       dump.done,
@@ -47,7 +50,7 @@ export async function runBackup({ config, storage, logger, signal, tools }) {
         signal: controller.signal,
         onProgress: ({ loaded }) => log.debug({ uploadedBytes: loaded }, "Upload progress"),
       }),
-      pipeline(...stages, { signal: controller.signal }),
+      pipeline(...(stages as [any, ...any[]]), { signal: controller.signal }),
     ]);
 
     if (Object.keys(collections).length === 0) {
@@ -74,18 +77,18 @@ export async function runBackup({ config, storage, logger, signal, tools }) {
     const oplogStartTs = preOplog?.newestTs ?? oplogEndTs;
     const oplogWindow = oplogEndTs
       ? {
-          startTs: formatOplogTimestamp(oplogStartTs),
+          startTs: formatOplogTimestamp(oplogStartTs!),
           endTs: formatOplogTimestamp(oplogEndTs),
         }
       : null;
 
-    const manifest = {
+    const manifest: BackupManifest = {
       version: MANIFEST_VERSION,
       key,
       database: config.mongo.database,
       createdAt: startedAt.toISOString(),
       completedAt: completedAt.toISOString(),
-      durationMs: completedAt - startedAt,
+      durationMs: (completedAt as any) - (startedAt as any),
       size: digest.bytes,
       sha256: digest.digest(),
       compression: "gzip",

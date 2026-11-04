@@ -2,23 +2,27 @@
   "name": "mongodb-backup-service",
   "version": "1.0.0",
   "description": "Production MongoDB backup daemon with S3/R2 streaming, client-side encryption, automated restore drills, and Prometheus metrics",
-  "main": "src/index.js",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "bin": {
-    "mongodb-backup": "./src/index.js"
+    "mongodb-backup": "./dist/index.js"
   },
   "type": "module",
   "scripts": {
-    "start": "node src/index.js daemon",
-    "backup": "node src/index.js backup",
-    "restore": "node src/index.js restore",
-    "verify": "node src/index.js verify",
-    "list": "node src/index.js list",
-    "prune": "node src/index.js prune",
-    "drill": "node src/index.js drill",
-    "oplog:tail": "node src/index.js oplog:tail",
-    "oplog:slice": "node src/index.js oplog:slice",
-    "oplog:list": "node src/index.js oplog:list",
-    "key:generate": "node src/index.js key:generate",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js daemon",
+    "backup": "node dist/index.js backup",
+    "restore": "node dist/index.js restore",
+    "verify": "node dist/index.js verify",
+    "list": "node dist/index.js list",
+    "prune": "node dist/index.js prune",
+    "drill": "node dist/index.js drill",
+    "oplog:tail": "node dist/index.js oplog:tail",
+    "oplog:slice": "node dist/index.js oplog:slice",
+    "oplog:list": "node dist/index.js oplog:list",
+    "key:generate": "node dist/index.js key:generate",
     "test": "vitest run",
     "test:watch": "vitest"
   },
@@ -48,10 +52,15 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@types/node": "^26.6.6",
+    "@types/node-cron": "^3.0.11",
+    "@types/nodemailer": "^8.0.2",
     "eslint": "^10.13.0",
     "globals": "^17.13.0",
     "pino-pretty": "^13.2.0",
     "prettier": "^3.9.10",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
     "vitest": "^5.0.5"
   }
 }

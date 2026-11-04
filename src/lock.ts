@@ -2,10 +2,18 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import type {
+  AcquireDistributedLockOptions,
+  AcquireHybridLockOptions,
+  AcquireLockOptions,
+  LockPayload,
+  ReleaseLockFn,
+} from "./types/lock.js";
+import type { StorageClient } from "./types/storage.js";
 
 const UNREADABLE_GRACE_MS = 5_000;
 
-export async function acquireLock(file, { staleAfterMs }) {
+export async function acquireLock(file: string, { staleAfterMs }: AcquireLockOptions): Promise<ReleaseLockFn | null> {
   await fs.mkdir(path.dirname(file), { recursive: true });
   const token = randomUUID();
 
@@ -16,7 +24,7 @@ export async function acquireLock(file, { staleAfterMs }) {
       { flag: "wx" },
     );
     return () => release(file, token);
-  } catch (error) {
+  } catch (error: any) {
     if (error.code !== "EEXIST") throw error;
   }
 
@@ -47,26 +55,26 @@ export async function acquireLock(file, { staleAfterMs }) {
   }
 }
 
-export async function readLock(file) {
+export async function readLock(file: string): Promise<LockPayload | null> {
   try {
-    return JSON.parse(await fs.readFile(file, "utf8"));
+    return JSON.parse(await fs.readFile(file, "utf8")) as LockPayload;
   } catch {
     return null;
   }
 }
 
-async function release(file, token) {
+async function release(file: string, token: string): Promise<void> {
   const owner = await readLock(file);
   if (owner?.token === token) {
     await fs.rm(file, { force: true });
   }
 }
 
-async function isStale(file, staleAfterMs) {
+async function isStale(file: string, staleAfterMs: number): Promise<boolean> {
   let stat;
   try {
     stat = await fs.stat(file);
-  } catch (error) {
+  } catch (error: any) {
     if (error.code === "ENOENT") return true;
     throw error;
   }
@@ -79,26 +87,26 @@ async function isStale(file, staleAfterMs) {
   return !isAlive(owner.pid);
 }
 
-function isAlive(pid) {
+function isAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
-  } catch (error) {
+  } catch (error: any) {
     return error.code === "EPERM";
   }
 }
 
 export async function acquireDistributedLock(
-  storage,
-  lockKey,
+  storage?: StorageClient,
+  lockKey?: string,
   {
     holder = `${os.hostname()}:${process.pid}`,
     ttlMs = 90_000,
     heartbeatIntervalMs = 30_000,
     logger,
-  } = {},
-) {
-  if (!storage || typeof storage.acquireLock !== "function") {
+  }: AcquireDistributedLockOptions = {},
+): Promise<ReleaseLockFn | null> {
+  if (!storage || !lockKey || typeof storage.acquireLock !== "function") {
     return null;
   }
 
@@ -107,8 +115,8 @@ export async function acquireDistributedLock(
 
   const timer = setInterval(async () => {
     try {
-      await storage.refreshLock(lockKey, token, ttlMs);
-    } catch (err) {
+      await storage.refreshLock!(lockKey, token, ttlMs);
+    } catch (err: any) {
       logger?.warn({ err: err.message }, "Failed to refresh distributed S3 lock heartbeat");
     }
   }, heartbeatIntervalMs);
@@ -117,8 +125,8 @@ export async function acquireDistributedLock(
   return async function release() {
     clearInterval(timer);
     try {
-      await storage.releaseLock(lockKey, token);
-    } catch (err) {
+      await storage.releaseLock!(lockKey, token);
+    } catch (err: any) {
       logger?.warn({ err: err.message }, "Failed to release distributed S3 lock");
     }
   };
@@ -133,7 +141,7 @@ export async function acquireHybridLock({
   heartbeatIntervalMs = 30_000,
   holder,
   logger,
-}) {
+}: AcquireHybridLockOptions): Promise<ReleaseLockFn | null> {
   const localRelease = await acquireLock(file, { staleAfterMs });
   if (!localRelease) {
     return null;

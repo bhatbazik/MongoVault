@@ -1,21 +1,26 @@
 import { listBackups, manifestKey, scopeOf } from "./catalog.js";
 import { listOplogSlices } from "./oplog.js";
+import type { BackupSummary } from "./types/catalog.js";
+import type { DateParts } from "./types/common.js";
+import type { RetentionPolicy } from "./types/config.js";
+import type { OplogSlice } from "./types/oplog.js";
+import type { PruneContext, PruneOptions, PruneResult, RetentionPlan, RetentionTarget } from "./types/retention.js";
 
 const ORPHAN_AGE_MS = 60 * 60 * 1000;
 
-const PERIODS = {
+const PERIODS: Record<string, (parts: DateParts) => string> = {
   keepDaily: ({ year, month, day }) => `${year}-${month}-${day}`,
   keepWeekly: isoWeek,
   keepMonthly: ({ year, month }) => `${year}-${month}`,
 };
 
-export function planRetention(backups, policy, timeZone) {
-  const sorted = [...backups].sort((a, b) => b.createdAt - a.createdAt);
-  const keep = new Set(sorted.slice(0, Math.max(policy.keepLast ?? 0, 1)).map((b) => b.key));
+export function planRetention(backups: BackupSummary[], policy: RetentionPolicy, timeZone?: string): RetentionPlan {
+  const sorted = [...backups].sort((a, b) => (b.createdAt as unknown as number) - (a.createdAt as unknown as number));
+  const keep = new Set<string>(sorted.slice(0, Math.max(policy.keepLast ?? 0, 1)).map((b) => b.key));
 
   for (const [rule, period] of Object.entries(PERIODS)) {
-    const limit = policy[rule] ?? 0;
-    const seen = new Set();
+    const limit = (policy as Record<string, number | undefined>)[rule] ?? 0;
+    const seen = new Set<string>();
     for (const backup of sorted) {
       if (seen.size >= limit) break;
       const bucket = period(zonedDate(backup.createdAt, timeZone));
@@ -32,7 +37,7 @@ export function planRetention(backups, policy, timeZone) {
   };
 }
 
-export async function prune({ config, storage, logger }, { dryRun = false, now = Date.now() } = {}) {
+export async function prune({ config, storage, logger }: PruneContext, { dryRun = false, now = Date.now() }: PruneOptions = {}): Promise<PruneResult> {
   if (!config.retention) {
     throw new Error("No retention policy configured. Set one of the RETENTION_KEEP_* variables.");
   }
@@ -44,7 +49,7 @@ export async function prune({ config, storage, logger }, { dryRun = false, now =
     config.retention,
     config.schedule.timezone,
   );
-  const orphans = backups.filter((b) => !b.complete && now - b.createdAt > ORPHAN_AGE_MS);
+  const orphans = backups.filter((b) => !b.complete && now - (b.createdAt as unknown as number) > ORPHAN_AGE_MS);
 
   // Prune PITR oplog slices older than the oldest retained base backup
   const oldestKeptBackup = keep.length > 0 ? keep[keep.length - 1] : null;
@@ -60,10 +65,10 @@ export async function prune({ config, storage, logger }, { dryRun = false, now =
     return oldestKeptEpochSec !== null && slice.endTs.t < oldestKeptEpochSec;
   });
 
-  const targets = [...remove, ...orphans, ...expiredSlices];
+  const targets: RetentionTarget[] = [...remove, ...orphans, ...expiredSlices];
 
   if (!dryRun && targets.length > 0) {
-    const keysToDelete = [];
+    const keysToDelete: string[] = [];
     for (const backup of targets) {
       keysToDelete.push(manifestKey(backup.key), backup.key);
       logger.debug({ key: backup.key }, "Marked backup for deletion");
@@ -82,22 +87,22 @@ export async function prune({ config, storage, logger }, { dryRun = false, now =
   return { keep, remove: targets };
 }
 
-function zonedDate(date, timeZone) {
+function zonedDate(date: Date, timeZone?: string): DateParts {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone,
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
   }).formatToParts(date);
-  const value = (type) => parts.find((part) => part.type === type).value;
+  const value = (type: string) => parts.find((part) => part.type === type)!.value;
   return { year: value("year"), month: value("month"), day: value("day") };
 }
 
-function isoWeek({ year, month, day }) {
+function isoWeek({ year, month, day }: DateParts): string {
   const date = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)));
   const weekday = date.getUTCDay() || 7;
   date.setUTCDate(date.getUTCDate() + 4 - weekday);
   const weekYear = date.getUTCFullYear();
-  const week = Math.ceil(((date - Date.UTC(weekYear, 0, 1)) / 86_400_000 + 1) / 7);
+  const week = Math.ceil(((date.getTime() - Date.UTC(weekYear, 0, 1)) / 86_400_000 + 1) / 7);
   return `${weekYear}-W${String(week).padStart(2, "0")}`;
 }

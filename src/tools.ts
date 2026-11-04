@@ -1,21 +1,32 @@
-import { spawn } from "node:child_process";
+import { spawn, type StdioOptions } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
 import { formatDuration } from "./format.js";
+import type {
+  DumpLineResult,
+  MongodumpOptions,
+  MongodumpResult,
+  MongorestoreOptions,
+  MongorestoreResult,
+  ReplayOplogFileOptions,
+  RestoreLineResult,
+  RunToolOptions,
+  RunToolResult,
+} from "./types/tools.js";
 
 const KILL_GRACE_MS = 10_000;
 const TAIL_LINES = 40;
 const DUMPED = /(?:done dumping|dumped)\s+["']?([^.\s"']+)["']?\.["']?(.+?)["']?\s+\(([\d,]+)\s+documents?\)/i;
 const RESTORED = /([\d,]+)\s+document\(s\)\s+restored\s+successfully\.\s+([\d,]+)\s+document\(s\)\s+failed/i;
 
-export function isClusterDatabase(database) {
+export function isClusterDatabase(database?: string | null): boolean {
   return !database || database === "*" || database === "all";
 }
 
-export function parseDumpLine(line) {
+export function parseDumpLine(line: string): DumpLineResult | null {
   const match = DUMPED.exec(line);
   return match
     ? {
@@ -26,7 +37,7 @@ export function parseDumpLine(line) {
     : null;
 }
 
-export function parseRestoreLine(line) {
+export function parseRestoreLine(line: string): RestoreLineResult | null {
   const match = RESTORED.exec(line);
   return match
     ? {
@@ -36,20 +47,22 @@ export function parseRestoreLine(line) {
     : null;
 }
 
-export function runTool(command, args, { stdio, signal, timeoutMs, onLine = () => {} }) {
-  const child = spawn(command, args, { stdio });
-  const tail = [];
+export function runTool(command: string, args: string[], { stdio, signal, timeoutMs, onLine = () => {} }: RunToolOptions): RunToolResult {
+  const child = spawn(command, args, { stdio: stdio as StdioOptions });
+  const tail: string[] = [];
 
-  readline.createInterface({ input: child.stderr, crlfDelay: Infinity }).on("line", (line) => {
-    tail.push(line);
-    if (tail.length > TAIL_LINES) tail.shift();
-    onLine(line);
-  });
+  if (child.stderr) {
+    readline.createInterface({ input: child.stderr, crlfDelay: Infinity }).on("line", (line) => {
+      tail.push(line);
+      if (tail.length > TAIL_LINES) tail.shift();
+      onLine(line);
+    });
+  }
 
-  const done = new Promise((resolve, reject) => {
-    let failure = null;
+  const done = new Promise<void>((resolve, reject) => {
+    let failure: any = null;
 
-    const terminate = (reason) => {
+    const terminate = (reason: any) => {
       if (failure || child.exitCode !== null || child.signalCode !== null) return;
       failure = reason;
       child.kill("SIGTERM");
@@ -63,16 +76,16 @@ export function runTool(command, args, { stdio, signal, timeoutMs, onLine = () =
         )
       : null;
 
-    const onAbort = () => terminate(signal.reason ?? new Error(`${command} was aborted`));
+    const onAbort = () => terminate(signal?.reason ?? new Error(`${command} was aborted`));
     if (signal?.aborted) onAbort();
     else signal?.addEventListener("abort", onAbort, { once: true });
 
     const cleanup = () => {
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
     };
 
-    child.once("error", (error) => {
+    child.once("error", (error: any) => {
       cleanup();
       reject(
         error.code === "ENOENT"
@@ -104,7 +117,7 @@ export async function mongodump({
   timeoutMs,
   logger,
   command = "mongodump",
-}) {
+}: MongodumpOptions): Promise<MongodumpResult> {
   const isCluster = isClusterDatabase(database);
   if (oplog && !isCluster) {
     throw new Error("--oplog mode is only supported on full cluster dumps (database: * or all)");
@@ -130,7 +143,7 @@ export async function mongodump({
   }
 
   args.push("--archive", "--gzip");
-  const collections = {};
+  const collections: Record<string, number> = {};
 
   const { child, done } = runTool(command, args, {
     stdio: ["ignore", "pipe", "pipe"],
@@ -149,7 +162,7 @@ export async function mongodump({
   });
 
   return {
-    stdout: child.stdout,
+    stdout: child.stdout!,
     done: done.finally(cleanupConfig).then(() => ({ collections })),
   };
 }
@@ -168,7 +181,7 @@ export async function mongorestore({
   timeoutMs,
   logger,
   command = "mongorestore",
-}) {
+}: MongorestoreOptions): Promise<MongorestoreResult> {
   if (oplogLimit && !oplogReplay) {
     throw new Error("cannot use --oplogLimit without --oplogReplay enabled");
   }
@@ -186,7 +199,7 @@ export async function mongorestore({
   if (parallelCollections && parallelCollections > 0) {
     args.push(`--numParallelCollections=${parallelCollections}`);
   }
-  let summary = null;
+  let summary: RestoreLineResult | null = null;
 
   const { child, done } = runTool(command, args, {
     stdio: ["pipe", "ignore", "pipe"],
@@ -199,11 +212,11 @@ export async function mongorestore({
   });
 
   return {
-    stdin: child.stdin,
+    stdin: child.stdin!,
     done: done
       .finally(cleanupConfig)
       .then(() => {
-        if (summary?.failed > 0) {
+        if (summary && summary.failed > 0) {
           throw new Error(`mongorestore failed to restore ${summary.failed} documents`);
         }
         return summary ?? { restored: 0, failed: 0 };
@@ -220,7 +233,7 @@ export async function replayOplogFile({
   timeoutMs,
   logger,
   command = "mongorestore",
-}) {
+}: ReplayOplogFileOptions): Promise<void> {
   if (!oplogFile) {
     throw new Error("oplogFile is required for replayOplogFile");
   }
@@ -253,7 +266,7 @@ export async function replayOplogFile({
   }
 }
 
-async function writeUriConfig(workDir, uri) {
+async function writeUriConfig(workDir: string, uri: string): Promise<{ file: string; cleanup: () => Promise<void> }> {
   await fs.mkdir(workDir, { recursive: true });
   const file = path.join(workDir, `.${randomUUID()}.yaml`);
   await fs.writeFile(file, `uri: ${JSON.stringify(uri)}\n`, { mode: 0o600 });

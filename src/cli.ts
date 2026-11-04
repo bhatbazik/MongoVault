@@ -17,8 +17,9 @@ import { restoreBackup, verifyBackup } from "./restore.js";
 import { prune } from "./retention.js";
 import { createScheduler } from "./scheduler.js";
 import { createStorage } from "./storage.js";
+import type { AppConfig } from "./types/config.js";
 
-function printHelp() {
+function printHelp(): void {
   console.log(`
 mongodb-backup-service CLI
 
@@ -55,7 +56,7 @@ Options:
 `);
 }
 
-export async function runCli(config, argv = process.argv.slice(2)) {
+export async function runCli(config: AppConfig | null, argv: string[] = process.argv.slice(2)): Promise<void> {
   const command = argv[0];
 
   if (!command || command === "--help" || command === "-h" || command === "help") {
@@ -93,6 +94,11 @@ export async function runCli(config, argv = process.argv.slice(2)) {
     return;
   }
 
+  if (!config) {
+    console.error("Error: Configuration is required for command:", command);
+    process.exit(1);
+  }
+
   const logger = createLogger({
     level: config.logLevel,
     pretty: process.stdout.isTTY && !values.json,
@@ -113,7 +119,7 @@ export async function runCli(config, argv = process.argv.slice(2)) {
 
       scheduler.start();
 
-      const shutdown = async (signal) => {
+      const shutdown = async (signal: string) => {
         logger.info({ signal }, "Received shutdown signal, stopping daemon...");
         await scheduler.stop();
         if (httpServer) await httpServer.close();
@@ -138,7 +144,7 @@ export async function runCli(config, argv = process.argv.slice(2)) {
         );
         process.exit(1);
       }
-      const backupConfig = {
+      const backupConfig: AppConfig = {
         ...config,
         mongo: {
           ...config.mongo,
@@ -164,7 +170,7 @@ export async function runCli(config, argv = process.argv.slice(2)) {
           console.log(`Oplog:      ${Boolean(manifest.oplog)}`);
         }
         await notifier.notifySuccess("backup", manifest);
-      } catch (error) {
+      } catch (error: any) {
         await notifier.notifyFailure("backup", error);
         logger.error({ err: error }, "Manual backup execution failed");
         process.exit(1);
@@ -200,7 +206,7 @@ export async function runCli(config, argv = process.argv.slice(2)) {
             console.log(`Slices:     ${result.replayedSlices} replayed (${result.replayedEntries} entries)`);
           }
         }
-      } catch (error) {
+      } catch (error: any) {
         logger.error({ err: error }, "Restore execution failed");
         process.exit(1);
       }
@@ -222,7 +228,7 @@ export async function runCli(config, argv = process.argv.slice(2)) {
           console.log(`SHA-256:    ${result.sha256}`);
           console.log(`Encrypted:  ${result.encrypted}`);
         }
-      } catch (error) {
+      } catch (error: any) {
         logger.error({ err: error }, "Verification failed");
         process.exit(1);
       }
@@ -273,7 +279,7 @@ export async function runCli(config, argv = process.argv.slice(2)) {
             console.log(`  - ${item.key}`);
           }
         }
-      } catch (error) {
+      } catch (error: any) {
         logger.error({ err: error }, "Prune failed");
         process.exit(1);
       }
@@ -292,7 +298,7 @@ export async function runCli(config, argv = process.argv.slice(2)) {
           console.log(`Documents:   ${result.documents}`);
           console.log(`Duration:    ${formatDuration(result.durationMs)}`);
         }
-      } catch (error) {
+      } catch (error: any) {
         logger.error({ err: error }, "Restore drill failed");
         process.exit(1);
       }
@@ -307,16 +313,16 @@ export async function runCli(config, argv = process.argv.slice(2)) {
         } else if (manifest) {
           console.log("\nOplog Slice Captured Successfully");
           console.log(`Key:        ${manifest.key}`);
-          console.log(`Range:      ${formatOplogTimestamp(manifest.oplogWindow.startTs)} -> ${formatOplogTimestamp(manifest.oplogWindow.endTs)}`);
-          console.log(`Entries:    ${manifest.oplogWindow.entries}`);
+          console.log(`Range:      ${formatOplogTimestamp(manifest.oplogWindow!.startTs)} -> ${formatOplogTimestamp(manifest.oplogWindow!.endTs)}`);
+          console.log(`Entries:    ${manifest.oplogWindow!.entries}`);
           console.log(`Size:       ${formatBytes(manifest.size)}`);
-          if (manifest.oplogWindow.gapDetected) {
+          if (manifest.oplogWindow!.gapDetected) {
             console.log("WARNING:    Oplog gap detected prior to this slice; take a new base backup.");
           }
         } else {
           console.log("No new oplog entries since last checkpoint.");
         }
-      } catch (error) {
+      } catch (error: any) {
         logger.error({ err: error }, "Oplog slice capture failed");
         process.exit(1);
       }
@@ -326,7 +332,7 @@ export async function runCli(config, argv = process.argv.slice(2)) {
     case "oplog:tail": {
       const archiver = startOplogArchiver({ config, storage, logger, notifier });
       archiver.start();
-      const shutdown = async (signal) => {
+      const shutdown = async (signal: string) => {
         logger.info({ signal }, "Stopping continuous oplog archiver...");
         await archiver.stop();
         process.exit(0);

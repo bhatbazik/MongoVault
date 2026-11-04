@@ -21,9 +21,12 @@ RUN groupadd -g 10001 app \
   && chown -R app:app /tmp/mongodb-backup /app
 
 COPY package*.json ./
-RUN npm ci --omit=dev
+RUN npm ci
 
+COPY tsconfig.json ./
 COPY src ./src
+RUN npm run build \
+  && npm prune --omit=dev
 
 USER app
 
@@ -32,5 +35,5 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD node -e 'fetch("http://127.0.0.1:" + (process.env.HTTP_PORT || 8080) + "/healthz").then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))'
 
-ENTRYPOINT ["node", "src/index.js"]
+ENTRYPOINT ["node", "dist/index.js"]
 CMD ["daemon"]

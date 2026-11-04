@@ -1,21 +1,28 @@
 import path from "node:path";
-import cron from "node-cron";
+import cron, { type ScheduledTask } from "node-cron";
 import { runBackup } from "./backup.js";
 import { databasePrefix, scopeOf } from "./catalog.js";
 import { runDrill } from "./drill.js";
 import { acquireHybridLock } from "./lock.js";
 import { startOplogArchiver } from "./oplog.js";
 import { prune } from "./retention.js";
+import type { BackupManifest } from "./types/catalog.js";
+import type { OplogArchiver } from "./types/oplog.js";
+import type {
+  Scheduler,
+  SchedulerContext,
+  SchedulerState,
+} from "./types/scheduler.js";
 
-export function createScheduler({ config, storage, logger, notifier, metrics }) {
+export function createScheduler({ config, storage, logger, notifier, metrics }: SchedulerContext): Scheduler {
   const lockFile = path.join(config.workDir, ".backup.lock");
   const distLockKey = `${databasePrefix(scopeOf(config))}.locks/backup.lock.json`;
-  let activeBackupPromise = null;
-  let activeAbortController = null;
-  let oplogArchiver = null;
+  let activeBackupPromise: Promise<BackupManifest> | null = null;
+  let activeAbortController: AbortController | null = null;
+  let oplogArchiver: OplogArchiver | null = null;
   let isShuttingDown = false;
 
-  const state = {
+  const state: SchedulerState = {
     status: "idle",
     lastRunAt: null,
     lastSuccessAt: null,
@@ -24,10 +31,10 @@ export function createScheduler({ config, storage, logger, notifier, metrics }) 
     lastDrillAt: null,
   };
 
-  async function executeBackup() {
+  async function executeBackup(): Promise<void> {
     if (isShuttingDown) return;
 
-    let release;
+    let release: (() => Promise<void>) | null = null;
     try {
       release = await acquireHybridLock({
         file: lockFile,
@@ -36,7 +43,7 @@ export function createScheduler({ config, storage, logger, notifier, metrics }) 
         staleAfterMs: config.timeoutMs + 60_000,
         logger,
       });
-    } catch (lockError) {
+    } catch (lockError: any) {
       logger.error({ err: lockError }, "Failed to acquire lock for backup");
       state.status = "error";
       state.lastError = lockError.message;
@@ -76,7 +83,7 @@ export function createScheduler({ config, storage, logger, notifier, metrics }) 
           logger.error({ err: pruneError }, "Retention prune failed after backup");
         }
       }
-    } catch (error) {
+    } catch (error: any) {
       state.status = "error";
       state.lastError = error.message;
       metrics.recordBackupFailure(config.mongo.database);
@@ -89,7 +96,7 @@ export function createScheduler({ config, storage, logger, notifier, metrics }) 
     }
   }
 
-  async function executeDrill() {
+  async function executeDrill(): Promise<void> {
     if (isShuttingDown || !config.drill) return;
 
     logger.info("Executing scheduled restore drill");
@@ -105,18 +112,18 @@ export function createScheduler({ config, storage, logger, notifier, metrics }) 
         collections: { restoredCount: result.documents },
         sha256: "verified",
         encryption: false,
-      });
-    } catch (error) {
+      } as any);
+    } catch (error: any) {
       metrics.recordDrillFailure();
       await notifier.notifyFailure("drill", error);
       logger.error({ err: error }, "Scheduled restore drill failed");
     }
   }
 
-  const tasks = [];
+  const tasks: ScheduledTask[] = [];
 
   return {
-    getState() {
+    getState(): SchedulerState {
       return {
         ...state,
         uptimeSeconds: Math.floor(process.uptime()),
@@ -124,15 +131,15 @@ export function createScheduler({ config, storage, logger, notifier, metrics }) 
       };
     },
 
-    triggerBackup() {
+    triggerBackup(): Promise<void> {
       return executeBackup();
     },
 
-    triggerDrill() {
+    triggerDrill(): Promise<void> {
       return executeDrill();
     },
 
-    start() {
+    start(): void {
       logger.info(
         { cron: config.schedule.cron, timezone: config.schedule.timezone },
         "Registering backup schedule",
@@ -181,7 +188,7 @@ export function createScheduler({ config, storage, logger, notifier, metrics }) 
       }
     },
 
-    async stop() {
+    async stop(): Promise<void> {
       isShuttingDown = true;
       for (const task of tasks) {
         task.stop();

@@ -1,7 +1,10 @@
 import nodemailer from "nodemailer";
 import { formatBytes, formatDuration } from "./format.js";
+import type { AppConfig } from "./types/config.js";
+import type { Logger } from "./types/logger.js";
+import type { EmailOptions, NotificationFailureContext, Notifier } from "./types/notify.js";
 
-export function createNotifier(config, logger) {
+export function createNotifier(config: AppConfig, logger: Logger): Notifier {
   const { notifications } = config;
 
   const mailer = notifications.email
@@ -19,7 +22,7 @@ export function createNotifier(config, logger) {
       })
     : null;
 
-  async function sendEmail({ subject, text }) {
+  async function sendEmail({ subject, text }: EmailOptions): Promise<void> {
     if (!mailer || !notifications.email) return;
     try {
       await mailer.sendMail({
@@ -33,7 +36,7 @@ export function createNotifier(config, logger) {
     }
   }
 
-  async function postJson(url, payload) {
+  async function postJson(url: string, payload: unknown): Promise<void> {
     if (!url) return;
     try {
       const response = await fetch(url, {
@@ -49,7 +52,7 @@ export function createNotifier(config, logger) {
     }
   }
 
-  async function pingHeartbeat(ok, message, event) {
+  async function pingHeartbeat(ok: boolean, message?: string, event?: string): Promise<void> {
     const url = event === "drill"
       ? (notifications.drillHeartbeatUrl || notifications.heartbeatUrl)
       : notifications.heartbeatUrl;
@@ -69,7 +72,7 @@ export function createNotifier(config, logger) {
   }
 
   return {
-    async notifySuccess(event, data) {
+    async notifySuccess(event: string, data: any): Promise<void> {
       await pingHeartbeat(true, `${event} succeeded`, event);
 
       if (!notifications.onSuccess) return;
@@ -103,7 +106,7 @@ export function createNotifier(config, logger) {
       ]);
     },
 
-    async notifyFailure(event, error, context = {}) {
+    async notifyFailure(event: string, error: Error, context: NotificationFailureContext = {}): Promise<void> {
       await pingHeartbeat(false, error.message, event);
 
       const title = `MongoDB Backup Failed: ${context.database || config.mongo.database}`;

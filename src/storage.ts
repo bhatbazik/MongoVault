@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { Readable } from "node:stream";
 import {
   DeleteObjectCommand,
   DeleteObjectsCommand,
@@ -6,9 +7,18 @@ import {
   HeadObjectCommand,
   PutObjectCommand,
   S3Client,
+  type S3ClientConfig,
   paginateListObjectsV2,
 } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
+import type {
+  GetJsonResult,
+  StorageClient,
+  StorageHeadResult,
+  StorageObject,
+  StorageOptions,
+  UploadOptions,
+} from "./types/storage.js";
 
 export function createStorage({
   endpoint,
@@ -19,8 +29,8 @@ export function createStorage({
   forcePathStyle,
   partSizeMb = 32,
   queueSize = 2,
-}) {
-  const clientConfig = {
+}: StorageOptions): StorageClient {
+  const clientConfig: S3ClientConfig = {
     region,
     forcePathStyle,
     credentials: { accessKeyId, secretAccessKey },
@@ -38,10 +48,10 @@ export function createStorage({
   return {
     bucket,
 
-    async upload(key, body, { contentType = "application/octet-stream", signal, onProgress } = {}) {
+    async upload(key: string, body: unknown, { contentType = "application/octet-stream", signal, onProgress }: UploadOptions = {}): Promise<void> {
       const upload = new Upload({
         client,
-        params: { Bucket: bucket, Key: key, Body: body, ContentType: contentType },
+        params: { Bucket: bucket, Key: key, Body: body as any, ContentType: contentType },
         partSize,
         queueSize: concurrency,
         leavePartsOnError: false,
@@ -59,7 +69,7 @@ export function createStorage({
       }
     },
 
-    async head(key) {
+    async head(key: string): Promise<StorageHeadResult | null> {
       try {
         const response = await client.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
         return {
@@ -73,14 +83,14 @@ export function createStorage({
       }
     },
 
-    async download(key, { signal } = {}) {
+    async download(key: string, { signal }: { signal?: AbortSignal } = {}): Promise<Readable> {
       const response = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }), {
         abortSignal: signal,
       });
-      return response.Body;
+      return response.Body as Readable;
     },
 
-    async putJson(key, value) {
+    async putJson(key: string, value: unknown): Promise<void> {
       await client.send(
         new PutObjectCommand({
           Bucket: bucket,
@@ -91,10 +101,10 @@ export function createStorage({
       );
     },
 
-    async getJson(key) {
+    async getJson<T = unknown>(key: string): Promise<GetJsonResult<T> | null> {
       try {
         const response = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
-        const data = JSON.parse(await response.Body.transformToString());
+        const data = JSON.parse(await (response.Body as any).transformToString()) as T;
         const etag = response.ETag ? response.ETag.replace(/"/g, "") : null;
         return { data, etag };
       } catch (error) {
@@ -103,19 +113,19 @@ export function createStorage({
       }
     },
 
-    async *list(prefix) {
+    async *list(prefix: string): AsyncGenerator<StorageObject, void, unknown> {
       for await (const page of paginateListObjectsV2({ client }, { Bucket: bucket, Prefix: prefix })) {
         for (const object of page.Contents ?? []) {
-          yield { key: object.Key, size: Number(object.Size), lastModified: object.LastModified };
+          yield { key: object.Key!, size: Number(object.Size), lastModified: object.LastModified };
         }
       }
     },
 
-    async remove(key) {
+    async remove(key: string): Promise<void> {
       await client.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
     },
 
-    async removeMany(keys) {
+    async removeMany(keys: string[]): Promise<void> {
       if (!keys || keys.length === 0) return;
       const CHUNK_SIZE = 1000;
       for (let i = 0; i < keys.length; i += CHUNK_SIZE) {
@@ -136,9 +146,9 @@ export function createStorage({
       }
     },
 
-    async acquireLock(key, { holder, ttlMs }) {
+    async acquireLock(key: string, { holder, ttlMs }: { holder?: string; ttlMs: number }): Promise<string | null> {
       const now = Date.now();
-      const current = await this.getJson(key);
+      const current = await this.getJson<any>(key);
       const currentData = current?.data;
       if (currentData && currentData.expiresAt && currentData.expiresAt > now) {
         return null;
@@ -152,7 +162,7 @@ export function createStorage({
       };
 
       try {
-        const putParams = {
+        const putParams: any = {
           Bucket: bucket,
           Key: key,
           Body: JSON.stringify(lockData, null, 2),
@@ -174,22 +184,22 @@ export function createStorage({
         }
         if (isConditionalHeaderUnsupported(err)) {
           await this.putJson(key, lockData);
-          const readBack = await this.getJson(key);
+          const readBack = await this.getJson<any>(key);
           return readBack?.data?.token === token ? token : null;
         }
         throw err;
       }
     },
 
-    async refreshLock(key, token, ttlMs) {
-      const current = await this.getJson(key);
+    async refreshLock(key: string, token: string, ttlMs: number): Promise<boolean> {
+      const current = await this.getJson<any>(key);
       if (current?.data?.token === token) {
         const updated = {
           ...current.data,
           expiresAt: Date.now() + ttlMs,
         };
         try {
-          const putParams = {
+          const putParams: any = {
             Bucket: bucket,
             Key: key,
             Body: JSON.stringify(updated, null, 2),
@@ -211,8 +221,8 @@ export function createStorage({
       return false;
     },
 
-    async releaseLock(key, token) {
-      const current = await this.getJson(key);
+    async releaseLock(key: string, token: string): Promise<void> {
+      const current = await this.getJson<any>(key);
       if (current?.data?.token === token) {
         if (current.etag) {
           try {
@@ -235,7 +245,7 @@ export function createStorage({
   };
 }
 
-function isNotFound(error) {
+function isNotFound(error: any): boolean {
   return (
     error?.name === "NotFound" ||
     error?.name === "NoSuchKey" ||
@@ -243,7 +253,7 @@ function isNotFound(error) {
   );
 }
 
-function isPreconditionFailed(error) {
+function isPreconditionFailed(error: any): boolean {
   const status = error?.$metadata?.httpStatusCode;
   return (
     error?.name === "PreconditionFailed" ||
@@ -254,7 +264,7 @@ function isPreconditionFailed(error) {
   );
 }
 
-function isConditionalHeaderUnsupported(error) {
+function isConditionalHeaderUnsupported(error: any): boolean {
   const status = error?.$metadata?.httpStatusCode;
   return (
     error?.name === "NotImplemented" ||

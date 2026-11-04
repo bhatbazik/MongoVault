@@ -4,6 +4,7 @@ import cron from "node-cron";
 import { z } from "zod";
 import { isClusterScope } from "./catalog.js";
 import { parseKey, parseKeyRing } from "./crypto.js";
+import type { AppConfig, ConfigIssue } from "./types/config.js";
 
 const list = z
   .string()
@@ -15,7 +16,7 @@ const list = z
       .filter(Boolean),
   );
 
-const flag = (fallback) =>
+const flag = (fallback: boolean) =>
   z
     .enum(["true", "false", "1", "0"])
     .default(fallback ? "true" : "false")
@@ -114,14 +115,14 @@ const schema = z
     if (env.ENCRYPTION_KEY) {
       try {
         parseKey(env.ENCRYPTION_KEY);
-      } catch (error) {
+      } catch (error: any) {
         ctx.addIssue({ code: "custom", path: ["ENCRYPTION_KEY"], message: error.message });
       }
     }
     if (env.ENCRYPTION_KEY_RING) {
       try {
         parseKeyRing(env.ENCRYPTION_KEY_RING);
-      } catch (error) {
+      } catch (error: any) {
         ctx.addIssue({ code: "custom", path: ["ENCRYPTION_KEY_RING"], message: error.message });
       }
     }
@@ -150,7 +151,9 @@ const schema = z
   });
 
 export class ConfigError extends Error {
-  constructor(issues) {
+  issues: ConfigIssue[];
+
+  constructor(issues: any[]) {
     const details = issues.map((issue) => `  ${issue.path.join(".")}: ${issue.message}`);
     super(`Invalid configuration:\n${details.join("\n")}`);
     this.name = "ConfigError";
@@ -158,7 +161,7 @@ export class ConfigError extends Error {
   }
 }
 
-export function loadConfig(env = process.env) {
+export function loadConfig(env: Record<string, string | undefined> = process.env): AppConfig {
   const present = Object.fromEntries(
     Object.entries(env).filter(([, value]) => value !== undefined && value !== ""),
   );
@@ -169,7 +172,7 @@ export function loadConfig(env = process.env) {
   return toConfig(result.data);
 }
 
-function toConfig(env) {
+function toConfig(env: z.infer<typeof schema>): AppConfig {
   const retention = {
     keepLast: env.RETENTION_KEEP_LAST ?? 0,
     keepDaily: env.RETENTION_KEEP_DAILY ?? 0,
@@ -244,8 +247,8 @@ function toConfig(env) {
   };
 }
 
-function deduplicateKeys(keys) {
-  const seen = new Set();
+function deduplicateKeys(keys: Buffer[]): Buffer[] {
+  const seen = new Set<string>();
   return keys.filter((key) => {
     const hex = key.toString("hex");
     if (seen.has(hex)) return false;

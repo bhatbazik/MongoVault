@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { Writable } from "node:stream";
+import { type Transform, Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createGunzip } from "node:zlib";
 import { linkedController, settleAll } from "./abort.js";
@@ -14,15 +14,24 @@ import {
   resolvePitrPlan,
 } from "./oplog.js";
 import { mongorestore, replayOplogFile } from "./tools.js";
+import type { BackupManifest } from "./types/catalog.js";
+import type { AppConfig } from "./types/config.js";
+import type {
+  DescribeBackupResult,
+  RestoreContext,
+  RestoreOptions,
+  RestoreResult,
+  VerifyBackupResult,
+} from "./types/restore.js";
 
 export class IntegrityError extends Error {
-  constructor(message) {
+  constructor(message: string) {
     super(message);
     this.name = "IntegrityError";
   }
 }
 
-async function describeBackup({ config, storage }, ref) {
+async function describeBackup({ config, storage }: RestoreContext, ref: string): Promise<DescribeBackupResult> {
   const key = await resolveBackup(storage, scopeOf(config), ref);
   const manifest = await readManifest(storage, key);
   const object = manifest ? null : await storage.head(key);
@@ -34,7 +43,7 @@ async function describeBackup({ config, storage }, ref) {
       `Manifest key mismatch for ${key}: manifest belongs to ${manifest.key}`,
     );
   }
-  const checksum = manifest?.sha256 ?? object.metadata.sha256 ?? null;
+  const checksum = manifest?.sha256 ?? object?.metadata?.sha256 ?? null;
 
   const keyRing = config.encryptionKeyRing || (config.encryptionKey ? [config.encryptionKey] : []);
   if (manifest?.encryption) {
@@ -43,25 +52,25 @@ async function describeBackup({ config, storage }, ref) {
     }
     try {
       verifyManifest(keyRing, manifest);
-    } catch (error) {
+    } catch (error: any) {
       throw new IntegrityError(error.message);
     }
   }
   return { key, manifest, checksum };
 }
 
-function decryptStage(config, manifest) {
+function decryptStage(config: AppConfig, manifest: BackupManifest | null): Transform[] {
   const keyRing = config.encryptionKeyRing || (config.encryptionKey ? [config.encryptionKey] : []);
   return manifest?.encryption ? [createDecryptor(keyRing, manifest.encryption)] : [];
 }
 
-function assertChecksum(key, expected, actual) {
+function assertChecksum(key: string, expected: string | null, actual: string): void {
   if (expected && expected !== actual) {
     throw new IntegrityError(`Checksum mismatch for ${key}: expected ${expected}, got ${actual}`);
   }
 }
 
-export async function verifyBackup(ctx, ref = "latest") {
+export async function verifyBackup(ctx: RestoreContext, ref: string = "latest"): Promise<VerifyBackupResult> {
   const { config, storage, logger, signal } = ctx;
   const { key, manifest, checksum } = await describeBackup(ctx, ref);
   if (!checksum) {
@@ -73,15 +82,18 @@ export async function verifyBackup(ctx, ref = "latest") {
   const discard = new Writable({ write: (_chunk, _encoding, callback) => callback() });
 
   try {
-    await pipeline(
+    const stages = [
       await storage.download(key, { signal }),
       digest,
       ...decryptStage(config, manifest),
       createGunzip(),
       discard,
+    ];
+    await pipeline(
+      ...(stages as [any, ...any[]]),
       { signal },
     );
-  } catch (error) {
+  } catch (error: any) {
     if (error.name === "AbortError") throw error;
     throw new IntegrityError(`${key} could not be read back: ${error.message}`);
   }
@@ -97,7 +109,7 @@ export async function verifyBackup(ctx, ref = "latest") {
 }
 
 export async function restoreBackup(
-  ctx,
+  ctx: RestoreContext,
   {
     ref = "latest",
     uri,
@@ -108,8 +120,8 @@ export async function restoreBackup(
     oplogLimit,
     pitr,
     parallelCollections,
-  },
-) {
+  }: RestoreOptions,
+): Promise<RestoreResult> {
   if (pitr) {
     return restorePointInTime(ctx, {
       pitr,
@@ -150,7 +162,8 @@ export async function restoreBackup(
 
   const controller = linkedController(signal);
   try {
-    const restore = await tools.mongorestore({
+    const effectiveMongorestore = tools.mongorestore ?? mongorestore;
+    const restore = await effectiveMongorestore({
       uri,
       workDir: config.workDir,
       nsInclude: isFilteredCluster ? `${target}.*` : (isRenamedDb ? `${source}.*` : undefined),
@@ -168,14 +181,17 @@ export async function restoreBackup(
     log.info({ source, target, drop }, "Streaming restore pipeline from storage (zero-disk)");
     const digest = new DigestStream();
     const downloadStream = await storage.download(key, { signal: controller.signal });
+    const stages = [
+      downloadStream,
+      digest,
+      ...decryptStage(config, manifest),
+      restore.stdin,
+    ];
 
     const [summary] = await settleAll(controller, [
       restore.done,
       pipeline(
-        downloadStream,
-        digest,
-        ...decryptStage(config, manifest),
-        restore.stdin,
+        ...(stages as [any, ...any[]]),
         { signal: controller.signal },
       ),
     ]);
@@ -195,7 +211,7 @@ export async function restoreBackup(
 }
 
 export async function restorePointInTime(
-  ctx,
+  ctx: RestoreContext,
   {
     pitr,
     uri,
@@ -203,11 +219,11 @@ export async function restorePointInTime(
     drop = false,
     preVerify = drop,
     parallelCollections,
-  },
-) {
+  }: RestoreOptions,
+): Promise<RestoreResult> {
   const { config, storage, logger, signal, tools } = ctx;
   const effectiveReplay = tools?.replayOplogFile ?? replayOplogFile;
-  const plan = await resolvePitrPlan(storage, scopeOf(config), pitr);
+  const plan = await resolvePitrPlan(storage, scopeOf(config), pitr!);
   const targetLimit = formatOplogTimestamp(plan.targetTs);
 
   logger.info(

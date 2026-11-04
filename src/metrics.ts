@@ -1,7 +1,8 @@
 import http from "node:http";
 import client from "prom-client";
+import type { HttpServerInstance, HttpServerOptions, MetricsRegistry } from "./types/metrics.js";
 
-export function createMetricsRegistry() {
+export function createMetricsRegistry(): MetricsRegistry {
   const register = new client.Registry();
   client.collectDefaultMetrics({ register, prefix: "mongodb_backup_" });
 
@@ -48,27 +49,27 @@ export function createMetricsRegistry() {
   });
 
   return {
-    recordBackupSuccess(database, sizeBytes, durationMs) {
+    recordBackupSuccess(database: string, sizeBytes: number, durationMs: number): void {
       backupRunsTotal.inc({ status: "success", database });
       backupDurationSeconds.observe({ database }, durationMs / 1000);
       backupSizeBytes.set({ database }, sizeBytes);
       backupLastSuccessTimestamp.set({ database }, Math.floor(Date.now() / 1000));
     },
 
-    recordBackupFailure(database) {
+    recordBackupFailure(database: string): void {
       backupRunsTotal.inc({ status: "failure", database });
     },
 
-    recordDrillSuccess() {
+    recordDrillSuccess(): void {
       drillRunsTotal.inc({ status: "success" });
       drillLastSuccessTimestamp.set(Math.floor(Date.now() / 1000));
     },
 
-    recordDrillFailure() {
+    recordDrillFailure(): void {
       drillRunsTotal.inc({ status: "failure" });
     },
 
-    async getMetrics() {
+    async getMetrics(): Promise<string> {
       return register.metrics();
     },
 
@@ -76,14 +77,14 @@ export function createMetricsRegistry() {
   };
 }
 
-export function startHttpServer({ port, metrics, getState, logger }) {
+export function startHttpServer({ port, metrics, getState, logger }: HttpServerOptions): HttpServerInstance | null {
   if (!port || port <= 0) return null;
 
   const server = http.createServer(async (req, res) => {
     try {
       if (req.method === "GET" && (req.url === "/healthz" || req.url === "/ready")) {
         const state = getState ? getState() : { status: "ok" };
-        const isHealthy = state.status !== "error" && !state.isShuttingDown;
+        const isHealthy = state.status !== "error" && !("isShuttingDown" in state && (state as any).isShuttingDown);
         res.writeHead(isHealthy ? 200 : 503, { "Content-Type": "application/json" });
         return res.end(JSON.stringify(state));
       }
@@ -108,8 +109,8 @@ export function startHttpServer({ port, metrics, getState, logger }) {
   });
 
   return {
-    close() {
-      return new Promise((resolve) => server.close(resolve));
+    close(): Promise<void> {
+      return new Promise((resolve) => server.close(() => resolve()));
     },
   };
 }

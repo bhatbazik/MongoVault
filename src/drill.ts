@@ -1,9 +1,17 @@
-import { MongoClient } from "mongodb";
+import { type Db, MongoClient } from "mongodb";
 import { isClusterScope, readManifest, resolveBackup, scopeOf } from "./catalog.js";
 import { restoreBackup } from "./restore.js";
+import type {
+  DrillContext,
+  DrillMismatch,
+  DrillResult,
+  DrillVariance,
+} from "./types/drill.js";
 
 export class DrillError extends Error {
-  constructor(key, mismatches) {
+  mismatches: DrillMismatch[];
+
+  constructor(key: string, mismatches: DrillMismatch[]) {
     const details = mismatches.map(
       ({ collection, expected, actual }) => `  ${collection}: expected ${expected}, restored ${actual}`,
     );
@@ -13,12 +21,12 @@ export class DrillError extends Error {
   }
 }
 
-export async function runDrill(ctx) {
+export async function runDrill(ctx: DrillContext): Promise<DrillResult> {
   const {
     config,
     storage,
     logger,
-    createMongoClient = (uri) => new MongoClient(uri),
+    createMongoClient = (uri: string) => new MongoClient(uri),
   } = ctx;
   if (!config.drill) {
     throw new Error("DRILL_MONGODB_URI is not set");
@@ -34,13 +42,16 @@ export async function runDrill(ctx) {
   const startedAt = Date.now();
   const key = await resolveBackup(storage, scopeOf(config), "latest");
   const manifest = await readManifest(storage, key);
+  if (!manifest) {
+    throw new Error(`Manifest not found for ${key}`);
+  }
   const isCluster = isClusterScope(manifest.database);
   const drillTag = `drill_${Date.now()}`;
   const client = createMongoClient(config.drill.uri);
 
   logger.info({ key, isCluster, oplog: Boolean(manifest.oplog) }, "Restore drill started");
 
-  const restoredDbs = new Set();
+  const restoredDbs = new Set<string>();
   try {
     await client.connect();
 
@@ -60,8 +71,8 @@ export async function runDrill(ctx) {
       const db = client.db(database);
       const existingCollections = await getExistingCollectionNames(db);
       const hasOplog = Boolean(manifest.oplog);
-      const mismatches = [];
-      const variances = [];
+      const mismatches: DrillMismatch[] = [];
+      const variances: DrillVariance[] = [];
 
       for (const [colKey, expected] of Object.entries(manifest.collections || {})) {
         if (existingCollections && !existingCollections.has(colKey)) {
@@ -71,7 +82,7 @@ export async function runDrill(ctx) {
           continue;
         }
 
-        let actual;
+        let actual: number | null;
         try {
           actual = await db.collection(colKey).countDocuments();
         } catch {
@@ -102,7 +113,7 @@ export async function runDrill(ctx) {
         );
       }
 
-      const result = {
+      const result: DrillResult = {
         key,
         database,
         collections: Object.keys(manifest.collections || {}).length,
@@ -130,14 +141,14 @@ export async function runDrill(ctx) {
         preVerify: false,
       });
 
-      const existingByDb = new Map();
+      const existingByDb = new Map<string, Set<string> | null>();
       for (const dbName of restoredDbs) {
         existingByDb.set(dbName, await getExistingCollectionNames(client.db(dbName)));
       }
 
       const hasOplog = Boolean(manifest.oplog);
-      const mismatches = [];
-      const variances = [];
+      const mismatches: DrillMismatch[] = [];
+      const variances: DrillVariance[] = [];
 
       for (const [colKey, expected] of Object.entries(manifest.collections || {})) {
         const firstDot = colKey.indexOf(".");
@@ -153,7 +164,7 @@ export async function runDrill(ctx) {
           continue;
         }
 
-        let actual;
+        let actual: number | null;
         try {
           actual = await client.db(dbName).collection(colName).countDocuments();
         } catch {
@@ -184,7 +195,7 @@ export async function runDrill(ctx) {
         );
       }
 
-      const result = {
+      const result: DrillResult = {
         key,
         database: "_cluster",
         collections: Object.keys(manifest.collections || {}).length,
@@ -203,7 +214,7 @@ export async function runDrill(ctx) {
   }
 }
 
-async function getExistingCollectionNames(db) {
+async function getExistingCollectionNames(db: Db): Promise<Set<string> | null> {
   if (typeof db.listCollections !== "function") return null;
   try {
     const items = await db.listCollections({}, { nameOnly: true }).toArray();

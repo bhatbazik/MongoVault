@@ -1,11 +1,12 @@
 import pino from "pino";
+import type { Logger, LoggerOptions } from "./types/logger.js";
 
-export function createLogger({ level = "info", pretty = false } = {}) {
-  const options = {
+export function createLogger({ level = "info", pretty = false }: LoggerOptions = {}): Logger {
+  const options: pino.LoggerOptions = {
     level,
     timestamp: pino.stdTimeFunctions.isoTime,
     formatters: {
-      level(label) {
+      level(label: string) {
         return { level: label };
       },
     },
