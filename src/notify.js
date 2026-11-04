@@ -49,12 +49,15 @@ export function createNotifier(config, logger) {
     }
   }
 
-  async function pingHeartbeat(ok, message) {
-    if (!notifications.heartbeatUrl) return;
+  async function pingHeartbeat(ok, message, event) {
+    const url = event === "drill"
+      ? (notifications.drillHeartbeatUrl || notifications.heartbeatUrl)
+      : notifications.heartbeatUrl;
+    if (!url) return;
     try {
       const target = ok
-        ? notifications.heartbeatUrl
-        : `${notifications.heartbeatUrl.replace(/\/+$/, "")}/fail`;
+        ? url
+        : `${url.replace(/\/+$/, "")}/fail`;
       await fetch(target, {
         method: "POST",
         headers: { "Content-Type": "text/plain" },
@@ -67,7 +70,7 @@ export function createNotifier(config, logger) {
 
   return {
     async notifySuccess(event, data) {
-      await pingHeartbeat(true, `${event} succeeded`);
+      await pingHeartbeat(true, `${event} succeeded`, event);
 
       if (!notifications.onSuccess) return;
 
@@ -101,7 +104,7 @@ export function createNotifier(config, logger) {
     },
 
     async notifyFailure(event, error, context = {}) {
-      await pingHeartbeat(false, error.message);
+      await pingHeartbeat(false, error.message, event);
 
       const title = `MongoDB Backup Failed: ${context.database || config.mongo.database}`;
       const summary = [

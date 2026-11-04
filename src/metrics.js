@@ -83,7 +83,8 @@ export function startHttpServer({ port, metrics, getState, logger }) {
     try {
       if (req.method === "GET" && (req.url === "/healthz" || req.url === "/ready")) {
         const state = getState ? getState() : { status: "ok" };
-        res.writeHead(200, { "Content-Type": "application/json" });
+        const isHealthy = state.status !== "error" && !state.isShuttingDown;
+        res.writeHead(isHealthy ? 200 : 503, { "Content-Type": "application/json" });
         return res.end(JSON.stringify(state));
       }
 

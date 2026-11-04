@@ -2,7 +2,8 @@ import os from "node:os";
 import path from "node:path";
 import cron from "node-cron";
 import { z } from "zod";
-import { parseKey } from "./crypto.js";
+import { isClusterScope } from "./catalog.js";
+import { parseKey, parseKeyRing } from "./crypto.js";
 
 const list = z
   .string()
@@ -64,6 +65,7 @@ const schema = z
     WORK_DIR: z.string().default(path.join(os.tmpdir(), "mongodb-backup")),
 
     ENCRYPTION_KEY: z.string().optional(),
+    ENCRYPTION_KEY_RING: z.string().optional(),
 
     RETENTION_KEEP_LAST: count,
     RETENTION_KEEP_DAILY: count,
@@ -84,6 +86,7 @@ const schema = z
     SLACK_WEBHOOK_URL: z.string().url().optional(),
     WEBHOOK_URL: z.string().url().optional(),
     HEARTBEAT_URL: z.string().url().optional(),
+    DRILL_HEARTBEAT_URL: z.string().url().optional(),
     NOTIFY_ON_SUCCESS: flag(true),
 
     HTTP_PORT: z.coerce.number().int().min(0).max(65535).default(8080),
@@ -110,6 +113,20 @@ const schema = z
       } catch (error) {
         ctx.addIssue({ code: "custom", path: ["ENCRYPTION_KEY"], message: error.message });
       }
+    }
+    if (env.ENCRYPTION_KEY_RING) {
+      try {
+        parseKeyRing(env.ENCRYPTION_KEY_RING);
+      } catch (error) {
+        ctx.addIssue({ code: "custom", path: ["ENCRYPTION_KEY_RING"], message: error.message });
+      }
+    }
+    if (env.MONGODB_OPLOG && !isClusterScope(env.MONGODB_DATABASE)) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["MONGODB_OPLOG"],
+        message: "MONGODB_OPLOG can only be used with full cluster backup (MONGODB_DATABASE: * or all)",
+      });
     }
   });
 
@@ -174,6 +191,10 @@ function toConfig(env) {
     timeoutMs: env.BACKUP_TIMEOUT_MINUTES * 60_000,
     workDir: env.WORK_DIR,
     encryptionKey: env.ENCRYPTION_KEY ? parseKey(env.ENCRYPTION_KEY) : null,
+    encryptionKeyRing: [
+      ...(env.ENCRYPTION_KEY ? [parseKey(env.ENCRYPTION_KEY)] : []),
+      ...(env.ENCRYPTION_KEY_RING ? parseKeyRing(env.ENCRYPTION_KEY_RING) : []),
+    ],
     retention: retentionEnabled ? retention : null,
     drill: env.DRILL_MONGODB_URI ? { uri: env.DRILL_MONGODB_URI, cron: env.DRILL_CRON ?? null } : null,
     notifications: {
@@ -192,6 +213,7 @@ function toConfig(env) {
       slackWebhookUrl: env.SLACK_WEBHOOK_URL ?? null,
       webhookUrl: env.WEBHOOK_URL ?? null,
       heartbeatUrl: env.HEARTBEAT_URL ?? null,
+      drillHeartbeatUrl: env.DRILL_HEARTBEAT_URL ?? null,
     },
     http: { port: env.HTTP_PORT },
     logLevel: env.LOG_LEVEL,

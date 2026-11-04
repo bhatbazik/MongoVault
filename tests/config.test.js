@@ -57,4 +57,25 @@ describe("config", () => {
 
     expect(() => loadConfig({ ...minimalValidEnv, ENCRYPTION_KEY: "invalid-key" })).toThrow();
   });
+
+  it("rejects MONGODB_OPLOG with single database scope", () => {
+    expect(() =>
+      loadConfig({
+        ...minimalValidEnv,
+        MONGODB_DATABASE: "my_db",
+        MONGODB_OPLOG: "true",
+      }),
+    ).toThrow("MONGODB_OPLOG can only be used with full cluster backup");
+  });
+
+  it("parses ENCRYPTION_KEY_RING for key rotation", () => {
+    const k1 = "a".repeat(64);
+    const k2 = "b".repeat(64);
+    const config = loadConfig({
+      ...minimalValidEnv,
+      ENCRYPTION_KEY: k1,
+      ENCRYPTION_KEY_RING: `${k2}, ${k1}`,
+    });
+    expect(config.encryptionKeyRing.length).toBe(3);
+  });
 });

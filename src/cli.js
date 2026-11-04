@@ -17,7 +17,8 @@ function printHelp() {
 mongodb-backup-service CLI
 
 Usage:
-  node src/cli.js <command> [options]
+  mongodb-backup <command> [options]
+  node src/index.js <command> [options]
 
 Commands:
   daemon               Run backup service in daemon mode with scheduler and metrics
@@ -73,7 +74,7 @@ export async function runCli(config, argv = process.argv.slice(2)) {
       json: { type: "boolean", default: false },
       help: { type: "boolean", short: "h" },
     },
-    strict: false,
+    strict: true,
   });
 
   if (values.help) {
@@ -114,12 +115,18 @@ export async function runCli(config, argv = process.argv.slice(2)) {
     }
 
     case "backup": {
+      const targetDb = values.database || config.mongo.database;
+      const targetOplog = values.oplog || config.mongo.oplog;
+      if (targetOplog && !isClusterScope(targetDb)) {
+        console.error("Error: --oplog can only be used with full cluster backup (database: * or all)");
+        process.exit(1);
+      }
       const backupConfig = {
         ...config,
         mongo: {
           ...config.mongo,
-          database: values.database || config.mongo.database,
-          oplog: values.oplog || config.mongo.oplog,
+          database: targetDb,
+          oplog: targetOplog,
           parallelCollections: values.parallel
             ? Number(values.parallel)
             : config.mongo.parallelCollections,

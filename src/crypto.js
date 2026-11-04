@@ -12,6 +12,7 @@ export const CHUNK_SIZE = 64 * 1024;
 export const KEY_LENGTH = 32;
 export const IV_LENGTH = 12;
 export const TAG_LENGTH = 16;
+export const MAX_FRAME_SIZE = 10 * 1024 * 1024; // 10 MB max frame size safety limit
 
 export function parseKey(value) {
   const key = /^[0-9a-f]{64}$/i.test(value)
@@ -21,6 +22,15 @@ export function parseKey(value) {
     throw new Error(`Encryption key must be ${KEY_LENGTH} bytes (base64 or hex encoded)`);
   }
   return key;
+}
+
+export function parseKeyRing(value) {
+  if (!value) return [];
+  const entries = Array.isArray(value) ? value : String(value).split(",");
+  return entries
+    .map((k) => k.trim())
+    .filter(Boolean)
+    .map((k) => parseKey(k));
 }
 
 export function generateKey() {
@@ -36,6 +46,13 @@ export function deriveNonce(baseNonce, frameIndex) {
   // Store 32-bit frame sequence in the last 4 bytes of 12-byte IV
   nonce.writeUInt32BE(frameIndex >>> 0, 8);
   return nonce;
+}
+
+export function computeAad(frameIndex, isFinal) {
+  const aad = Buffer.alloc(5);
+  aad.writeUInt32BE(frameIndex >>> 0, 0);
+  aad.writeUInt8(isFinal ? 1 : 0, 4);
+  return aad;
 }
 
 export class ChunkedAeadEncryptStream extends Transform {
@@ -77,8 +94,12 @@ export class ChunkedAeadEncryptStream extends Transform {
   }
 
   #encryptAndEmit(plaintext, isFinal) {
-    const nonce = deriveNonce(this.#baseNonce, this.#frameIndex++);
+    const frameIdx = this.#frameIndex++;
+    const nonce = deriveNonce(this.#baseNonce, frameIdx);
     const cipher = createCipheriv(ALGORITHM, this.#dataKey, nonce);
+    const aad = computeAad(frameIdx, isFinal);
+    cipher.setAAD(aad);
+
     const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
     const authTag = cipher.getAuthTag();
 
@@ -113,6 +134,9 @@ export class ChunkedAeadDecryptStream extends Transform {
       while (this.#bufferedBytes >= 5 + IV_LENGTH + TAG_LENGTH) {
         const combined = this.#buffer.length === 1 ? this.#buffer[0] : Buffer.concat(this.#buffer);
         const cipherLength = combined.readUInt32BE(0);
+        if (cipherLength > MAX_FRAME_SIZE) {
+          throw new Error(`AEAD frame size exceeds limit (${cipherLength} > ${MAX_FRAME_SIZE})`);
+        }
         const totalFrameSize = 5 + IV_LENGTH + cipherLength + TAG_LENGTH;
 
         if (combined.length < totalFrameSize) {
@@ -126,13 +150,17 @@ export class ChunkedAeadDecryptStream extends Transform {
         const ciphertext = combined.subarray(5 + IV_LENGTH, 5 + IV_LENGTH + cipherLength);
         const authTag = combined.subarray(5 + IV_LENGTH + cipherLength, totalFrameSize);
 
-        const expectedNonce = deriveNonce(this.#baseNonce, this.#frameIndex);
+        const frameIdx = this.#frameIndex;
+        const expectedNonce = deriveNonce(this.#baseNonce, frameIdx);
         if (!nonce.equals(expectedNonce)) {
-          throw new Error(`AEAD frame sequence corrupted or reordered at frame ${this.#frameIndex}`);
+          throw new Error(`AEAD frame sequence corrupted or reordered at frame ${frameIdx}`);
         }
 
         const decipher = createDecipheriv(ALGORITHM, this.#dataKey, nonce);
         decipher.setAuthTag(authTag);
+        const aad = computeAad(frameIdx, isFinal);
+        decipher.setAAD(aad);
+
         const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
 
         this.#frameIndex++;
@@ -158,7 +186,7 @@ export class ChunkedAeadDecryptStream extends Transform {
         new Error(`Incomplete AEAD frame at end of stream (${this.#bufferedBytes} trailing bytes)`),
       );
     }
-    if (!this.#seenFinal && this.#frameIndex > 0) {
+    if (!this.#seenFinal) {
       return callback(
         new Error("Truncated AEAD stream: end of stream reached before final frame"),
       );
@@ -184,16 +212,19 @@ export function createEncryptor(masterKey) {
   };
 }
 
-export function createDecryptor(masterKey, envelope) {
+export function createDecryptor(masterKeys, envelope) {
   if (envelope.algorithm !== ALGORITHM && envelope.algorithm !== CHUNKED_ALGORITHM) {
     throw new Error(`Unsupported encryption algorithm: ${envelope.algorithm}`);
   }
-  if (envelope.keyId !== keyId(masterKey)) {
+  const keys = Array.isArray(masterKeys) ? masterKeys : [masterKeys];
+  const matchedKey = keys.find((k) => keyId(k) === envelope.keyId);
+  if (!matchedKey) {
+    const configuredIds = keys.map((k) => keyId(k)).join(", ");
     throw new Error(
-      `Backup was encrypted with key ${envelope.keyId}, but the configured key is ${keyId(masterKey)}`,
+      `Backup was encrypted with key ${envelope.keyId}, but configured key ring has: [${configuredIds}]`,
     );
   }
-  const dataKey = unwrap(masterKey, envelope.wrappedKey);
+  const dataKey = unwrap(matchedKey, envelope.wrappedKey);
   const ivBuffer = Buffer.from(envelope.iv, "base64");
 
   if (envelope.algorithm === CHUNKED_ALGORITHM) {

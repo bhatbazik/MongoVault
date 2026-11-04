@@ -23,14 +23,16 @@ async function describeBackup({ config, storage }, ref) {
   }
   const checksum = manifest?.sha256 ?? object.metadata.sha256 ?? null;
 
-  if (manifest?.encryption && !config.encryptionKey) {
+  const keyRing = config.encryptionKeyRing || (config.encryptionKey ? [config.encryptionKey] : []);
+  if (manifest?.encryption && keyRing.length === 0) {
     throw new Error(`${key} is encrypted, but ENCRYPTION_KEY is not set`);
   }
   return { key, manifest, checksum };
 }
 
 function decryptStage(config, manifest) {
-  return manifest?.encryption ? [createDecryptor(config.encryptionKey, manifest.encryption)] : [];
+  const keyRing = config.encryptionKeyRing || (config.encryptionKey ? [config.encryptionKey] : []);
+  return manifest?.encryption ? [createDecryptor(keyRing, manifest.encryption)] : [];
 }
 
 function assertChecksum(key, expected, actual) {
@@ -95,6 +97,11 @@ export async function restoreBackup(
   const isCluster = isClusterScope(source);
 
   if (!checksum) log.warn("Backup has no checksum; restoring without an integrity check");
+
+  if (drop) {
+    log.info({ ref, drop }, "Pre-verifying backup archive integrity and checksum before dropping collections");
+    await verifyBackup(ctx, ref);
+  }
 
   const controller = linkedController(signal);
   try {

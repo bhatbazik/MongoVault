@@ -67,6 +67,7 @@ export async function resolveBackup(storage, scope, ref = "latest") {
   return latest.key;
 }
 
-export function readManifest(storage, key) {
-  return storage.getJson(manifestKey(key));
+export async function readManifest(storage, key) {
+  const result = await storage.getJson(manifestKey(key));
+  return result && typeof result === "object" && "data" in result ? result.data : result;
 }

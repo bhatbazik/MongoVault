@@ -169,4 +169,48 @@ describe("crypto", () => {
     const envelope = encryptor.envelope();
     expect(() => createDecryptor(keyB, envelope)).toThrow("Backup was encrypted with key");
   });
+
+  it("authenticates frame header and prevents truncation by tampering with isFinal flag", async () => {
+    const masterKey = parseKey(generateKey());
+    const payload = randomBytes(64 * 1024 * 3 + 100);
+    const encryptor = createEncryptor(masterKey);
+    const chunks = [];
+
+    await pipeline(
+      Readable.from(payload),
+      encryptor.stream,
+      async function* (source) {
+        for await (const chunk of source) chunks.push(chunk);
+      },
+    );
+
+    const envelope = encryptor.envelope();
+    const fullCiphertext = Buffer.concat(chunks);
+    const frameSize = 5 + 12 + 64 * 1024 + 16;
+    // Keep first 2 frames and flip frame #2's isFinal byte to 1
+    const truncated = Buffer.from(fullCiphertext.subarray(0, frameSize * 2));
+    truncated.writeUInt8(1, frameSize + 4);
+
+    const decipher = createDecryptor(masterKey, envelope);
+    await expect(
+      pipeline(Readable.from(truncated), decipher, async function* (s) {
+        for await (const c of s) yield c;
+      }),
+    ).rejects.toThrow();
+  });
+
+  it("supports key rotation with key ring array", async () => {
+    const oldKey = parseKey(generateKey());
+    const newKey = parseKey(generateKey());
+    const encryptor = createEncryptor(oldKey);
+
+    await pipeline(Readable.from(Buffer.from("data")), encryptor.stream, async function* (s) {
+      for await (const c of s) yield c;
+    });
+
+    const envelope = encryptor.envelope();
+    // Decryptor provided with key ring [newKey, oldKey]
+    const decipher = createDecryptor([newKey, oldKey], envelope);
+    expect(decipher).toBeDefined();
+  });
 });

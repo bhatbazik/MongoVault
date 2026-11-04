@@ -25,13 +25,21 @@ export function createScheduler({ config, storage, logger, notifier, metrics }) 
   async function executeBackup() {
     if (isShuttingDown) return;
 
-    const release = await acquireHybridLock({
-      file: lockFile,
-      storage,
-      lockKey: distLockKey,
-      staleAfterMs: config.timeoutMs + 60_000,
-      logger,
-    });
+    let release;
+    try {
+      release = await acquireHybridLock({
+        file: lockFile,
+        storage,
+        lockKey: distLockKey,
+        staleAfterMs: config.timeoutMs + 60_000,
+        logger,
+      });
+    } catch (lockError) {
+      logger.error({ err: lockError }, "Failed to acquire lock for backup");
+      state.status = "error";
+      state.lastError = lockError.message;
+      return;
+    }
 
     if (!release) {
       logger.warn("Skipping backup: another process holds the local or distributed lock");
@@ -132,7 +140,9 @@ export function createScheduler({ config, storage, logger, notifier, metrics }) 
         config.schedule.cron,
         () => {
           logger.info("Backup schedule triggered by cron");
-          void executeBackup();
+          executeBackup().catch((err) => {
+            logger.error({ err }, "Unhandled error during scheduled backup execution");
+          });
         },
         { timezone: config.schedule.timezone },
       );
@@ -147,7 +157,9 @@ export function createScheduler({ config, storage, logger, notifier, metrics }) 
           config.drill.cron,
           () => {
             logger.info("Drill schedule triggered by cron");
-            void executeDrill();
+            executeDrill().catch((err) => {
+              logger.error({ err }, "Unhandled error during scheduled drill execution");
+            });
           },
           { timezone: config.schedule.timezone },
         );
@@ -156,7 +168,9 @@ export function createScheduler({ config, storage, logger, notifier, metrics }) 
 
       if (config.schedule.runOnStart) {
         logger.info("BACKUP_ON_START is true; queuing initial backup run");
-        void executeBackup();
+        executeBackup().catch((err) => {
+          logger.error({ err }, "Unhandled error during initial backup run");
+        });
       }
     },
 

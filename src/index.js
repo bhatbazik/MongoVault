@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 import "dotenv/config";
 import { runCli } from "./cli.js";
 import { loadConfig } from "./config.js";
