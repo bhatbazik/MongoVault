@@ -1,3 +1,6 @@
+import { randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
 import { Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createGunzip } from "node:zlib";
@@ -5,7 +8,12 @@ import { linkedController, settleAll } from "./abort.js";
 import { isClusterScope, readManifest, resolveBackup, scopeOf } from "./catalog.js";
 import { createDecryptor, verifyManifest } from "./crypto.js";
 import { DigestStream } from "./digest.js";
-import { mongorestore } from "./tools.js";
+import {
+  downloadAndExtractOplogSlice,
+  formatOplogTimestamp,
+  resolvePitrPlan,
+} from "./oplog.js";
+import { mongorestore, replayOplogFile } from "./tools.js";
 
 export class IntegrityError extends Error {
   constructor(message) {
@@ -98,9 +106,21 @@ export async function restoreBackup(
     preVerify = drop,
     oplogReplay,
     oplogLimit,
+    pitr,
     parallelCollections,
   },
 ) {
+  if (pitr) {
+    return restorePointInTime(ctx, {
+      pitr,
+      uri,
+      database,
+      drop,
+      preVerify,
+      parallelCollections,
+    });
+  }
+
   const { config, storage, logger, signal, tools = { mongorestore } } = ctx;
   const { key, manifest, checksum } = await describeBackup(ctx, ref);
   const log = logger.child({ key });
@@ -169,6 +189,92 @@ export async function restoreBackup(
 
     log.info({ restored: summary.restored, target }, "Restore completed");
     return { key, source, target, restored: summary.restored, manifest };
+  } finally {
+    controller.dispose();
+  }
+}
+
+export async function restorePointInTime(
+  ctx,
+  {
+    pitr,
+    uri,
+    database,
+    drop = false,
+    preVerify = drop,
+    parallelCollections,
+  },
+) {
+  const { config, storage, logger, signal, tools } = ctx;
+  const effectiveReplay = tools?.replayOplogFile ?? replayOplogFile;
+  const plan = await resolvePitrPlan(storage, scopeOf(config), pitr);
+  const targetLimit = formatOplogTimestamp(plan.targetTs);
+
+  logger.info(
+    {
+      baseKey: plan.baseBackup.key,
+      baseEndTs: formatOplogTimestamp(plan.baseEndTs),
+      slicesCount: plan.slices.length,
+      targetTs: targetLimit,
+    },
+    "Resolved Point-in-Time Recovery (PITR) plan",
+  );
+
+  // Stage 1: Restore base backup
+  const baseResult = await restoreBackup(ctx, {
+    ref: plan.baseBackup.key,
+    uri,
+    database,
+    drop,
+    preVerify,
+    oplogReplay: Boolean(plan.baseManifest?.oplog),
+    oplogLimit: plan.slices.length === 0 && plan.baseManifest?.oplog ? targetLimit : undefined,
+    parallelCollections,
+  });
+
+  // Stage 2: Sequentially download, verify, decrypt, and replay continuous oplog slices up to targetLimit
+  const controller = linkedController(signal);
+  let replayedEntries = 0;
+
+  try {
+    for (const slice of plan.slices) {
+      const sliceFile = path.join(config.workDir, `.pitr-slice-${randomUUID()}.oplog.bson`);
+      try {
+        const extracted = await downloadAndExtractOplogSlice(
+          { config, storage, signal: controller.signal },
+          slice.key,
+          sliceFile,
+        );
+        await effectiveReplay({
+          uri,
+          workDir: config.workDir,
+          oplogFile: sliceFile,
+          oplogLimit: targetLimit,
+          timeoutMs: config.timeoutMs,
+          signal: controller.signal,
+          logger,
+        });
+        replayedEntries += extracted.manifest?.oplogWindow?.entries ?? 0;
+        logger.info(
+          {
+            sliceKey: slice.key,
+            startTs: formatOplogTimestamp(slice.startTs),
+            endTs: formatOplogTimestamp(slice.endTs),
+            oplogLimit: targetLimit,
+          },
+          "Replayed PITR oplog slice",
+        );
+      } finally {
+        await fs.rm(sliceFile, { force: true }).catch(() => {});
+      }
+    }
+
+    return {
+      ...baseResult,
+      pitrTarget: targetLimit,
+      replayedSlices: plan.slices.length,
+      replayedEntries,
+    };
   } finally {
     controller.dispose();
   }

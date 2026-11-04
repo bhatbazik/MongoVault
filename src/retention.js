@@ -1,4 +1,5 @@
 import { listBackups, manifestKey, scopeOf } from "./catalog.js";
+import { listOplogSlices } from "./oplog.js";
 
 const ORPHAN_AGE_MS = 60 * 60 * 1000;
 
@@ -36,14 +37,30 @@ export async function prune({ config, storage, logger }, { dryRun = false, now =
     throw new Error("No retention policy configured. Set one of the RETENTION_KEEP_* variables.");
   }
 
-  const backups = await listBackups(storage, scopeOf(config));
+  const scope = scopeOf(config);
+  const backups = await listBackups(storage, scope);
   const { keep, remove } = planRetention(
     backups.filter((backup) => backup.complete),
     config.retention,
     config.schedule.timezone,
   );
   const orphans = backups.filter((b) => !b.complete && now - b.createdAt > ORPHAN_AGE_MS);
-  const targets = [...remove, ...orphans];
+
+  // Prune PITR oplog slices older than the oldest retained base backup
+  const oldestKeptBackup = keep.length > 0 ? keep[keep.length - 1] : null;
+  const oldestKeptEpochSec = oldestKeptBackup
+    ? Math.floor(new Date(oldestKeptBackup.createdAt).getTime() / 1000)
+    : null;
+  const slices = await listOplogSlices(storage, scope);
+  const expiredSlices = slices.filter((slice) => {
+    if (!slice.complete) {
+      const sliceAgeMs = now - (slice.lastModified ? new Date(slice.lastModified).getTime() : slice.endTs.t * 1000);
+      return sliceAgeMs > ORPHAN_AGE_MS;
+    }
+    return oldestKeptEpochSec !== null && slice.endTs.t < oldestKeptEpochSec;
+  });
+
+  const targets = [...remove, ...orphans, ...expiredSlices];
 
   if (!dryRun && targets.length > 0) {
     const keysToDelete = [];

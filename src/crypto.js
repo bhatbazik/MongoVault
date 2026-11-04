@@ -269,6 +269,7 @@ function canonicalManifestPayload(manifest) {
   }
   return JSON.stringify({
     version: manifest.version,
+    ...(manifest.type ? { type: manifest.type } : {}),
     key: manifest.key,
     database: manifest.database,
     createdAt: manifest.createdAt,
@@ -277,6 +278,7 @@ function canonicalManifestPayload(manifest) {
     sha256: manifest.sha256,
     compression: manifest.compression,
     oplog: Boolean(manifest.oplog),
+    ...(manifest.oplogWindow ? { oplogWindow: manifest.oplogWindow } : {}),
     excludedCollections: manifest.excludedCollections ?? [],
     collections: manifest.collections ?? {},
     encryption: cleanEncryption,

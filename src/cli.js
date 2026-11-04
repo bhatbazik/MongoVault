@@ -7,6 +7,12 @@ import { formatBytes, formatDate, formatDuration } from "./format.js";
 import { createLogger } from "./logger.js";
 import { createMetricsRegistry, startHttpServer } from "./metrics.js";
 import { createNotifier } from "./notify.js";
+import {
+  captureOplogSlice,
+  formatOplogTimestamp,
+  listOplogSlices,
+  startOplogArchiver,
+} from "./oplog.js";
 import { restoreBackup, verifyBackup } from "./restore.js";
 import { prune } from "./retention.js";
 import { createScheduler } from "./scheduler.js";
@@ -23,11 +29,14 @@ Usage:
 Commands:
   daemon               Run backup service in daemon mode with scheduler and metrics
   backup               Execute an immediate backup to configured storage
-  restore              Restore a backup archive to MongoDB
+  restore              Restore a backup archive (or continuous PITR target) to MongoDB
   verify               Stream and verify backup checksum and decompression
   list                 List available backups in configured bucket
   prune                Apply retention policy and clean up expired backups
   drill                Run automated restore drill and verify document counts
+  oplog:tail           Run continuous oplog archiver daemon for second-level PITR
+  oplog:slice          Capture and upload a single incremental oplog slice now
+  oplog:list           List archived PITR oplog slices in configured bucket
   key:generate         Generate a new random AES-256 base64 encryption key
 
 Options:
@@ -37,7 +46,8 @@ Options:
   --drop                  Drop existing collections before restoring
   --oplog                 Capture point-in-time oplog during backup
   --oplog-replay          Replay captured oplog during restore
-  --oplog-limit <ts:inc>  Target timestamp for point-in-time recovery (e.g. 1774092000:1)
+  --oplog-limit <ts:inc>  Target timestamp for snapshot oplog replay (e.g. 1774092000:1)
+  --pitr <iso|ts:inc>     Restore to exact point-in-time using base backup + oplog slices
   --parallel <number>     Number of collections to dump/restore concurrently (default: 2)
   --dry-run               Simulate retention prune without deleting objects
   --json                  Output machine-readable JSON format
@@ -69,6 +79,7 @@ export async function runCli(config, argv = process.argv.slice(2)) {
       oplog: { type: "boolean", default: false },
       "oplog-replay": { type: "boolean", default: false },
       "oplog-limit": { type: "string" },
+      pitr: { type: "string" },
       parallel: { type: "string" },
       "dry-run": { type: "boolean", default: false },
       json: { type: "boolean", default: false },
@@ -173,6 +184,7 @@ export async function runCli(config, argv = process.argv.slice(2)) {
             drop: values.drop,
             oplogReplay: values["oplog-replay"],
             oplogLimit: values["oplog-limit"],
+            pitr: values.pitr,
             parallelCollections: values.parallel ? Number(values.parallel) : undefined,
           },
         );
@@ -183,6 +195,10 @@ export async function runCli(config, argv = process.argv.slice(2)) {
           console.log(`Key:        ${result.key}`);
           console.log(`Target DB:  ${result.target}`);
           console.log(`Restored:   ${result.restored} documents`);
+          if (result.pitrTarget) {
+            console.log(`PITR Limit: ${result.pitrTarget}`);
+            console.log(`Slices:     ${result.replayedSlices} replayed (${result.replayedEntries} entries)`);
+          }
         }
       } catch (error) {
         logger.error({ err: error }, "Restore execution failed");
@@ -279,6 +295,70 @@ export async function runCli(config, argv = process.argv.slice(2)) {
       } catch (error) {
         logger.error({ err: error }, "Restore drill failed");
         process.exit(1);
+      }
+      break;
+    }
+
+    case "oplog:slice": {
+      try {
+        const manifest = await captureOplogSlice({ config, storage, logger });
+        if (values.json) {
+          console.log(JSON.stringify(manifest, null, 2));
+        } else if (manifest) {
+          console.log("\nOplog Slice Captured Successfully");
+          console.log(`Key:        ${manifest.key}`);
+          console.log(`Range:      ${formatOplogTimestamp(manifest.oplogWindow.startTs)} -> ${formatOplogTimestamp(manifest.oplogWindow.endTs)}`);
+          console.log(`Entries:    ${manifest.oplogWindow.entries}`);
+          console.log(`Size:       ${formatBytes(manifest.size)}`);
+          if (manifest.oplogWindow.gapDetected) {
+            console.log("WARNING:    Oplog gap detected prior to this slice; take a new base backup.");
+          }
+        } else {
+          console.log("No new oplog entries since last checkpoint.");
+        }
+      } catch (error) {
+        logger.error({ err: error }, "Oplog slice capture failed");
+        process.exit(1);
+      }
+      break;
+    }
+
+    case "oplog:tail": {
+      const archiver = startOplogArchiver({ config, storage, logger, notifier });
+      archiver.start();
+      const shutdown = async (signal) => {
+        logger.info({ signal }, "Stopping continuous oplog archiver...");
+        await archiver.stop();
+        process.exit(0);
+      };
+      process.on("SIGINT", () => void shutdown("SIGINT"));
+      process.on("SIGTERM", () => void shutdown("SIGTERM"));
+      break;
+    }
+
+    case "oplog:list": {
+      const slices = await listOplogSlices(storage, scopeOf(config));
+      if (values.json) {
+        console.log(JSON.stringify(slices, null, 2));
+      } else {
+        if (slices.length === 0) {
+          console.log("No PITR oplog slices found in target prefix.");
+          return;
+        }
+        console.log(
+          ["Key".padEnd(64), "Start TS".padEnd(16), "End TS".padEnd(16), "Size"].join(" "),
+        );
+        console.log("-".repeat(110));
+        for (const s of slices) {
+          console.log(
+            [
+              s.key.padEnd(64),
+              formatOplogTimestamp(s.startTs).padEnd(16),
+              formatOplogTimestamp(s.endTs).padEnd(16),
+              formatBytes(s.size),
+            ].join(" "),
+          );
+        }
       }
       break;
     }

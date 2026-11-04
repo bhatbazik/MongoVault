@@ -211,6 +211,48 @@ export async function mongorestore({
   };
 }
 
+export async function replayOplogFile({
+  uri,
+  workDir,
+  oplogFile,
+  oplogLimit,
+  signal,
+  timeoutMs,
+  logger,
+  command = "mongorestore",
+}) {
+  if (!oplogFile) {
+    throw new Error("oplogFile is required for replayOplogFile");
+  }
+  const { file: configFile, cleanup: cleanupConfig } = await writeUriConfig(workDir, uri);
+  const emptyDir = path.join(workDir, `.empty-${randomUUID()}`);
+  await fs.mkdir(emptyDir, { recursive: true });
+
+  const args = [`--config=${configFile}`, "--oplogReplay", `--oplogFile=${oplogFile}`];
+  if (oplogLimit) {
+    args.push(`--oplogLimit=${oplogLimit}`);
+  }
+  args.push(`--dir=${emptyDir}`);
+
+  const { done } = runTool(command, args, {
+    stdio: ["ignore", "ignore", "pipe"],
+    signal,
+    timeoutMs,
+    onLine: (line) => {
+      logger?.debug({ tool: "mongorestore-oplog" }, line);
+    },
+  });
+
+  try {
+    await done;
+  } finally {
+    await Promise.allSettled([
+      cleanupConfig(),
+      fs.rm(emptyDir, { recursive: true, force: true }),
+    ]);
+  }
+}
+
 async function writeUriConfig(workDir, uri) {
   await fs.mkdir(workDir, { recursive: true });
   const file = path.join(workDir, `.${randomUUID()}.yaml`);

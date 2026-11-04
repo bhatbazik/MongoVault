@@ -4,6 +4,7 @@ import { runBackup } from "./backup.js";
 import { databasePrefix, scopeOf } from "./catalog.js";
 import { runDrill } from "./drill.js";
 import { acquireHybridLock } from "./lock.js";
+import { startOplogArchiver } from "./oplog.js";
 import { prune } from "./retention.js";
 
 export function createScheduler({ config, storage, logger, notifier, metrics }) {
@@ -11,6 +12,7 @@ export function createScheduler({ config, storage, logger, notifier, metrics }) 
   const distLockKey = `${databasePrefix(scopeOf(config))}.locks/backup.lock.json`;
   let activeBackupPromise = null;
   let activeAbortController = null;
+  let oplogArchiver = null;
   let isShuttingDown = false;
 
   const state = {
@@ -166,6 +168,11 @@ export function createScheduler({ config, storage, logger, notifier, metrics }) 
         tasks.push(drillTask);
       }
 
+      if (config.pitr?.enabled) {
+        oplogArchiver = startOplogArchiver({ config, storage, logger, notifier });
+        oplogArchiver.start();
+      }
+
       if (config.schedule.runOnStart) {
         logger.info("BACKUP_ON_START is true; queuing initial backup run");
         executeBackup().catch((err) => {
@@ -178,6 +185,10 @@ export function createScheduler({ config, storage, logger, notifier, metrics }) 
       isShuttingDown = true;
       for (const task of tasks) {
         task.stop();
+      }
+
+      if (oplogArchiver) {
+        await oplogArchiver.stop();
       }
 
       if (activeAbortController) {

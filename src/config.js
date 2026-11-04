@@ -67,6 +67,10 @@ const schema = z
     ENCRYPTION_KEY: z.string().optional(),
     ENCRYPTION_KEY_RING: z.string().optional(),
 
+    PITR_ENABLED: flag(false),
+    PITR_FLUSH_INTERVAL_SECONDS: z.coerce.number().int().min(5).max(3600).default(60),
+    PITR_MAX_SLICE_MB: z.coerce.number().int().min(1).max(256).default(16),
+
     RETENTION_KEEP_LAST: count,
     RETENTION_KEEP_DAILY: count,
     RETENTION_KEEP_WEEKLY: count,
@@ -128,6 +132,13 @@ const schema = z
         message: "MONGODB_OPLOG can only be used with full cluster backup (MONGODB_DATABASE: * or all)",
       });
     }
+    if (env.PITR_ENABLED && !isClusterScope(env.MONGODB_DATABASE)) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["PITR_ENABLED"],
+        message: "PITR_ENABLED can only be used with full cluster backup (MONGODB_DATABASE: * or all)",
+      });
+    }
     if (env.MONGODB_EXCLUDE_COLLECTIONS.length > 0 && isClusterScope(env.MONGODB_DATABASE)) {
       ctx.addIssue({
         code: "custom",
@@ -177,8 +188,13 @@ function toConfig(env) {
       uri: env.MONGODB_URI,
       database: env.MONGODB_DATABASE,
       excludeCollections: env.MONGODB_EXCLUDE_COLLECTIONS,
-      oplog: env.MONGODB_OPLOG,
+      oplog: env.MONGODB_OPLOG || env.PITR_ENABLED,
       parallelCollections: env.MONGODB_PARALLEL_COLLECTIONS,
+    },
+    pitr: {
+      enabled: env.PITR_ENABLED,
+      flushIntervalSeconds: env.PITR_FLUSH_INTERVAL_SECONDS,
+      maxSliceMb: env.PITR_MAX_SLICE_MB,
     },
     storage: {
       bucket: env.S3_BUCKET,

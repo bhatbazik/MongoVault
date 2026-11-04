@@ -4,9 +4,11 @@ import { linkedController, settleAll } from "./abort.js";
 import { MANIFEST_VERSION, archiveKey, manifestKey, scopeOf } from "./catalog.js";
 import { createEncryptor, signManifest } from "./crypto.js";
 import { DigestStream } from "./digest.js";
+import { formatOplogTimestamp, getOplogBounds } from "./oplog.js";
 import { mongodump } from "./tools.js";
 
-export async function runBackup({ config, storage, logger, signal, tools = { mongodump } }) {
+export async function runBackup({ config, storage, logger, signal, tools }) {
+  const effectiveTools = tools ?? { mongodump, getOplogBounds };
   const startedAt = new Date();
   const encrypted = Boolean(config.encryptionKey);
   const key = archiveKey(scopeOf(config), startedAt, { encrypted });
@@ -16,7 +18,12 @@ export async function runBackup({ config, storage, logger, signal, tools = { mon
   log.info({ database: config.mongo.database, encrypted }, "Backup started");
 
   try {
-    const dump = await tools.mongodump({
+    const preOplog =
+      config.mongo.oplog && effectiveTools.getOplogBounds
+        ? await effectiveTools.getOplogBounds(config.mongo.uri).catch(() => null)
+        : null;
+
+    const dump = await effectiveTools.mongodump({
       uri: config.mongo.uri,
       database: config.mongo.database,
       excludeCollections: config.mongo.excludeCollections,
@@ -57,7 +64,21 @@ export async function runBackup({ config, storage, logger, signal, tools = { mon
       );
     }
 
+    const postOplog =
+      config.mongo.oplog && effectiveTools.getOplogBounds
+        ? await effectiveTools.getOplogBounds(config.mongo.uri).catch(() => null)
+        : null;
+
     const completedAt = new Date();
+    const oplogEndTs = postOplog?.newestTs ?? preOplog?.newestTs ?? null;
+    const oplogStartTs = preOplog?.newestTs ?? oplogEndTs;
+    const oplogWindow = oplogEndTs
+      ? {
+          startTs: formatOplogTimestamp(oplogStartTs),
+          endTs: formatOplogTimestamp(oplogEndTs),
+        }
+      : null;
+
     const manifest = {
       version: MANIFEST_VERSION,
       key,
@@ -71,6 +92,7 @@ export async function runBackup({ config, storage, logger, signal, tools = { mon
       encryption: encryptor?.envelope() ?? null,
       excludedCollections: config.mongo.excludeCollections,
       oplog: Boolean(config.mongo.oplog),
+      ...(oplogWindow ? { oplogWindow } : {}),
       collections,
     };
     if (manifest.encryption && config.encryptionKey) {

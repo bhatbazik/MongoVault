@@ -15,6 +15,9 @@
     "list": "node src/index.js list",
     "prune": "node src/index.js prune",
     "drill": "node src/index.js drill",
+    "oplog:tail": "node src/index.js oplog:tail",
+    "oplog:slice": "node src/index.js oplog:slice",
+    "oplog:list": "node src/index.js oplog:list",
     "key:generate": "node src/index.js key:generate",
     "test": "vitest run",
     "test:watch": "vitest"
