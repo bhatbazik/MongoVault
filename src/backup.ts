@@ -10,7 +10,13 @@ import type { BackupContext } from "./types/backup.js";
 import type { BackupManifest } from "./types/catalog.js";
 import type { BackupTools } from "./types/tools.js";
 
-export async function runBackup({ config, storage, logger, signal, tools }: BackupContext): Promise<BackupManifest> {
+export async function runBackup({
+  config,
+  storage,
+  logger,
+  signal,
+  tools,
+}: BackupContext): Promise<BackupManifest> {
   const effectiveTools: BackupTools = tools ?? { mongodump, getOplogBounds };
   const startedAt = new Date();
   const encrypted = Boolean(config.encryptionKey);
@@ -38,10 +44,12 @@ export async function runBackup({ config, storage, logger, signal, tools }: Back
       logger: log,
     });
 
-    const encryptor = encrypted && config.encryptionKey ? createEncryptor(config.encryptionKey) : null;
+    const encryptor =
+      encrypted && config.encryptionKey ? createEncryptor(config.encryptionKey) : null;
     const digest = new DigestStream();
     const body = new PassThrough({ highWaterMark: 1024 * 1024 });
-    const stages = [dump.stdout, encryptor?.stream, digest, body].filter(Boolean) as any[];
+    const stages = [dump.stdout, encryptor?.stream, digest, body].filter(Boolean);
+    const runPipeline = pipeline as unknown as (...args: unknown[]) => Promise<void>;
 
     const [{ collections }] = await settleAll(controller, [
       dump.done,
@@ -50,7 +58,7 @@ export async function runBackup({ config, storage, logger, signal, tools }: Back
         signal: controller.signal,
         onProgress: ({ loaded }) => log.debug({ uploadedBytes: loaded }, "Upload progress"),
       }),
-      pipeline(...(stages as [any, ...any[]]), { signal: controller.signal }),
+      runPipeline(...stages, { signal: controller.signal }),
     ]);
 
     if (Object.keys(collections).length === 0) {
@@ -88,7 +96,7 @@ export async function runBackup({ config, storage, logger, signal, tools }: Back
       database: config.mongo.database,
       createdAt: startedAt.toISOString(),
       completedAt: completedAt.toISOString(),
-      durationMs: (completedAt as any) - (startedAt as any),
+      durationMs: completedAt.getTime() - startedAt.getTime(),
       size: digest.bytes,
       sha256: digest.digest(),
       compression: "gzip",

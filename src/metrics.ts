@@ -77,22 +77,30 @@ export function createMetricsRegistry(): MetricsRegistry {
   };
 }
 
-export function startHttpServer({ port, metrics, getState, logger }: HttpServerOptions): HttpServerInstance | null {
+export function startHttpServer({
+  port,
+  metrics,
+  getState,
+  logger,
+}: HttpServerOptions): HttpServerInstance | null {
   if (!port || port <= 0) return null;
 
   const server = http.createServer(async (req, res) => {
     try {
       if (req.method === "GET" && (req.url === "/healthz" || req.url === "/ready")) {
         const state = getState ? getState() : { status: "ok" };
-        const isHealthy = state.status !== "error" && !("isShuttingDown" in state && (state as any).isShuttingDown);
+        const isHealthy =
+          state.status !== "error" && !("isShuttingDown" in state && Boolean(state.isShuttingDown));
         res.writeHead(isHealthy ? 200 : 503, { "Content-Type": "application/json" });
-        return res.end(JSON.stringify(state));
+        res.end(JSON.stringify(state));
+        return;
       }
 
       if (req.method === "GET" && req.url === "/metrics") {
         const data = await metrics.getMetrics();
         res.writeHead(200, { "Content-Type": metrics.contentType });
-        return res.end(data);
+        res.end(data);
+        return;
       }
 
       res.writeHead(404, { "Content-Type": "text/plain" });

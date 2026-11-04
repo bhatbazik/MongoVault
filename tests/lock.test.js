@@ -2,12 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import {
-  acquireDistributedLock,
-  acquireHybridLock,
-  acquireLock,
-  readLock,
-} from "../src/lock.js";
+import { acquireDistributedLock, acquireHybridLock, acquireLock, readLock } from "../src/lock.js";
 
 describe("lock", () => {
   let tmpDir;
@@ -46,7 +41,11 @@ describe("lock", () => {
 
     await fs.writeFile(
       lockFile,
-      JSON.stringify({ pid: process.pid, token: "other-token", acquiredAt: new Date().toISOString() }),
+      JSON.stringify({
+        pid: process.pid,
+        token: "other-token",
+        acquiredAt: new Date().toISOString(),
+      }),
     );
 
     await releaseA();

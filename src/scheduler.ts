@@ -8,13 +8,15 @@ import { startOplogArchiver } from "./oplog.js";
 import { prune } from "./retention.js";
 import type { BackupManifest } from "./types/catalog.js";
 import type { OplogArchiver } from "./types/oplog.js";
-import type {
-  Scheduler,
-  SchedulerContext,
-  SchedulerState,
-} from "./types/scheduler.js";
+import type { Scheduler, SchedulerContext, SchedulerState } from "./types/scheduler.js";
 
-export function createScheduler({ config, storage, logger, notifier, metrics }: SchedulerContext): Scheduler {
+export function createScheduler({
+  config,
+  storage,
+  logger,
+  notifier,
+  metrics,
+}: SchedulerContext): Scheduler {
   const lockFile = path.join(config.workDir, ".backup.lock");
   const distLockKey = `${databasePrefix(scopeOf(config))}.locks/backup.lock.json`;
   let activeBackupPromise: Promise<BackupManifest> | null = null;
@@ -34,7 +36,7 @@ export function createScheduler({ config, storage, logger, notifier, metrics }: 
   async function executeBackup(): Promise<void> {
     if (isShuttingDown) return;
 
-    let release: (() => Promise<void>) | null = null;
+    let release: (() => Promise<void>) | null;
     try {
       release = await acquireHybridLock({
         file: lockFile,
@@ -43,10 +45,11 @@ export function createScheduler({ config, storage, logger, notifier, metrics }: 
         staleAfterMs: config.timeoutMs + 60_000,
         logger,
       });
-    } catch (lockError: any) {
-      logger.error({ err: lockError }, "Failed to acquire lock for backup");
+    } catch (lockError) {
+      const err = lockError instanceof Error ? lockError : new Error(String(lockError));
+      logger.error({ err }, "Failed to acquire lock for backup");
       state.status = "error";
-      state.lastError = lockError.message;
+      state.lastError = err.message;
       return;
     }
 
@@ -83,12 +86,13 @@ export function createScheduler({ config, storage, logger, notifier, metrics }: 
           logger.error({ err: pruneError }, "Retention prune failed after backup");
         }
       }
-    } catch (error: any) {
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error(String(error));
       state.status = "error";
-      state.lastError = error.message;
+      state.lastError = err.message;
       metrics.recordBackupFailure(config.mongo.database);
-      await notifier.notifyFailure("backup", error, { database: config.mongo.database });
-      logger.error({ err: error }, "Scheduled backup run failed");
+      await notifier.notifyFailure("backup", err, { database: config.mongo.database });
+      logger.error({ err }, "Scheduled backup run failed");
     } finally {
       activeBackupPromise = null;
       activeAbortController = null;
@@ -112,11 +116,12 @@ export function createScheduler({ config, storage, logger, notifier, metrics }: 
         collections: { restoredCount: result.documents },
         sha256: "verified",
         encryption: false,
-      } as any);
-    } catch (error: any) {
+      });
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error(String(error));
       metrics.recordDrillFailure();
-      await notifier.notifyFailure("drill", error);
-      logger.error({ err: error }, "Scheduled restore drill failed");
+      await notifier.notifyFailure("drill", err);
+      logger.error({ err }, "Scheduled restore drill failed");
     }
   }
 

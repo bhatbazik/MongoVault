@@ -1,0 +1,8 @@
+if ! command -v npm >/dev/null 2>&1; then
+  export PATH="$HOME/.nvm/versions/node/$(ls "$HOME/.nvm/versions/node" 2>/dev/null | tail -n 1)/bin:$PATH"
+fi
+
+npx lint-staged
+npm run typecheck
+npm run build
+npm test

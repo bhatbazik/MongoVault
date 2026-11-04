@@ -115,29 +115,39 @@ const schema = z
     if (env.ENCRYPTION_KEY) {
       try {
         parseKey(env.ENCRYPTION_KEY);
-      } catch (error: any) {
-        ctx.addIssue({ code: "custom", path: ["ENCRYPTION_KEY"], message: error.message });
+      } catch (error) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["ENCRYPTION_KEY"],
+          message: (error as Error).message,
+        });
       }
     }
     if (env.ENCRYPTION_KEY_RING) {
       try {
         parseKeyRing(env.ENCRYPTION_KEY_RING);
-      } catch (error: any) {
-        ctx.addIssue({ code: "custom", path: ["ENCRYPTION_KEY_RING"], message: error.message });
+      } catch (error) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["ENCRYPTION_KEY_RING"],
+          message: (error as Error).message,
+        });
       }
     }
     if (env.MONGODB_OPLOG && !isClusterScope(env.MONGODB_DATABASE)) {
       ctx.addIssue({
         code: "custom",
         path: ["MONGODB_OPLOG"],
-        message: "MONGODB_OPLOG can only be used with full cluster backup (MONGODB_DATABASE: * or all)",
+        message:
+          "MONGODB_OPLOG can only be used with full cluster backup (MONGODB_DATABASE: * or all)",
       });
     }
     if (env.PITR_ENABLED && !isClusterScope(env.MONGODB_DATABASE)) {
       ctx.addIssue({
         code: "custom",
         path: ["PITR_ENABLED"],
-        message: "PITR_ENABLED can only be used with full cluster backup (MONGODB_DATABASE: * or all)",
+        message:
+          "PITR_ENABLED can only be used with full cluster backup (MONGODB_DATABASE: * or all)",
       });
     }
     if (env.MONGODB_EXCLUDE_COLLECTIONS.length > 0 && isClusterScope(env.MONGODB_DATABASE)) {
@@ -153,11 +163,15 @@ const schema = z
 export class ConfigError extends Error {
   issues: ConfigIssue[];
 
-  constructor(issues: any[]) {
+  constructor(issues: Array<{ path: PropertyKey[]; message: string; code?: string }>) {
     const details = issues.map((issue) => `  ${issue.path.join(".")}: ${issue.message}`);
     super(`Invalid configuration:\n${details.join("\n")}`);
     this.name = "ConfigError";
-    this.issues = issues;
+    this.issues = issues.map((i) => ({
+      code: i.code ?? "custom",
+      path: i.path.map((p) => (typeof p === "symbol" ? p.toString() : p)),
+      message: i.message,
+    }));
   }
 }
 
@@ -202,7 +216,7 @@ function toConfig(env: z.infer<typeof schema>): AppConfig {
     storage: {
       bucket: env.S3_BUCKET,
       endpoint,
-      region: env.S3_REGION ?? (env.R2_ACCOUNT_ID ? "auto" : (process.env.AWS_REGION || "us-east-1")),
+      region: env.S3_REGION ?? (env.R2_ACCOUNT_ID ? "auto" : process.env.AWS_REGION || "us-east-1"),
       forcePathStyle: env.S3_FORCE_PATH_STYLE,
       accessKeyId: env.S3_ACCESS_KEY_ID,
       secretAccessKey: env.S3_SECRET_ACCESS_KEY,
@@ -223,7 +237,9 @@ function toConfig(env: z.infer<typeof schema>): AppConfig {
       ...(env.ENCRYPTION_KEY_RING ? parseKeyRing(env.ENCRYPTION_KEY_RING) : []),
     ]),
     retention: retentionEnabled ? retention : null,
-    drill: env.DRILL_MONGODB_URI ? { uri: env.DRILL_MONGODB_URI, cron: env.DRILL_CRON ?? null } : null,
+    drill: env.DRILL_MONGODB_URI
+      ? { uri: env.DRILL_MONGODB_URI, cron: env.DRILL_CRON ?? null }
+      : null,
     notifications: {
       onSuccess: env.NOTIFY_ON_SUCCESS,
       email: env.SMTP_HOST

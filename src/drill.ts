@@ -1,19 +1,15 @@
 import { type Db, MongoClient } from "mongodb";
 import { isClusterScope, readManifest, resolveBackup, scopeOf } from "./catalog.js";
 import { restoreBackup } from "./restore.js";
-import type {
-  DrillContext,
-  DrillMismatch,
-  DrillResult,
-  DrillVariance,
-} from "./types/drill.js";
+import type { DrillContext, DrillMismatch, DrillResult, DrillVariance } from "./types/drill.js";
 
 export class DrillError extends Error {
   mismatches: DrillMismatch[];
 
   constructor(key: string, mismatches: DrillMismatch[]) {
     const details = mismatches.map(
-      ({ collection, expected, actual }) => `  ${collection}: expected ${expected}, restored ${actual}`,
+      ({ collection, expected, actual }) =>
+        `  ${collection}: expected ${expected}, restored ${actual}`,
     );
     super(`Restore drill failed for ${key}:\n${details.join("\n")}`);
     this.name = "DrillError";
@@ -208,7 +204,10 @@ export async function runDrill(ctx: DrillContext): Promise<DrillResult> {
     }
   } finally {
     for (const dbName of restoredDbs) {
-      await client.db(dbName).dropDatabase().catch(() => {});
+      await client
+        .db(dbName)
+        .dropDatabase()
+        .catch(() => {});
     }
     await client.close().catch(() => {});
   }

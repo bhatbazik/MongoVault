@@ -5,7 +5,7 @@ export class DigestStream extends Transform {
   #hash: Hash = createHash("sha256");
   #bytes: number = 0;
 
-  _transform(chunk: Buffer, _encoding: BufferEncoding, callback: TransformCallback): void {
+  override _transform(chunk: Buffer, _encoding: BufferEncoding, callback: TransformCallback): void {
     this.#hash.update(chunk);
     this.#bytes += chunk.length;
     callback(null, chunk);

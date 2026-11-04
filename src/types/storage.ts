@@ -36,7 +36,11 @@ export interface GetJsonResult<T = unknown> {
 
 export interface StorageClient {
   bucket: string;
-  upload: (key: string, body: Readable | Buffer | Uint8Array | unknown, options?: UploadOptions) => Promise<void>;
+  upload: (
+    key: string,
+    body: Readable | Buffer | Uint8Array | unknown,
+    options?: UploadOptions,
+  ) => Promise<void>;
   head: (key: string) => Promise<StorageHeadResult | null>;
   download: (key: string, options?: { signal?: AbortSignal }) => Promise<Readable>;
   putJson: (key: string, value: unknown) => Promise<void>;
@@ -44,7 +48,10 @@ export interface StorageClient {
   list: (prefix: string) => AsyncGenerator<StorageObject, void, unknown>;
   remove: (key: string) => Promise<void>;
   removeMany?: (keys: string[]) => Promise<void>;
-  acquireLock?: (key: string, options: { holder?: string; ttlMs: number }) => Promise<string | null>;
+  acquireLock?: (
+    key: string,
+    options: { holder?: string; ttlMs: number },
+  ) => Promise<string | null>;
   refreshLock?: (key: string, token: string, ttlMs: number) => Promise<boolean>;
   releaseLock?: (key: string, token: string) => Promise<void>;
 }

@@ -33,7 +33,8 @@ describe("tools parsers", () => {
   });
 
   it("parses mongorestore completion line with commas and counts", () => {
-    const line = "2026-03-10T12:00:00.000+0000\t15,420 document(s) restored successfully. 0 document(s) failed to restore.";
+    const line =
+      "2026-03-10T12:00:00.000+0000\t15,420 document(s) restored successfully. 0 document(s) failed to restore.";
     expect(parseRestoreLine(line)).toEqual({
       restored: 15420,
       failed: 0,

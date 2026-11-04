@@ -141,48 +141,48 @@ node src/index.js drill
 
 Set these variables in `.env` or pass them as system environment variables:
 
-| Variable | Type | Default | Description |
-| :--- | :---: | :---: | :--- |
-| `MONGODB_URI` | String | *Required* | Connection string for source MongoDB instance |
-| `MONGODB_DATABASE` | String | *Required* | Target database name |
-| `MONGODB_EXCLUDE_COLLECTIONS`| String | `""` | Comma-delimited list of collections to exclude |
-| `MONGODB_OPLOG` | Boolean | `false` | Capture point-in-time oplog during backup (replica sets) |
-| `MONGODB_PARALLEL_COLLECTIONS`| Number | `2` | Number of collections dumped concurrently |
-| `S3_BUCKET` | String | *Required* | Target bucket name |
-| `S3_ACCESS_KEY_ID` | String | *Required* | S3 API access key ID |
-| `S3_SECRET_ACCESS_KEY` | String | *Required* | S3 API secret access key |
-| `S3_PART_SIZE_MB` | Number | `32` | S3 multipart chunk size (32MB handles up to 320GB) |
-| `S3_QUEUE_SIZE` | Number | `2` | Concurrent multipart uploads (controls memory footprint) |
-| `R2_ACCOUNT_ID` | String | Optional | Cloudflare Account ID (auto-derives endpoint & region) |
-| `S3_ENDPOINT` | URL | Optional | Custom S3 endpoint URL (MinIO, Wasabi, AWS) |
-| `S3_REGION` | String | `"auto"` | S3 region identifier |
-| `S3_FORCE_PATH_STYLE` | Boolean | `false` | Enable path-style S3 URLs (required for MinIO) |
-| `S3_PREFIX` | String | `"mongodb"` | Root prefix key in bucket |
-| `BACKUP_CRON` | String | `"0 2 * * *"` | 5-field cron expression for backup schedule |
-| `BACKUP_TIMEZONE` | String | `"UTC"` | Timezone for cron schedules and directory stamps |
-| `BACKUP_TIMEOUT_MINUTES` | Number | `180` | Process execution timeout |
-| `BACKUP_ON_START` | Boolean | `false` | Run an immediate backup upon daemon boot |
-| `WORK_DIR` | Path | OS tmp dir | Scratch folder for lock files and temp restore streams |
-| `ENCRYPTION_KEY` | Base64/Hex | Optional | 32-byte master key for AES-256-GCM envelope encryption |
-| `RETENTION_KEEP_LAST` | Number | Optional | Keep N most recent backups |
-| `RETENTION_KEEP_DAILY` | Number | Optional | Keep 1 backup per day for N days |
-| `RETENTION_KEEP_WEEKLY` | Number | Optional | Keep 1 backup per week for N weeks |
-| `RETENTION_KEEP_MONTHLY` | Number | Optional | Keep 1 backup per month for N months |
-| `DRILL_MONGODB_URI` | String | Optional | Target MongoDB instance for restore drills |
-| `DRILL_CRON` | String | Optional | Cron schedule for automated restore drills |
-| `HEARTBEAT_URL` | URL | Optional | Healthchecks.io / Cronitor heartbeat ping URL |
-| `NOTIFY_ON_SUCCESS` | Boolean | `true` | Send notifications on successful runs |
-| `SLACK_WEBHOOK_URL` | URL | Optional | Incoming Slack webhook URL |
-| `WEBHOOK_URL` | URL | Optional | Generic webhook URL for status events (POST JSON) |
-| `SMTP_HOST` | String | Optional | SMTP server hostname |
-| `SMTP_PORT` | Number | `587` | SMTP port |
-| `SMTP_SECURE` | Boolean | `false` | Use TLS directly (port 465) |
-| `SMTP_USER` | String | Optional | SMTP username |
-| `SMTP_PASSWORD` | String | Optional | SMTP password |
-| `SMTP_FROM` | String | Optional | Email sender address |
-| `SMTP_TO` | String | Optional | Comma-delimited recipient email addresses |
-| `HTTP_PORT` | Number | `8080` | Port for `/healthz` and `/metrics` server (0 disables) |
-| `LOG_LEVEL` | String | `"info"` | Log level (`trace`, `debug`, `info`, `warn`, `error`) |
+| Variable                       |    Type    |    Default    | Description                                              |
+| :----------------------------- | :--------: | :-----------: | :------------------------------------------------------- |
+| `MONGODB_URI`                  |   String   |  _Required_   | Connection string for source MongoDB instance            |
+| `MONGODB_DATABASE`             |   String   |  _Required_   | Target database name                                     |
+| `MONGODB_EXCLUDE_COLLECTIONS`  |   String   |     `""`      | Comma-delimited list of collections to exclude           |
+| `MONGODB_OPLOG`                |  Boolean   |    `false`    | Capture point-in-time oplog during backup (replica sets) |
+| `MONGODB_PARALLEL_COLLECTIONS` |   Number   |      `2`      | Number of collections dumped concurrently                |
+| `S3_BUCKET`                    |   String   |  _Required_   | Target bucket name                                       |
+| `S3_ACCESS_KEY_ID`             |   String   |  _Required_   | S3 API access key ID                                     |
+| `S3_SECRET_ACCESS_KEY`         |   String   |  _Required_   | S3 API secret access key                                 |
+| `S3_PART_SIZE_MB`              |   Number   |     `32`      | S3 multipart chunk size (32MB handles up to 320GB)       |
+| `S3_QUEUE_SIZE`                |   Number   |      `2`      | Concurrent multipart uploads (controls memory footprint) |
+| `R2_ACCOUNT_ID`                |   String   |   Optional    | Cloudflare Account ID (auto-derives endpoint & region)   |
+| `S3_ENDPOINT`                  |    URL     |   Optional    | Custom S3 endpoint URL (MinIO, Wasabi, AWS)              |
+| `S3_REGION`                    |   String   |   `"auto"`    | S3 region identifier                                     |
+| `S3_FORCE_PATH_STYLE`          |  Boolean   |    `false`    | Enable path-style S3 URLs (required for MinIO)           |
+| `S3_PREFIX`                    |   String   |  `"mongodb"`  | Root prefix key in bucket                                |
+| `BACKUP_CRON`                  |   String   | `"0 2 * * *"` | 5-field cron expression for backup schedule              |
+| `BACKUP_TIMEZONE`              |   String   |    `"UTC"`    | Timezone for cron schedules and directory stamps         |
+| `BACKUP_TIMEOUT_MINUTES`       |   Number   |     `180`     | Process execution timeout                                |
+| `BACKUP_ON_START`              |  Boolean   |    `false`    | Run an immediate backup upon daemon boot                 |
+| `WORK_DIR`                     |    Path    |  OS tmp dir   | Scratch folder for lock files and temp restore streams   |
+| `ENCRYPTION_KEY`               | Base64/Hex |   Optional    | 32-byte master key for AES-256-GCM envelope encryption   |
+| `RETENTION_KEEP_LAST`          |   Number   |   Optional    | Keep N most recent backups                               |
+| `RETENTION_KEEP_DAILY`         |   Number   |   Optional    | Keep 1 backup per day for N days                         |
+| `RETENTION_KEEP_WEEKLY`        |   Number   |   Optional    | Keep 1 backup per week for N weeks                       |
+| `RETENTION_KEEP_MONTHLY`       |   Number   |   Optional    | Keep 1 backup per month for N months                     |
+| `DRILL_MONGODB_URI`            |   String   |   Optional    | Target MongoDB instance for restore drills               |
+| `DRILL_CRON`                   |   String   |   Optional    | Cron schedule for automated restore drills               |
+| `HEARTBEAT_URL`                |    URL     |   Optional    | Healthchecks.io / Cronitor heartbeat ping URL            |
+| `NOTIFY_ON_SUCCESS`            |  Boolean   |    `true`     | Send notifications on successful runs                    |
+| `SLACK_WEBHOOK_URL`            |    URL     |   Optional    | Incoming Slack webhook URL                               |
+| `WEBHOOK_URL`                  |    URL     |   Optional    | Generic webhook URL for status events (POST JSON)        |
+| `SMTP_HOST`                    |   String   |   Optional    | SMTP server hostname                                     |
+| `SMTP_PORT`                    |   Number   |     `587`     | SMTP port                                                |
+| `SMTP_SECURE`                  |  Boolean   |    `false`    | Use TLS directly (port 465)                              |
+| `SMTP_USER`                    |   String   |   Optional    | SMTP username                                            |
+| `SMTP_PASSWORD`                |   String   |   Optional    | SMTP password                                            |
+| `SMTP_FROM`                    |   String   |   Optional    | Email sender address                                     |
+| `SMTP_TO`                      |   String   |   Optional    | Comma-delimited recipient email addresses                |
+| `HTTP_PORT`                    |   Number   |    `8080`     | Port for `/healthz` and `/metrics` server (0 disables)   |
+| `LOG_LEVEL`                    |   String   |   `"info"`    | Log level (`trace`, `debug`, `info`, `warn`, `error`)    |
 
 ---
 
@@ -319,17 +319,23 @@ Backing up multi-gigabyte or 100 GB+ databases on small VPS hosts (e.g. 1 vCPU, 
 A 100 GB dump takes 1 to 2 hours. Without point-in-time consistency, collections dumped early in the run are out-of-sync with collections dumped later.
 
 ### 1. Consistent Snapshot Backups (`--oplog`)
+
 Enable `MONGODB_OPLOG=true` or pass `--oplog` on the CLI:
+
 ```bash
 node src/index.js backup --oplog
 ```
+
 `mongodump` tails and records all oplog transactions that occur during the dump. Restoring automatically applies these operations, producing a transactionally consistent snapshot of the exact second the backup finished.
 
 ### 2. Point-In-Time Replay (`--oplog-limit`)
+
 To roll back the database to a specific second (e.g. right before an accidental table drop):
+
 ```bash
 node src/index.js restore --oplog-replay --oplog-limit 1774092000:1 --drop
 ```
+
 `mongorestore` applies all oplog operations up to timestamp `1774092000` (Unix epoch seconds) and increment `1`.
 
 ---
@@ -337,9 +343,11 @@ node src/index.js restore --oplog-replay --oplog-limit 1774092000:1 --drop
 ## Cloudflare R2 & Checksum Architecture
 
 ### Why Client-Side Envelope Encryption Eliminates Server-Side Checksum Limitations
+
 Older S3 backup scripts relied on AWS S3's `ChecksumAlgorithm: SHA256` where S3 computes hashes server-side on upload. Cloudflare R2 did not historically support this proprietary header for multipart uploads.
 
 In this architecture, client-side **AES-256-GCM** makes server-side hash computation redundant:
+
 - **Cryptographic AEAD Guarantee:** AES-256-GCM produces a 128-bit authentication tag (`authTag`). If a single bit in the R2 object is modified, truncated, or corrupted in transit or at rest, the decryption cipher fails immediately with an authentication error.
 - **In-flight SHA-256:** Computed in-memory during streaming and recorded in the `.manifest.json`.
 - **R2 Multipart Cleanup:** Cloudflare R2 automatically purges incomplete multipart uploads after 7 days, avoiding lingering storage costs from aborted network runs.
@@ -351,14 +359,14 @@ In this architecture, client-side **AES-256-GCM** makes server-side hash computa
 
 The built-in HTTP server exposes standard metrics compatible with Prometheus, Grafana, and Datadog:
 
-| Metric | Type | Description |
-| :--- | :---: | :--- |
-| `mongodb_backup_runs_total` | Counter | Total backups run, labeled by `status` (success/failure) and `database` |
-| `mongodb_backup_duration_seconds` | Histogram | Execution time distribution in seconds |
-| `mongodb_backup_size_bytes` | Gauge | Byte size of the most recent backup archive |
-| `mongodb_backup_last_success_timestamp_seconds` | Gauge | Epoch timestamp of last successful backup |
-| `mongodb_backup_drill_runs_total` | Counter | Total restore drills run, labeled by `status` |
-| `mongodb_backup_drill_last_success_timestamp_seconds`| Gauge | Epoch timestamp of last successful drill |
+| Metric                                                |   Type    | Description                                                             |
+| :---------------------------------------------------- | :-------: | :---------------------------------------------------------------------- |
+| `mongodb_backup_runs_total`                           |  Counter  | Total backups run, labeled by `status` (success/failure) and `database` |
+| `mongodb_backup_duration_seconds`                     | Histogram | Execution time distribution in seconds                                  |
+| `mongodb_backup_size_bytes`                           |   Gauge   | Byte size of the most recent backup archive                             |
+| `mongodb_backup_last_success_timestamp_seconds`       |   Gauge   | Epoch timestamp of last successful backup                               |
+| `mongodb_backup_drill_runs_total`                     |  Counter  | Total restore drills run, labeled by `status`                           |
+| `mongodb_backup_drill_last_success_timestamp_seconds` |   Gauge   | Epoch timestamp of last successful drill                                |
 
 ---
 
@@ -375,6 +383,7 @@ npm run test:watch
 ```
 
 Test coverage includes:
+
 - AES-256-GCM envelope encryption & deciphering with auth tag validation
 - Atomic token lock lifecycle, contention, and stale PID recovery
 - GFS retention planning algorithms across day/week/month boundaries

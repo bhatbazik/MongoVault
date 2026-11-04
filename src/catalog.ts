@@ -1,4 +1,9 @@
-import type { ArchiveKeyOptions, BackupManifest, BackupScope, BackupSummary } from "./types/catalog.js";
+import type {
+  ArchiveKeyOptions,
+  BackupManifest,
+  BackupScope,
+  BackupSummary,
+} from "./types/catalog.js";
 import type { StorageClient, StorageObject } from "./types/storage.js";
 
 export const MANIFEST_SUFFIX = ".manifest.json";
@@ -11,7 +16,10 @@ export function isClusterScope(database?: string | null): boolean {
   return !database || database === "*" || database === "all";
 }
 
-export function scopeOf(config: { storage: { prefix: string }; mongo: { database: string } }): BackupScope {
+export function scopeOf(config: {
+  storage: { prefix: string };
+  mongo: { database: string };
+}): BackupScope {
   return { prefix: config.storage.prefix, database: config.mongo.database };
 }
 
@@ -20,7 +28,11 @@ export function databasePrefix({ prefix, database }: BackupScope): string {
   return `${[prefix, target].filter(Boolean).join("/")}/`;
 }
 
-export function archiveKey(scope: BackupScope, date: Date, { encrypted }: ArchiveKeyOptions): string {
+export function archiveKey(
+  scope: BackupScope,
+  date: Date,
+  { encrypted }: ArchiveKeyOptions,
+): string {
   const iso = date.toISOString();
   const day = iso.slice(0, 10);
   const stamp = `${iso.slice(0, 19).replace(/[-:]/g, "")}Z`;
@@ -38,7 +50,10 @@ export function parseCreatedAt(key: string): Date | null {
   return new Date(`${year}-${month}-${day}T${hour}:${minute}:${second}Z`);
 }
 
-export async function listBackups(storage: StorageClient, scope: BackupScope): Promise<BackupSummary[]> {
+export async function listBackups(
+  storage: StorageClient,
+  scope: BackupScope,
+): Promise<BackupSummary[]> {
   const archives: StorageObject[] = [];
   const manifests = new Set<string>();
 
@@ -61,7 +76,11 @@ export async function listBackups(storage: StorageClient, scope: BackupScope): P
     .sort((a, b) => (b.createdAt as unknown as number) - (a.createdAt as unknown as number));
 }
 
-export async function resolveBackup(storage: StorageClient, scope: BackupScope, ref: string = "latest"): Promise<string> {
+export async function resolveBackup(
+  storage: StorageClient,
+  scope: BackupScope,
+  ref: string = "latest",
+): Promise<string> {
   if (ref !== "latest") return ref;
   const latest = (await listBackups(storage, scope)).find((backup) => backup.complete);
   if (!latest) {
@@ -70,8 +89,13 @@ export async function resolveBackup(storage: StorageClient, scope: BackupScope, 
   return latest.key;
 }
 
-export async function readManifest(storage: StorageClient, key: string): Promise<BackupManifest | null> {
+export async function readManifest(
+  storage: StorageClient,
+  key: string,
+): Promise<BackupManifest | null> {
   const result = await storage.getJson<BackupManifest | { data: BackupManifest }>(manifestKey(key));
   if (!result) return null;
-  return result && typeof result === "object" && "data" in result ? (result.data as unknown as BackupManifest) : (result as unknown as BackupManifest);
+  return result && typeof result === "object" && "data" in result
+    ? (result.data as unknown as BackupManifest)
+    : (result as unknown as BackupManifest);
 }

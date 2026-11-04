@@ -13,16 +13,12 @@ describe("digest", () => {
     const digest = new DigestStream();
     const collected = [];
 
-    await pipeline(
-      Readable.from(data),
-      digest,
-      async function* (source) {
-        for await (const chunk of source) {
-          collected.push(chunk);
-          yield chunk;
-        }
-      },
-    );
+    await pipeline(Readable.from(data), digest, async function* (source) {
+      for await (const chunk of source) {
+        collected.push(chunk);
+        yield chunk;
+      }
+    });
 
     expect(Buffer.concat(collected)).toEqual(data);
     expect(digest.bytes).toBe(data.length);

@@ -8,11 +8,7 @@ import { linkedController, settleAll } from "./abort.js";
 import { isClusterScope, readManifest, resolveBackup, scopeOf } from "./catalog.js";
 import { createDecryptor, verifyManifest } from "./crypto.js";
 import { DigestStream } from "./digest.js";
-import {
-  downloadAndExtractOplogSlice,
-  formatOplogTimestamp,
-  resolvePitrPlan,
-} from "./oplog.js";
+import { downloadAndExtractOplogSlice, formatOplogTimestamp, resolvePitrPlan } from "./oplog.js";
 import { mongorestore, replayOplogFile } from "./tools.js";
 import type { BackupManifest } from "./types/catalog.js";
 import type { AppConfig } from "./types/config.js";
@@ -31,7 +27,10 @@ export class IntegrityError extends Error {
   }
 }
 
-async function describeBackup({ config, storage }: RestoreContext, ref: string): Promise<DescribeBackupResult> {
+async function describeBackup(
+  { config, storage }: RestoreContext,
+  ref: string,
+): Promise<DescribeBackupResult> {
   const key = await resolveBackup(storage, scopeOf(config), ref);
   const manifest = await readManifest(storage, key);
   const object = manifest ? null : await storage.head(key);
@@ -52,8 +51,8 @@ async function describeBackup({ config, storage }: RestoreContext, ref: string):
     }
     try {
       verifyManifest(keyRing, manifest);
-    } catch (error: any) {
-      throw new IntegrityError(error.message);
+    } catch (error) {
+      throw new IntegrityError((error as Error).message);
     }
   }
   return { key, manifest, checksum };
@@ -70,7 +69,10 @@ function assertChecksum(key: string, expected: string | null, actual: string): v
   }
 }
 
-export async function verifyBackup(ctx: RestoreContext, ref: string = "latest"): Promise<VerifyBackupResult> {
+export async function verifyBackup(
+  ctx: RestoreContext,
+  ref: string = "latest",
+): Promise<VerifyBackupResult> {
   const { config, storage, logger, signal } = ctx;
   const { key, manifest, checksum } = await describeBackup(ctx, ref);
   if (!checksum) {
@@ -89,19 +91,20 @@ export async function verifyBackup(ctx: RestoreContext, ref: string = "latest"):
       createGunzip(),
       discard,
     ];
-    await pipeline(
-      ...(stages as [any, ...any[]]),
-      { signal },
-    );
-  } catch (error: any) {
-    if (error.name === "AbortError") throw error;
-    throw new IntegrityError(`${key} could not be read back: ${error.message}`);
+    const runPipeline = pipeline as unknown as (...args: unknown[]) => Promise<void>;
+    await runPipeline(...stages, { signal });
+  } catch (error: unknown) {
+    const err = error as { name?: string; message?: string };
+    if (err.name === "AbortError") throw error;
+    throw new IntegrityError(`${key} could not be read back: ${err.message ?? String(error)}`);
   }
 
   const sha256 = digest.digest();
   assertChecksum(key, checksum, sha256);
   if (manifest && manifest.size !== digest.bytes) {
-    throw new IntegrityError(`Size mismatch for ${key}: expected ${manifest.size}, got ${digest.bytes}`);
+    throw new IntegrityError(
+      `Size mismatch for ${key}: expected ${manifest.size}, got ${digest.bytes}`,
+    );
   }
 
   logger.info({ key, sha256 }, "Backup verified");
@@ -156,7 +159,10 @@ export async function restoreBackup(
   if (!checksum) log.warn("Backup has no checksum; restoring without an integrity check");
 
   if (preVerify) {
-    log.info({ ref, drop }, "Pre-verifying backup archive integrity and checksum before dropping collections");
+    log.info(
+      { ref, drop },
+      "Pre-verifying backup archive integrity and checksum before dropping collections",
+    );
     await verifyBackup(ctx, ref);
   }
 
@@ -166,7 +172,7 @@ export async function restoreBackup(
     const restore = await effectiveMongorestore({
       uri,
       workDir: config.workDir,
-      nsInclude: isFilteredCluster ? `${target}.*` : (isRenamedDb ? `${source}.*` : undefined),
+      nsInclude: isFilteredCluster ? `${target}.*` : isRenamedDb ? `${source}.*` : undefined,
       nsFrom: isRenamedDb ? `${source}.*` : undefined,
       nsTo: isRenamedDb ? `${target}.*` : undefined,
       drop,
@@ -181,19 +187,13 @@ export async function restoreBackup(
     log.info({ source, target, drop }, "Streaming restore pipeline from storage (zero-disk)");
     const digest = new DigestStream();
     const downloadStream = await storage.download(key, { signal: controller.signal });
-    const stages = [
-      downloadStream,
-      digest,
-      ...decryptStage(config, manifest),
-      restore.stdin,
-    ];
+    const stages = [downloadStream, digest, ...decryptStage(config, manifest), restore.stdin];
 
     const [summary] = await settleAll(controller, [
       restore.done,
-      pipeline(
-        ...(stages as [any, ...any[]]),
-        { signal: controller.signal },
-      ),
+      (pipeline as unknown as (...args: unknown[]) => Promise<void>)(...stages, {
+        signal: controller.signal,
+      }),
     ]);
 
     assertChecksum(key, checksum, digest.digest());
@@ -212,14 +212,7 @@ export async function restoreBackup(
 
 export async function restorePointInTime(
   ctx: RestoreContext,
-  {
-    pitr,
-    uri,
-    database,
-    drop = false,
-    preVerify = drop,
-    parallelCollections,
-  }: RestoreOptions,
+  { pitr, uri, database, drop = false, preVerify = drop, parallelCollections }: RestoreOptions,
 ): Promise<RestoreResult> {
   const { config, storage, logger, signal, tools } = ctx;
   const effectiveReplay = tools?.replayOplogFile ?? replayOplogFile;

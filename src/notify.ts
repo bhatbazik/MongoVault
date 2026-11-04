@@ -1,5 +1,6 @@
 import nodemailer from "nodemailer";
 import { formatBytes, formatDuration } from "./format.js";
+import type { BackupManifest } from "./types/catalog.js";
 import type { AppConfig } from "./types/config.js";
 import type { Logger } from "./types/logger.js";
 import type { EmailOptions, NotificationFailureContext, Notifier } from "./types/notify.js";
@@ -45,7 +46,10 @@ export function createNotifier(config: AppConfig, logger: Logger): Notifier {
         body: JSON.stringify(payload),
       });
       if (!response.ok) {
-        logger.warn({ status: response.status, url }, "Webhook notification returned non-2xx status");
+        logger.warn(
+          { status: response.status, url },
+          "Webhook notification returned non-2xx status",
+        );
       }
     } catch (error) {
       logger.error({ err: error, url }, "Failed to deliver webhook notification");
@@ -53,14 +57,13 @@ export function createNotifier(config: AppConfig, logger: Logger): Notifier {
   }
 
   async function pingHeartbeat(ok: boolean, message?: string, event?: string): Promise<void> {
-    const url = event === "drill"
-      ? (notifications.drillHeartbeatUrl || notifications.heartbeatUrl)
-      : notifications.heartbeatUrl;
+    const url =
+      event === "drill"
+        ? notifications.drillHeartbeatUrl || notifications.heartbeatUrl
+        : notifications.heartbeatUrl;
     if (!url) return;
     try {
-      const target = ok
-        ? url
-        : `${url.replace(/\/+$/, "")}/fail`;
+      const target = ok ? url : `${url.replace(/\/+$/, "")}/fail`;
       await fetch(target, {
         method: "POST",
         headers: { "Content-Type": "text/plain" },
@@ -72,21 +75,25 @@ export function createNotifier(config: AppConfig, logger: Logger): Notifier {
   }
 
   return {
-    async notifySuccess(event: string, data: any): Promise<void> {
+    async notifySuccess(
+      event: string,
+      data: BackupManifest | Record<string, unknown>,
+    ): Promise<void> {
       await pingHeartbeat(true, `${event} succeeded`, event);
 
       if (!notifications.onSuccess) return;
 
-      const title = `MongoDB Backup Successful: ${data.database}`;
+      const d = data as Partial<BackupManifest>;
+      const title = `MongoDB Backup Successful: ${d.database ?? config.mongo.database}`;
       const summary = [
         `Event: ${event}`,
-        `Database: ${data.database}`,
-        `Archive: ${data.key}`,
-        `Size: ${formatBytes(data.size)}`,
-        `Duration: ${formatDuration(data.durationMs)}`,
-        `Collections: ${Object.keys(data.collections || {}).length}`,
-        `SHA-256: ${data.sha256}`,
-        `Encrypted: ${Boolean(data.encryption)}`,
+        `Database: ${d.database ?? config.mongo.database}`,
+        `Archive: ${d.key ?? "N/A"}`,
+        `Size: ${d.size !== undefined ? formatBytes(d.size) : "N/A"}`,
+        `Duration: ${d.durationMs !== undefined ? formatDuration(d.durationMs) : "N/A"}`,
+        `Collections: ${Object.keys(d.collections || {}).length}`,
+        `SHA-256: ${d.sha256 ?? "N/A"}`,
+        `Encrypted: ${Boolean(d.encryption)}`,
       ].join("\n");
 
       await Promise.allSettled([
@@ -106,7 +113,11 @@ export function createNotifier(config: AppConfig, logger: Logger): Notifier {
       ]);
     },
 
-    async notifyFailure(event: string, error: Error, context: NotificationFailureContext = {}): Promise<void> {
+    async notifyFailure(
+      event: string,
+      error: Error,
+      context: NotificationFailureContext = {},
+    ): Promise<void> {
       await pingHeartbeat(false, error.message, event);
 
       const title = `MongoDB Backup Failed: ${context.database || config.mongo.database}`;

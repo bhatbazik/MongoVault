@@ -402,9 +402,9 @@ describe("Continuous Oplog Archiver and PITR Restore Coordinator", () => {
     expect(leftover).toEqual([]);
 
     // 5. Requesting a PITR target beyond archived slices (e.g. 1099:1) fails cleanly
-    await expect(
-      resolvePitrPlan(mockStorage, scopeOf(config), "1099:1"),
-    ).rejects.toThrow(/PITR oplog coverage ends at 1030:1/);
+    await expect(resolvePitrPlan(mockStorage, scopeOf(config), "1099:1")).rejects.toThrow(
+      /PITR oplog coverage ends at 1030:1/,
+    );
   });
 
   it("prunes expired PITR oplog slices older than the oldest kept base backup", async () => {

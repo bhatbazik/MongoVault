@@ -13,7 +13,10 @@ import type { StorageClient } from "./types/storage.js";
 
 const UNREADABLE_GRACE_MS = 5_000;
 
-export async function acquireLock(file: string, { staleAfterMs }: AcquireLockOptions): Promise<ReleaseLockFn | null> {
+export async function acquireLock(
+  file: string,
+  { staleAfterMs }: AcquireLockOptions,
+): Promise<ReleaseLockFn | null> {
   await fs.mkdir(path.dirname(file), { recursive: true });
   const token = randomUUID();
 
@@ -24,8 +27,8 @@ export async function acquireLock(file: string, { staleAfterMs }: AcquireLockOpt
       { flag: "wx" },
     );
     return () => release(file, token);
-  } catch (error: any) {
-    if (error.code !== "EEXIST") throw error;
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
   }
 
   if (!(await isStale(file, staleAfterMs))) {
@@ -74,8 +77,8 @@ async function isStale(file: string, staleAfterMs: number): Promise<boolean> {
   let stat;
   try {
     stat = await fs.stat(file);
-  } catch (error: any) {
-    if (error.code === "ENOENT") return true;
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
     throw error;
   }
 
@@ -91,8 +94,8 @@ function isAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
-  } catch (error: any) {
-    return error.code === "EPERM";
+  } catch (error: unknown) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
   }
 }
 
@@ -116,8 +119,11 @@ export async function acquireDistributedLock(
   const timer = setInterval(async () => {
     try {
       await storage.refreshLock!(lockKey, token, ttlMs);
-    } catch (err: any) {
-      logger?.warn({ err: err.message }, "Failed to refresh distributed S3 lock heartbeat");
+    } catch (err: unknown) {
+      logger?.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        "Failed to refresh distributed S3 lock heartbeat",
+      );
     }
   }, heartbeatIntervalMs);
   timer.unref();
@@ -126,8 +132,11 @@ export async function acquireDistributedLock(
     clearInterval(timer);
     try {
       await storage.releaseLock!(lockKey, token);
-    } catch (err: any) {
-      logger?.warn({ err: err.message }, "Failed to release distributed S3 lock");
+    } catch (err: unknown) {
+      logger?.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        "Failed to release distributed S3 lock",
+      );
     }
   };
 }

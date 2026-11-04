@@ -39,16 +39,12 @@ describe("crypto", () => {
     const encryptor = createEncryptor(masterKey);
     const encryptedChunks = [];
 
-    await pipeline(
-      Readable.from(payload),
-      encryptor.stream,
-      async function* (source) {
-        for await (const chunk of source) {
-          encryptedChunks.push(chunk);
-          yield chunk;
-        }
-      },
-    );
+    await pipeline(Readable.from(payload), encryptor.stream, async function* (source) {
+      for await (const chunk of source) {
+        encryptedChunks.push(chunk);
+        yield chunk;
+      }
+    });
 
     const envelope = encryptor.envelope();
     expect(envelope.keyId).toBe(keyId(masterKey));
@@ -137,7 +133,9 @@ describe("crypto", () => {
     const wrapIv = randomBytes(12);
     const wrapCipher = createCipheriv("aes-256-gcm", masterKey, wrapIv);
     const wrappedEnc = Buffer.concat([wrapCipher.update(dataKey), wrapCipher.final()]);
-    const wrappedKey = Buffer.concat([wrapIv, wrapCipher.getAuthTag(), wrappedEnc]).toString("base64");
+    const wrappedKey = Buffer.concat([wrapIv, wrapCipher.getAuthTag(), wrappedEnc]).toString(
+      "base64",
+    );
 
     const legacyEnvelope = {
       algorithm: "aes-256-gcm",
@@ -149,13 +147,9 @@ describe("crypto", () => {
 
     const decipher = createDecryptor(masterKey, legacyEnvelope);
     const decrypted = [];
-    await pipeline(
-      Readable.from(ciphertext),
-      decipher,
-      async function* (source) {
-        for await (const chunk of source) decrypted.push(chunk);
-      },
-    );
+    await pipeline(Readable.from(ciphertext), decipher, async function* (source) {
+      for await (const chunk of source) decrypted.push(chunk);
+    });
 
     expect(Buffer.concat(decrypted)).toEqual(payload);
   });
@@ -179,13 +173,9 @@ describe("crypto", () => {
     const encryptor = createEncryptor(masterKey);
     const chunks = [];
 
-    await pipeline(
-      Readable.from(payload),
-      encryptor.stream,
-      async function* (source) {
-        for await (const chunk of source) chunks.push(chunk);
-      },
-    );
+    await pipeline(Readable.from(payload), encryptor.stream, async function* (source) {
+      for await (const chunk of source) chunks.push(chunk);
+    });
 
     const envelope = encryptor.envelope();
     const fullCiphertext = Buffer.concat(chunks);

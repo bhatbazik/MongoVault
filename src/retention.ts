@@ -3,8 +3,13 @@ import { listOplogSlices } from "./oplog.js";
 import type { BackupSummary } from "./types/catalog.js";
 import type { DateParts } from "./types/common.js";
 import type { RetentionPolicy } from "./types/config.js";
-import type { OplogSlice } from "./types/oplog.js";
-import type { PruneContext, PruneOptions, PruneResult, RetentionPlan, RetentionTarget } from "./types/retention.js";
+import type {
+  PruneContext,
+  PruneOptions,
+  PruneResult,
+  RetentionPlan,
+  RetentionTarget,
+} from "./types/retention.js";
 
 const ORPHAN_AGE_MS = 60 * 60 * 1000;
 
@@ -14,9 +19,17 @@ const PERIODS: Record<string, (parts: DateParts) => string> = {
   keepMonthly: ({ year, month }) => `${year}-${month}`,
 };
 
-export function planRetention(backups: BackupSummary[], policy: RetentionPolicy, timeZone?: string): RetentionPlan {
-  const sorted = [...backups].sort((a, b) => (b.createdAt as unknown as number) - (a.createdAt as unknown as number));
-  const keep = new Set<string>(sorted.slice(0, Math.max(policy.keepLast ?? 0, 1)).map((b) => b.key));
+export function planRetention(
+  backups: BackupSummary[],
+  policy: RetentionPolicy,
+  timeZone?: string,
+): RetentionPlan {
+  const sorted = [...backups].sort(
+    (a, b) => (b.createdAt as unknown as number) - (a.createdAt as unknown as number),
+  );
+  const keep = new Set<string>(
+    sorted.slice(0, Math.max(policy.keepLast ?? 0, 1)).map((b) => b.key),
+  );
 
   for (const [rule, period] of Object.entries(PERIODS)) {
     const limit = (policy as Record<string, number | undefined>)[rule] ?? 0;
@@ -37,7 +50,10 @@ export function planRetention(backups: BackupSummary[], policy: RetentionPolicy,
   };
 }
 
-export async function prune({ config, storage, logger }: PruneContext, { dryRun = false, now = Date.now() }: PruneOptions = {}): Promise<PruneResult> {
+export async function prune(
+  { config, storage, logger }: PruneContext,
+  { dryRun = false, now = Date.now() }: PruneOptions = {},
+): Promise<PruneResult> {
   if (!config.retention) {
     throw new Error("No retention policy configured. Set one of the RETENTION_KEEP_* variables.");
   }
@@ -49,7 +65,9 @@ export async function prune({ config, storage, logger }: PruneContext, { dryRun 
     config.retention,
     config.schedule.timezone,
   );
-  const orphans = backups.filter((b) => !b.complete && now - (b.createdAt as unknown as number) > ORPHAN_AGE_MS);
+  const orphans = backups.filter(
+    (b) => !b.complete && now - (b.createdAt as unknown as number) > ORPHAN_AGE_MS,
+  );
 
   // Prune PITR oplog slices older than the oldest retained base backup
   const oldestKeptBackup = keep.length > 0 ? keep[keep.length - 1] : null;
@@ -59,7 +77,8 @@ export async function prune({ config, storage, logger }: PruneContext, { dryRun 
   const slices = await listOplogSlices(storage, scope);
   const expiredSlices = slices.filter((slice) => {
     if (!slice.complete) {
-      const sliceAgeMs = now - (slice.lastModified ? new Date(slice.lastModified).getTime() : slice.endTs.t * 1000);
+      const sliceAgeMs =
+        now - (slice.lastModified ? new Date(slice.lastModified).getTime() : slice.endTs.t * 1000);
       return sliceAgeMs > ORPHAN_AGE_MS;
     }
     return oldestKeptEpochSec !== null && slice.endTs.t < oldestKeptEpochSec;

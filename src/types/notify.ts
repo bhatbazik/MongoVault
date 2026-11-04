@@ -12,5 +12,9 @@ export interface NotificationFailureContext {
 
 export interface Notifier {
   notifySuccess: (event: string, data: BackupManifest | Record<string, unknown>) => Promise<void>;
-  notifyFailure: (event: string, error: Error, context?: NotificationFailureContext) => Promise<void>;
+  notifyFailure: (
+    event: string,
+    error: Error,
+    context?: NotificationFailureContext,
+  ) => Promise<void>;
 }

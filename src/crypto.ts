@@ -78,12 +78,15 @@ export class ChunkedAeadEncryptStream extends Transform {
     this.#chunkSize = chunkSize;
   }
 
-  _transform(chunk: Buffer, _encoding: BufferEncoding, callback: TransformCallback): void {
+  override _transform(chunk: Buffer, _encoding: BufferEncoding, callback: TransformCallback): void {
     this.#buffer.push(chunk);
     this.#bufferedBytes += chunk.length;
 
     while (this.#bufferedBytes >= this.#chunkSize) {
-      const combined = this.#buffer.length === 1 ? this.#buffer[0] : Buffer.concat(this.#buffer);
+      const combined =
+        this.#buffer.length === 1 && this.#buffer[0]
+          ? this.#buffer[0]
+          : Buffer.concat(this.#buffer);
       const slice = combined.subarray(0, this.#chunkSize);
       const remainder = combined.subarray(this.#chunkSize);
 
@@ -95,8 +98,9 @@ export class ChunkedAeadEncryptStream extends Transform {
     callback();
   }
 
-  _flush(callback: TransformCallback): void {
-    const remaining = this.#buffer.length === 1 ? this.#buffer[0] : (this.#buffer.length ? Buffer.concat(this.#buffer) : Buffer.alloc(0));
+  override _flush(callback: TransformCallback): void {
+    const remaining =
+      this.#buffer.length === 1 && this.#buffer[0] ? this.#buffer[0] : Buffer.concat(this.#buffer);
     this.#encryptAndEmit(remaining, true);
     callback();
   }
@@ -134,13 +138,16 @@ export class ChunkedAeadDecryptStream extends Transform {
     this.#baseNonce = baseNonce;
   }
 
-  _transform(chunk: Buffer, _encoding: BufferEncoding, callback: TransformCallback): void {
+  override _transform(chunk: Buffer, _encoding: BufferEncoding, callback: TransformCallback): void {
     this.#buffer.push(chunk);
     this.#bufferedBytes += chunk.length;
 
     try {
       while (this.#bufferedBytes >= 5 + IV_LENGTH + TAG_LENGTH) {
-        const combined = this.#buffer.length === 1 ? this.#buffer[0] : Buffer.concat(this.#buffer);
+        const combined =
+          this.#buffer.length === 1 && this.#buffer[0]
+            ? this.#buffer[0]
+            : Buffer.concat(this.#buffer);
         const cipherLength = combined.readUInt32BE(0);
         if (cipherLength > MAX_FRAME_SIZE) {
           throw new Error(`AEAD frame size exceeds limit (${cipherLength} > ${MAX_FRAME_SIZE})`);
@@ -188,16 +195,14 @@ export class ChunkedAeadDecryptStream extends Transform {
     }
   }
 
-  _flush(callback: TransformCallback): void {
+  override _flush(callback: TransformCallback): void {
     if (this.#bufferedBytes > 0) {
       return callback(
         new Error(`Incomplete AEAD frame at end of stream (${this.#bufferedBytes} trailing bytes)`),
       );
     }
     if (!this.#seenFinal) {
-      return callback(
-        new Error("Truncated AEAD stream: end of stream reached before final frame"),
-      );
+      return callback(new Error("Truncated AEAD stream: end of stream reached before final frame"));
     }
     callback();
   }
@@ -220,7 +225,10 @@ export function createEncryptor(masterKey: Buffer): Encryptor {
   };
 }
 
-export function createDecryptor(masterKeys: Buffer | Buffer[], envelope: EncryptionEnvelope): Transform {
+export function createDecryptor(
+  masterKeys: Buffer | Buffer[],
+  envelope: EncryptionEnvelope,
+): Transform {
   if (envelope.algorithm !== ALGORITHM && envelope.algorithm !== CHUNKED_ALGORITHM) {
     throw new Error(`Unsupported encryption algorithm: ${envelope.algorithm}`);
   }
@@ -264,14 +272,18 @@ function unwrap(masterKey: Buffer, wrapped: string): Buffer {
   return Buffer.concat([decipher.update(encrypted), decipher.final()]);
 }
 
-function canonicalManifestPayload(manifest: BackupManifest | Record<string, any>): string {
-  const cleanEncryption = manifest.encryption ? { ...manifest.encryption } : null;
+function canonicalManifestPayload(
+  manifest: BackupManifest | (Record<string, unknown> & Partial<BackupManifest>),
+): string {
+  const enc = manifest.encryption as
+    (Record<string, unknown> & { manifestHmac?: string }) | null | undefined;
+  const cleanEncryption = enc ? { ...enc } : null;
   if (cleanEncryption) {
     delete cleanEncryption.manifestHmac;
   }
   return JSON.stringify({
     version: manifest.version,
-    ...(manifest.type ? { type: manifest.type } : {}),
+    ...("type" in manifest && manifest.type ? { type: manifest.type } : {}),
     key: manifest.key,
     database: manifest.database,
     createdAt: manifest.createdAt,
@@ -287,26 +299,33 @@ function canonicalManifestPayload(manifest: BackupManifest | Record<string, any>
   });
 }
 
-export function signManifest(masterKey: Buffer, manifest: BackupManifest | Record<string, any>): string {
-  return createHmac("sha256", masterKey)
-    .update(canonicalManifestPayload(manifest))
-    .digest("hex");
+export function signManifest(
+  masterKey: Buffer,
+  manifest: BackupManifest | Record<string, unknown>,
+): string {
+  return createHmac("sha256", masterKey).update(canonicalManifestPayload(manifest)).digest("hex");
 }
 
-export function verifyManifest(masterKeys: Buffer | Buffer[], manifest: BackupManifest | Record<string, any>): boolean {
-  if (!manifest?.encryption?.manifestHmac) return true;
+export function verifyManifest(
+  masterKeys: Buffer | Buffer[],
+  manifest: BackupManifest | Record<string, unknown>,
+): boolean {
+  const enc = (manifest as Partial<BackupManifest>).encryption;
+  if (!enc?.manifestHmac) return true;
   const keys = Array.isArray(masterKeys) ? masterKeys : [masterKeys];
-  const matchedKey = keys.find((k) => keyId(k) === manifest.encryption.keyId);
+  const matchedKey = keys.find((k) => keyId(k) === enc.keyId);
   if (!matchedKey) {
     const configuredIds = keys.map((k) => keyId(k)).join(", ");
     throw new Error(
-      `Backup was encrypted with key ${manifest.encryption.keyId}, but configured key ring has: [${configuredIds}]`,
+      `Backup was encrypted with key ${enc.keyId}, but configured key ring has: [${configuredIds}]`,
     );
   }
   const expected = Buffer.from(signManifest(matchedKey, manifest), "hex");
-  const actual = Buffer.from(String(manifest.encryption.manifestHmac), "hex");
+  const actual = Buffer.from(String(enc.manifestHmac), "hex");
   if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) {
-    throw new Error(`Manifest HMAC verification failed for ${manifest.key}: manifest has been tampered with`);
+    throw new Error(
+      `Manifest HMAC verification failed for ${(manifest as Partial<BackupManifest>).key}: manifest has been tampered with`,
+    );
   }
   return true;
 }

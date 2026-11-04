@@ -1,5 +1,5 @@
-import type { MongoClient, Timestamp } from "mongodb";
-import type { BackupManifest, BackupScope, BackupSummary } from "./catalog.js";
+import type { MongoClient } from "mongodb";
+import type { BackupManifest, BackupSummary } from "./catalog.js";
 import type { AppConfig } from "./config.js";
 import type { Logger } from "./logger.js";
 import type { Notifier } from "./notify.js";

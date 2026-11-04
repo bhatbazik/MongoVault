@@ -52,9 +52,15 @@ describe("retention", () => {
     const mockStorage = {
       async *list() {
         yield { key: "mongodb/prod/2026-03-01/20260301T000000Z.archive.gz", size: 100 };
-        yield { key: "mongodb/prod/2026-03-01/20260301T000000Z.archive.gz.manifest.json", size: 10 };
+        yield {
+          key: "mongodb/prod/2026-03-01/20260301T000000Z.archive.gz.manifest.json",
+          size: 10,
+        };
         yield { key: "mongodb/prod/2026-03-02/20260302T000000Z.archive.gz", size: 100 };
-        yield { key: "mongodb/prod/2026-03-02/20260302T000000Z.archive.gz.manifest.json", size: 10 };
+        yield {
+          key: "mongodb/prod/2026-03-02/20260302T000000Z.archive.gz.manifest.json",
+          size: 10,
+        };
       },
       async removeMany(keys) {
         deletedKeys.push(...keys);
@@ -74,6 +80,8 @@ describe("retention", () => {
     expect(result.keep).toHaveLength(1);
     expect(result.remove).toHaveLength(1);
     expect(deletedKeys).toContain("mongodb/prod/2026-03-01/20260301T000000Z.archive.gz");
-    expect(deletedKeys).toContain("mongodb/prod/2026-03-01/20260301T000000Z.archive.gz.manifest.json");
+    expect(deletedKeys).toContain(
+      "mongodb/prod/2026-03-01/20260301T000000Z.archive.gz.manifest.json",
+    );
   });
 });

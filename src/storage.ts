@@ -6,6 +6,7 @@ import {
   GetObjectCommand,
   HeadObjectCommand,
   PutObjectCommand,
+  type PutObjectCommandInput,
   S3Client,
   type S3ClientConfig,
   paginateListObjectsV2,
@@ -48,10 +49,19 @@ export function createStorage({
   return {
     bucket,
 
-    async upload(key: string, body: unknown, { contentType = "application/octet-stream", signal, onProgress }: UploadOptions = {}): Promise<void> {
+    async upload(
+      key: string,
+      body: unknown,
+      { contentType = "application/octet-stream", signal, onProgress }: UploadOptions = {},
+    ): Promise<void> {
       const upload = new Upload({
         client,
-        params: { Bucket: bucket, Key: key, Body: body as any, ContentType: contentType },
+        params: {
+          Bucket: bucket,
+          Key: key,
+          Body: body as PutObjectCommandInput["Body"],
+          ContentType: contentType,
+        },
         partSize,
         queueSize: concurrency,
         leavePartsOnError: false,
@@ -104,7 +114,10 @@ export function createStorage({
     async getJson<T = unknown>(key: string): Promise<GetJsonResult<T> | null> {
       try {
         const response = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
-        const data = JSON.parse(await (response.Body as any).transformToString()) as T;
+        const bodyStr = await (
+          response.Body as { transformToString: () => Promise<string> }
+        ).transformToString();
+        const data = JSON.parse(bodyStr) as T;
         const etag = response.ETag ? response.ETag.replace(/"/g, "") : null;
         return { data, etag };
       } catch (error) {
@@ -114,7 +127,10 @@ export function createStorage({
     },
 
     async *list(prefix: string): AsyncGenerator<StorageObject, void, unknown> {
-      for await (const page of paginateListObjectsV2({ client }, { Bucket: bucket, Prefix: prefix })) {
+      for await (const page of paginateListObjectsV2(
+        { client },
+        { Bucket: bucket, Prefix: prefix },
+      )) {
         for (const object of page.Contents ?? []) {
           yield { key: object.Key!, size: Number(object.Size), lastModified: object.LastModified };
         }
@@ -141,20 +157,25 @@ export function createStorage({
         );
         if (response.Errors && response.Errors.length > 0) {
           const sample = response.Errors.map((e) => `${e.Key}: ${e.Message || e.Code}`).join("; ");
-          throw new Error(`S3 batch delete failed for ${response.Errors.length} objects: ${sample}`);
+          throw new Error(
+            `S3 batch delete failed for ${response.Errors.length} objects: ${sample}`,
+          );
         }
       }
     },
 
-    async acquireLock(key: string, { holder, ttlMs }: { holder?: string; ttlMs: number }): Promise<string | null> {
+    async acquireLock(
+      key: string,
+      { holder, ttlMs }: { holder?: string; ttlMs: number },
+    ): Promise<string | null> {
       const now = Date.now();
-      const current = await this.getJson<any>(key);
+      const current = await this.getJson<LockRecord>(key);
       const currentData = current?.data;
       if (currentData && currentData.expiresAt && currentData.expiresAt > now) {
         return null;
       }
       const token = randomUUID();
-      const lockData = {
+      const lockData: LockRecord = {
         token,
         holder,
         acquiredAt: new Date(now).toISOString(),
@@ -162,20 +183,13 @@ export function createStorage({
       };
 
       try {
-        const putParams: any = {
+        const putParams: PutObjectCommandInput = {
           Bucket: bucket,
           Key: key,
           Body: JSON.stringify(lockData, null, 2),
           ContentType: "application/json",
+          ...(current?.etag ? { IfMatch: `"${current.etag}"` } : { IfNoneMatch: "*" }),
         };
-        // Use conditional write:
-        // If current lock file existed and had an etag (stale lock takeover), require matching ETag.
-        // If it did not exist, require IfNoneMatch: "*" to prevent concurrent creation race.
-        if (current?.etag) {
-          putParams.IfMatch = `"${current.etag}"`;
-        } else {
-          putParams.IfNoneMatch = "*";
-        }
         await client.send(new PutObjectCommand(putParams));
         return token;
       } catch (err) {
@@ -184,7 +198,7 @@ export function createStorage({
         }
         if (isConditionalHeaderUnsupported(err)) {
           await this.putJson(key, lockData);
-          const readBack = await this.getJson<any>(key);
+          const readBack = await this.getJson<LockRecord>(key);
           return readBack?.data?.token === token ? token : null;
         }
         throw err;
@@ -192,22 +206,20 @@ export function createStorage({
     },
 
     async refreshLock(key: string, token: string, ttlMs: number): Promise<boolean> {
-      const current = await this.getJson<any>(key);
+      const current = await this.getJson<LockRecord>(key);
       if (current?.data?.token === token) {
-        const updated = {
+        const updated: LockRecord = {
           ...current.data,
           expiresAt: Date.now() + ttlMs,
         };
         try {
-          const putParams: any = {
+          const putParams: PutObjectCommandInput = {
             Bucket: bucket,
             Key: key,
             Body: JSON.stringify(updated, null, 2),
             ContentType: "application/json",
+            ...(current.etag ? { IfMatch: `"${current.etag}"` } : {}),
           };
-          if (current.etag) {
-            putParams.IfMatch = `"${current.etag}"`;
-          }
           await client.send(new PutObjectCommand(putParams));
           return true;
         } catch (err) {
@@ -222,7 +234,7 @@ export function createStorage({
     },
 
     async releaseLock(key: string, token: string): Promise<void> {
-      const current = await this.getJson<any>(key);
+      const current = await this.getJson<LockRecord>(key);
       if (current?.data?.token === token) {
         if (current.etag) {
           try {
@@ -245,31 +257,45 @@ export function createStorage({
   };
 }
 
-function isNotFound(error: any): boolean {
+interface LockRecord {
+  token: string;
+  holder?: string;
+  acquiredAt: string;
+  expiresAt: number;
+}
+
+interface AwsErrorLike {
+  name?: string;
+  code?: string;
+  $metadata?: { httpStatusCode?: number };
+}
+
+function isNotFound(error: unknown): boolean {
+  const err = error as AwsErrorLike | null | undefined;
   return (
-    error?.name === "NotFound" ||
-    error?.name === "NoSuchKey" ||
-    error?.$metadata?.httpStatusCode === 404
+    err?.name === "NotFound" || err?.name === "NoSuchKey" || err?.$metadata?.httpStatusCode === 404
   );
 }
 
-function isPreconditionFailed(error: any): boolean {
-  const status = error?.$metadata?.httpStatusCode;
+function isPreconditionFailed(error: unknown): boolean {
+  const err = error as AwsErrorLike | null | undefined;
+  const status = err?.$metadata?.httpStatusCode;
   return (
-    error?.name === "PreconditionFailed" ||
-    error?.code === "PreconditionFailed" ||
-    error?.name === "ConditionalRequestConflict" ||
+    err?.name === "PreconditionFailed" ||
+    err?.code === "PreconditionFailed" ||
+    err?.name === "ConditionalRequestConflict" ||
     status === 412 ||
     status === 409
   );
 }
 
-function isConditionalHeaderUnsupported(error: any): boolean {
-  const status = error?.$metadata?.httpStatusCode;
+function isConditionalHeaderUnsupported(error: unknown): boolean {
+  const err = error as AwsErrorLike | null | undefined;
+  const status = err?.$metadata?.httpStatusCode;
   return (
-    error?.name === "NotImplemented" ||
-    error?.code === "NotImplemented" ||
-    error?.name === "InvalidArgument" ||
+    err?.name === "NotImplemented" ||
+    err?.code === "NotImplemented" ||
+    err?.name === "InvalidArgument" ||
     status === 501
   );
 }

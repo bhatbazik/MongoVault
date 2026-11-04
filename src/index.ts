@@ -8,7 +8,12 @@ async function main(): Promise<void> {
   const command = argv[0] || "daemon";
   const effectiveArgv = argv.length === 0 ? ["daemon"] : argv;
 
-  if (command === "key:generate" || command === "--help" || command === "-h" || command === "help") {
+  if (
+    command === "key:generate" ||
+    command === "--help" ||
+    command === "-h" ||
+    command === "help"
+  ) {
     await runCli(null, effectiveArgv);
     return;
   }
@@ -17,11 +22,12 @@ async function main(): Promise<void> {
   await runCli(config, effectiveArgv);
 }
 
-main().catch((error: any) => {
-  if (error.name === "ConfigError") {
-    console.error(error.message);
+main().catch((error: unknown) => {
+  const err = error as { name?: string; message?: string; stack?: string };
+  if (err.name === "ConfigError") {
+    console.error(err.message);
   } else {
-    console.error("Fatal error:", error.stack || error.message);
+    console.error("Fatal error:", err.stack || err.message || error);
   }
   process.exit(1);
 });

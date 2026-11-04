@@ -19,8 +19,10 @@ import type {
 
 const KILL_GRACE_MS = 10_000;
 const TAIL_LINES = 40;
-const DUMPED = /(?:done dumping|dumped)\s+["']?([^.\s"']+)["']?\.["']?(.+?)["']?\s+\(([\d,]+)\s+documents?\)/i;
-const RESTORED = /([\d,]+)\s+document\(s\)\s+restored\s+successfully\.\s+([\d,]+)\s+document\(s\)\s+failed/i;
+const DUMPED =
+  /(?:done dumping|dumped)\s+["']?([^.\s"']+)["']?\.["']?(.+?)["']?\s+\(([\d,]+)\s+documents?\)/i;
+const RESTORED =
+  /([\d,]+)\s+document\(s\)\s+restored\s+successfully\.\s+([\d,]+)\s+document\(s\)\s+failed/i;
 
 export function isClusterDatabase(database?: string | null): boolean {
   return !database || database === "*" || database === "all";
@@ -28,26 +30,32 @@ export function isClusterDatabase(database?: string | null): boolean {
 
 export function parseDumpLine(line: string): DumpLineResult | null {
   const match = DUMPED.exec(line);
-  return match
-    ? {
-        database: match[1],
-        collection: match[2],
-        documents: Number(match[3].replace(/,/g, "")),
-      }
-    : null;
+  if (!match || !match[1] || !match[2] || !match[3]) {
+    return null;
+  }
+  return {
+    database: match[1],
+    collection: match[2],
+    documents: Number(match[3].replace(/,/g, "")),
+  };
 }
 
 export function parseRestoreLine(line: string): RestoreLineResult | null {
   const match = RESTORED.exec(line);
-  return match
-    ? {
-        restored: Number(match[1].replace(/,/g, "")),
-        failed: Number(match[2].replace(/,/g, "")),
-      }
-    : null;
+  if (!match || !match[1] || !match[2]) {
+    return null;
+  }
+  return {
+    restored: Number(match[1].replace(/,/g, "")),
+    failed: Number(match[2].replace(/,/g, "")),
+  };
 }
 
-export function runTool(command: string, args: string[], { stdio, signal, timeoutMs, onLine = () => {} }: RunToolOptions): RunToolResult {
+export function runTool(
+  command: string,
+  args: string[],
+  { stdio, signal, timeoutMs, onLine = () => {} }: RunToolOptions,
+): RunToolResult {
   const child = spawn(command, args, { stdio: stdio as StdioOptions });
   const tail: string[] = [];
 
@@ -60,9 +68,9 @@ export function runTool(command: string, args: string[], { stdio, signal, timeou
   }
 
   const done = new Promise<void>((resolve, reject) => {
-    let failure: any = null;
+    let failure: unknown = null;
 
-    const terminate = (reason: any) => {
+    const terminate = (reason: unknown) => {
       if (failure || child.exitCode !== null || child.signalCode !== null) return;
       failure = reason;
       child.kill("SIGTERM");
@@ -85,7 +93,7 @@ export function runTool(command: string, args: string[], { stdio, signal, timeou
       signal?.removeEventListener("abort", onAbort);
     };
 
-    child.once("error", (error: any) => {
+    child.once("error", (error: Error & { code?: string }) => {
       cleanup();
       reject(
         error.code === "ENOENT"
@@ -153,9 +161,7 @@ export async function mongodump({
       logger?.debug({ tool: "mongodump" }, line);
       const dumped = parseDumpLine(line);
       if (dumped) {
-        const key = isCluster
-          ? `${dumped.database}.${dumped.collection}`
-          : dumped.collection;
+        const key = isCluster ? `${dumped.database}.${dumped.collection}` : dumped.collection;
         collections[key] = dumped.documents;
       }
     },
@@ -213,14 +219,12 @@ export async function mongorestore({
 
   return {
     stdin: child.stdin!,
-    done: done
-      .finally(cleanupConfig)
-      .then(() => {
-        if (summary && summary.failed > 0) {
-          throw new Error(`mongorestore failed to restore ${summary.failed} documents`);
-        }
-        return summary ?? { restored: 0, failed: 0 };
-      }),
+    done: done.finally(cleanupConfig).then(() => {
+      if (summary && summary.failed > 0) {
+        throw new Error(`mongorestore failed to restore ${summary.failed} documents`);
+      }
+      return summary ?? { restored: 0, failed: 0 };
+    }),
   };
 }
 
@@ -259,14 +263,14 @@ export async function replayOplogFile({
   try {
     await done;
   } finally {
-    await Promise.allSettled([
-      cleanupConfig(),
-      fs.rm(emptyDir, { recursive: true, force: true }),
-    ]);
+    await Promise.allSettled([cleanupConfig(), fs.rm(emptyDir, { recursive: true, force: true })]);
   }
 }
 
-async function writeUriConfig(workDir: string, uri: string): Promise<{ file: string; cleanup: () => Promise<void> }> {
+async function writeUriConfig(
+  workDir: string,
+  uri: string,
+): Promise<{ file: string; cleanup: () => Promise<void> }> {
   await fs.mkdir(workDir, { recursive: true });
   const file = path.join(workDir, `.${randomUUID()}.yaml`);
   await fs.writeFile(file, `uri: ${JSON.stringify(uri)}\n`, { mode: 0o600 });

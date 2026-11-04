@@ -22,7 +22,11 @@ export async function settleAll<T extends readonly Promise<unknown>[]>(
     task.catch((error) => controller.abort(error));
   }
   const results = await Promise.allSettled(tasks);
-  const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+  const failure = results.find(
+    (result): result is PromiseRejectedResult => result.status === "rejected",
+  );
   if (failure) throw failure.reason;
-  return results.map((result) => (result as PromiseFulfilledResult<unknown>).value) as { [K in keyof T]: Awaited<T[K]> };
+  return results.map((result) => (result as PromiseFulfilledResult<unknown>).value) as {
+    [K in keyof T]: Awaited<T[K]>;
+  };
 }

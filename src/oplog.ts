@@ -16,10 +16,9 @@ import {
 } from "./catalog.js";
 import { createDecryptor, createEncryptor, signManifest, verifyManifest } from "./crypto.js";
 import { DigestStream } from "./digest.js";
-import type { BackupManifest, BackupScope } from "./types/catalog.js";
+import type { BackupManifest, BackupScope, BackupSummary } from "./types/catalog.js";
 import type { AppConfig } from "./types/config.js";
 import type {
-  BsonTimestampLike,
   CaptureOplogSliceOptions,
   ExtractOplogSliceResult,
   OplogArchiver,
@@ -33,30 +32,44 @@ import type {
 } from "./types/oplog.js";
 import type { StorageClient } from "./types/storage.js";
 
-const SLICE_PATTERN =
-  /(\d{10})_(\d{1,10})__(\d{10})_(\d{1,10})\.oplog\.bson\.gz(\.enc)?$/;
+const SLICE_PATTERN = /(\d{10})_(\d{1,10})__(\d{10})_(\d{1,10})\.oplog\.bson\.gz(\.enc)?$/;
 
-export function parseOplogTimestamp(value: any): OplogTimestamp | null {
+export function parseOplogTimestamp(value: unknown): OplogTimestamp | null {
   if (!value) return null;
-  if (typeof value === "object" && typeof value.t === "number" && typeof value.i === "number") {
-    return { t: value.t >>> 0, i: value.i >>> 0 };
+  if (
+    typeof value === "object" &&
+    value !== null &&
+    "t" in value &&
+    "i" in value &&
+    typeof (value as { t: unknown }).t === "number" &&
+    typeof (value as { i: unknown }).i === "number"
+  ) {
+    const v = value as { t: number; i: number };
+    return { t: v.t >>> 0, i: v.i >>> 0 };
   }
   const str = String(value).trim();
   const match = /^(\d+)[:_](\d+)$/.exec(str);
-  if (!match) {
+  if (!match || !match[1] || !match[2]) {
     throw new Error(
-      `Invalid oplog timestamp "${value}". Expected format "<seconds>:<ordinal>" (e.g. 1774092000:1)`,
+      `Invalid oplog timestamp "${String(value)}". Expected format "<seconds>:<ordinal>" (e.g. 1774092000:1)`,
     );
   }
   const t = Number(match[1]);
   const i = Number(match[2]);
-  if (!Number.isInteger(t) || t < 0 || t > 0xffffffff || !Number.isInteger(i) || i < 0 || i > 0xffffffff) {
-    throw new Error(`Oplog timestamp components out of 32-bit range: "${value}"`);
+  if (
+    !Number.isInteger(t) ||
+    t < 0 ||
+    t > 0xffffffff ||
+    !Number.isInteger(i) ||
+    i < 0 ||
+    i > 0xffffffff
+  ) {
+    throw new Error(`Oplog timestamp components out of 32-bit range: "${String(value)}"`);
   }
   return { t, i };
 }
 
-export function parsePitrTarget(value: any): OplogTimestamp {
+export function parsePitrTarget(value: unknown): OplogTimestamp {
   if (!value) {
     throw new Error("Point-in-time target is required");
   }
@@ -90,16 +103,22 @@ export function toBsonTimestamp(ts: OplogTimestamp): Timestamp {
   return new Timestamp({ t: ts.t >>> 0, i: ts.i >>> 0 });
 }
 
-export function fromBsonTimestamp(bsonTs: any): OplogTimestamp | null {
+export function fromBsonTimestamp(bsonTs: unknown): OplogTimestamp | null {
   if (!bsonTs) return null;
-  if (typeof bsonTs.getHighBits === "function") {
+  const ts = bsonTs as {
+    getHighBits?: () => number;
+    getLowBits?: () => number;
+    t?: number;
+    i?: number;
+  };
+  if (typeof ts.getHighBits === "function" && typeof ts.getLowBits === "function") {
     return {
-      t: bsonTs.getHighBits() >>> 0,
-      i: bsonTs.getLowBits() >>> 0,
+      t: ts.getHighBits() >>> 0,
+      i: ts.getLowBits() >>> 0,
     };
   }
-  if (typeof bsonTs.t === "number" && typeof bsonTs.i === "number") {
-    return { t: bsonTs.t >>> 0, i: bsonTs.i >>> 0 };
+  if (typeof ts.t === "number" && typeof ts.i === "number") {
+    return { t: ts.t >>> 0, i: ts.i >>> 0 };
   }
   return null;
 }
@@ -112,7 +131,12 @@ export function pitrStateKey(scope: BackupScope): string {
   return `${pitrPrefix(scope)}state.json`;
 }
 
-export function oplogSliceKey(scope: BackupScope, startTs: OplogTimestamp, endTs: OplogTimestamp, { encrypted = false }: { encrypted?: boolean } = {}): string {
+export function oplogSliceKey(
+  scope: BackupScope,
+  startTs: OplogTimestamp,
+  endTs: OplogTimestamp,
+  { encrypted = false }: { encrypted?: boolean } = {},
+): string {
   const date = new Date((endTs.t >>> 0) * 1000);
   const day = date.toISOString().slice(0, 10);
   const sT = String(startTs.t >>> 0).padStart(10, "0");
@@ -132,8 +156,11 @@ export function parseSliceKeyTimestamps(key: string): OplogSliceKeyTimestamps | 
   };
 }
 
-export async function listOplogSlices(storage: StorageClient, scope: BackupScope): Promise<OplogSlice[]> {
-  const slices: any[] = [];
+export async function listOplogSlices(
+  storage: StorageClient,
+  scope: BackupScope,
+): Promise<OplogSlice[]> {
+  const slices: Array<Omit<OplogSlice, "complete">> = [];
   const manifests = new Set<string>();
 
   for await (const object of storage.list(pitrPrefix(scope))) {
@@ -164,15 +191,25 @@ export async function listOplogSlices(storage: StorageClient, scope: BackupScope
 
 export async function getOplogBounds(
   uri: string,
-  { createMongoClient = (u: string) => new MongoClient(u) }: { createMongoClient?: (u: string) => MongoClient } = {},
+  {
+    createMongoClient = (u: string) => new MongoClient(u),
+  }: { createMongoClient?: (u: string) => MongoClient } = {},
 ): Promise<OplogBounds> {
   const client = createMongoClient(uri);
   try {
     await client.connect();
     const oplog = client.db("local").collection("oplog.rs");
     const [oldestDoc, newestDoc] = await Promise.all([
-      oplog.find({}, { projection: { ts: 1 } }).sort({ $natural: 1 }).limit(1).next(),
-      oplog.find({}, { projection: { ts: 1 } }).sort({ $natural: -1 }).limit(1).next(),
+      oplog
+        .find({}, { projection: { ts: 1 } })
+        .sort({ $natural: 1 })
+        .limit(1)
+        .next(),
+      oplog
+        .find({}, { projection: { ts: 1 } })
+        .sort({ $natural: -1 })
+        .limit(1)
+        .next(),
     ]);
     return {
       oldestTs: fromBsonTimestamp(oldestDoc?.ts),
@@ -205,17 +242,19 @@ export async function uploadOplogSlice({
 
   try {
     const gzip = createGzip();
-    const encryptor = encrypted && config.encryptionKey ? createEncryptor(config.encryptionKey) : null;
+    const encryptor =
+      encrypted && config.encryptionKey ? createEncryptor(config.encryptionKey) : null;
     const digest = new DigestStream();
     const body = new PassThrough({ highWaterMark: 1024 * 1024 });
-    const stages = [Readable.from(rawDocs), gzip, encryptor?.stream, digest, body].filter(Boolean) as any[];
+    const stages = [Readable.from(rawDocs), gzip, encryptor?.stream, digest, body].filter(Boolean);
+    const runPipeline = pipeline as unknown as (...args: unknown[]) => Promise<void>;
 
     await settleAll(controller, [
       storage.upload(key, body, {
         contentType: encrypted ? "application/octet-stream" : "application/gzip",
         signal: controller.signal,
       }),
-      pipeline(...(stages as [any, ...any[]]), { signal: controller.signal }),
+      runPipeline(...stages, { signal: controller.signal }),
     ]);
 
     const stored = await storage.head(key);
@@ -233,7 +272,7 @@ export async function uploadOplogSlice({
       database: config.mongo.database,
       createdAt: startedAt.toISOString(),
       completedAt: completedAt.toISOString(),
-      durationMs: (completedAt as any) - (startedAt as any),
+      durationMs: completedAt.getTime() - startedAt.getTime(),
       size: digest.bytes,
       sha256: digest.digest(),
       compression: "gzip",
@@ -282,7 +321,7 @@ export async function captureOplogSlice({
   createMongoClient = (u) => new MongoClient(u),
 }: CaptureOplogSliceOptions): Promise<BackupManifest | null> {
   const scope = scopeOf(config);
-  const stateObj = await storage.getJson<any>(pitrStateKey(scope));
+  const stateObj = await storage.getJson<{ lastTs?: string }>(pitrStateKey(scope));
   const state = stateObj && "data" in stateObj ? stateObj.data : stateObj;
 
   let cursorStartTs = sinceTs ? parseOplogTimestamp(sinceTs) : null;
@@ -291,8 +330,9 @@ export async function captureOplogSlice({
   }
   if (!cursorStartTs) {
     const backups = (await listBackups(storage, scope)).filter((b) => b.complete);
-    if (backups.length > 0) {
-      const latestManifest = await readManifest(storage, backups[0].key);
+    const firstBackup = backups[0];
+    if (firstBackup) {
+      const latestManifest = await readManifest(storage, firstBackup.key);
       if (latestManifest?.oplogWindow?.endTs) {
         cursorStartTs = parseOplogTimestamp(latestManifest.oplogWindow.endTs);
       }
@@ -327,9 +367,7 @@ export async function captureOplogSlice({
       );
     }
 
-    const query = cursorStartTs
-      ? { ts: { $gt: toBsonTimestamp(cursorStartTs) } }
-      : {};
+    const query = cursorStartTs ? { ts: { $gt: toBsonTimestamp(cursorStartTs) } } : {};
 
     const maxBytes = (config.pitr?.maxSliceMb ?? 16) * 1024 * 1024;
     const cursor = oplog.find(query).sort({ $natural: 1 });
@@ -387,14 +425,18 @@ export async function captureOplogSlice({
   }
 }
 
-export async function resolvePitrPlan(storage: StorageClient, scope: BackupScope, targetInput: string | OplogTimestamp): Promise<PitrPlan> {
+export async function resolvePitrPlan(
+  storage: StorageClient,
+  scope: BackupScope,
+  targetInput: string | OplogTimestamp,
+): Promise<PitrPlan> {
   const targetTs = parsePitrTarget(targetInput);
   const backups = (await listBackups(storage, scope)).filter((b) => b.complete);
   if (backups.length === 0) {
     throw new Error(`No complete base backups found under ${databasePrefix(scope)}`);
   }
 
-  let selectedBackup: any = null;
+  let selectedBackup: BackupSummary | null = null;
   let selectedManifest: BackupManifest | null = null;
   let baseEndTs: OplogTimestamp | null = null;
 
@@ -404,7 +446,8 @@ export async function resolvePitrPlan(storage: StorageClient, scope: BackupScope
     const endTs: OplogTimestamp = manifest.oplogWindow?.endTs
       ? parseOplogTimestamp(manifest.oplogWindow.endTs)!
       : {
-          t: Math.floor(new Date(manifest.completedAt || manifest.createdAt).getTime() / 1000) >>> 0,
+          t:
+            Math.floor(new Date(manifest.completedAt || manifest.createdAt).getTime() / 1000) >>> 0,
           i: 0,
         };
 
@@ -425,8 +468,7 @@ export async function resolvePitrPlan(storage: StorageClient, scope: BackupScope
   const allSlices = (await listOplogSlices(storage, scope)).filter((s) => s.complete);
   const candidateSlices = allSlices.filter(
     (s) =>
-      compareTimestamps(s.endTs, baseEndTs!) > 0 &&
-      compareTimestamps(s.startTs, targetTs) <= 0,
+      compareTimestamps(s.endTs, baseEndTs!) > 0 && compareTimestamps(s.startTs, targetTs) <= 0,
   );
 
   // Read manifests and verify contiguity of the oplog chain
@@ -446,7 +488,10 @@ export async function resolvePitrPlan(storage: StorageClient, scope: BackupScope
           `PITR timeline gap detected between ${formatOplogTimestamp(expectedPrevEndTs)} and slice ${slice.key} (starts after ${formatOplogTimestamp(prevEndTs)})`,
         );
       }
-    } else if (sliceManifest?.oplogWindow && compareTimestamps(slice.startTs, expectedPrevEndTs) > 0) {
+    } else if (
+      sliceManifest?.oplogWindow &&
+      compareTimestamps(slice.startTs, expectedPrevEndTs) > 0
+    ) {
       throw new Error(
         `PITR timeline gap detected before slice ${slice.key} (oplog rolled over after ${formatOplogTimestamp(expectedPrevEndTs)})`,
       );
@@ -461,10 +506,7 @@ export async function resolvePitrPlan(storage: StorageClient, scope: BackupScope
     }
   }
 
-  if (
-    compareTimestamps(targetTs, baseEndTs) > 0 &&
-    verifiedSlices.length === 0
-  ) {
+  if (compareTimestamps(targetTs, baseEndTs) > 0 && verifiedSlices.length === 0) {
     throw new Error(
       `Target timestamp ${formatOplogTimestamp(targetTs)} is newer than base backup (${formatOplogTimestamp(baseEndTs)}), but no oplog slices are available to bridge the window`,
     );
@@ -491,7 +533,11 @@ export async function resolvePitrPlan(storage: StorageClient, scope: BackupScope
   };
 }
 
-export async function downloadAndExtractOplogSlice({ config, storage, signal }: { config: AppConfig; storage: StorageClient; signal?: AbortSignal }, sliceKey: string, destBsonFile: string): Promise<ExtractOplogSliceResult> {
+export async function downloadAndExtractOplogSlice(
+  { config, storage, signal }: { config: AppConfig; storage: StorageClient; signal?: AbortSignal },
+  sliceKey: string,
+  destBsonFile: string,
+): Promise<ExtractOplogSliceResult> {
   const manifest = await readManifest(storage, sliceKey);
   const keyRing = config.encryptionKeyRing || (config.encryptionKey ? [config.encryptionKey] : []);
 
@@ -503,9 +549,7 @@ export async function downloadAndExtractOplogSlice({ config, storage, signal }: 
   }
 
   const digest = new DigestStream();
-  const decryptStage = manifest?.encryption
-    ? [createDecryptor(keyRing, manifest.encryption)]
-    : [];
+  const decryptStage = manifest?.encryption ? [createDecryptor(keyRing, manifest.encryption)] : [];
 
   await fs.mkdir(path.dirname(destBsonFile), { recursive: true });
   const fileHandle = await fs.open(destBsonFile, "w", 0o600);
@@ -513,17 +557,9 @@ export async function downloadAndExtractOplogSlice({ config, storage, signal }: 
 
   try {
     const downloadStream = await storage.download(sliceKey, { signal });
-    const stages = [
-      downloadStream,
-      digest,
-      ...decryptStage,
-      createGunzip(),
-      writeStream,
-    ];
-    await pipeline(
-      ...(stages as [any, ...any[]]),
-      { signal },
-    );
+    const stages = [downloadStream, digest, ...decryptStage, createGunzip(), writeStream];
+    const runPipeline = pipeline as unknown as (...args: unknown[]) => Promise<void>;
+    await runPipeline(...stages, { signal });
   } finally {
     await fileHandle.close().catch(() => {});
   }
@@ -567,10 +603,11 @@ export function startOplogArchiver({
         createMongoClient,
       });
       await activePromise;
-    } catch (error: any) {
-      logger.error({ err: error }, "Continuous PITR oplog slice capture failed");
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      logger.error({ err }, "Continuous PITR oplog slice capture failed");
       if (notifier) {
-        await notifier.notifyFailure("pitr-oplog", error).catch(() => {});
+        await notifier.notifyFailure("pitr-oplog", err).catch(() => {});
       }
     } finally {
       activePromise = null;
