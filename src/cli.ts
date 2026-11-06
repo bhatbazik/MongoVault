@@ -17,6 +17,9 @@ import {
   startOplogArchiver,
 } from "./oplog.js";
 import { describeBackup, restoreBackup, verifyBackup } from "./restore.js";
+import { runPhysicalBackup, restorePhysicalBackup } from "./physical.js";
+import { runCloudSnapshot, restoreCloudSnapshot } from "./snapshot.js";
+import { runShardedClusterBackup, restoreShardedCluster } from "./sharding.js";
 import { deleteBackup, prune, pruneOplogSlices } from "./retention.js";
 import { createScheduler } from "./scheduler.js";
 import { formatStatus, getStatus } from "./status.js";
@@ -51,6 +54,10 @@ Commands:
 
 Options:
   --key <string>            Target backup key (default: latest)
+  --engine <string>         Backup engine: logical, physical, or snapshot (default: logical)
+  --db-path <path>          WiredTiger database path for physical backup or restore
+  --volume-id <string>      Cloud volume ID for cloud snapshot engine
+  --sharding                Execute synchronized multi-shard cluster backup
   --uri <string>            Target MongoDB URI for restore (default: MONGODB_URI)
   --database <string>       Target database name for restore (default: original database)
   --ns-include <string>     Selective restore collection pattern (e.g. "mydb.users,mydb.orders*")
@@ -92,6 +99,10 @@ export async function runCli(
     args: argv.slice(1),
     options: {
       key: { type: "string" },
+      engine: { type: "string" },
+      "db-path": { type: "string" },
+      "volume-id": { type: "string" },
+      sharding: { type: "boolean", default: false },
       uri: { type: "string" },
       database: { type: "string" },
       "ns-include": { type: "string" },
@@ -309,11 +320,41 @@ export async function runCli(
       };
 
       try {
-        const manifest = await runBackup({ config: backupConfig, storage, logger });
+        let manifest;
+        const selectedEngine = values.engine || config.engine || "logical";
+
+        if (selectedEngine === "physical") {
+          const res = await runPhysicalBackup({
+            config: backupConfig,
+            storage,
+            logger,
+            dbPath: values["db-path"],
+          });
+          manifest = res.manifest;
+        } else if (selectedEngine === "snapshot") {
+          const res = await runCloudSnapshot({
+            config: backupConfig,
+            storage,
+            logger,
+            volumeId: values["volume-id"],
+          });
+          manifest = res.manifest;
+        } else if (values.sharding || config.sharding?.enabled) {
+          const res = await runShardedClusterBackup({
+            config: backupConfig,
+            storage,
+            logger,
+          });
+          manifest = res.manifest;
+        } else {
+          manifest = await runBackup({ config: backupConfig, storage, logger });
+        }
+
         if (values.json) {
           console.log(JSON.stringify(manifest, null, 2));
         } else {
           console.log("\nBackup Completed Successfully");
+          console.log(`Engine:     ${manifest.engine || "logical"}`);
           console.log(`Key:        ${manifest.key}`);
           console.log(`Size:       ${formatBytes(manifest.size)}`);
           console.log(`Duration:   ${formatDuration(manifest.durationMs)}`);
@@ -334,6 +375,79 @@ export async function runCli(
     }
 
     case "restore": {
+      if (values["db-path"]) {
+        try {
+          const res = await restorePhysicalBackup({
+            config,
+            storage,
+            logger,
+            targetDbPath: values["db-path"],
+            ref: values.key || "latest",
+          });
+          if (values.json) {
+            console.log(JSON.stringify(res, null, 2));
+          } else {
+            console.log("\nPhysical Restore Completed Successfully");
+            console.log(`Key:        ${res.key}`);
+            console.log(`Target:     ${res.targetDbPath}`);
+            console.log(
+              `Files:      ${res.restoredFiles} restored (${formatBytes(res.totalBytes)})`,
+            );
+          }
+        } catch (error) {
+          logger.error({ err: error }, "Physical restore failed");
+          process.exit(1);
+        }
+        break;
+      }
+
+      if (values.engine === "snapshot" || values.key?.endsWith(".snapshot")) {
+        try {
+          const res = await restoreCloudSnapshot({
+            config,
+            storage,
+            logger,
+            ref: values.key || "latest",
+          });
+          if (values.json) {
+            console.log(JSON.stringify(res, null, 2));
+          } else {
+            console.log("\nCloud Snapshot Restored Successfully");
+            console.log(`Snapshot ID:  ${res.snapshotId}`);
+            console.log(`Volume ID:    ${res.volumeId}`);
+            console.log(`New Volume:   ${res.newVolumeId || "n/a"}`);
+          }
+        } catch (error) {
+          logger.error({ err: error }, "Cloud snapshot restore failed");
+          process.exit(1);
+        }
+        break;
+      }
+
+      if (values.sharding) {
+        try {
+          const res = await restoreShardedCluster({
+            config,
+            storage,
+            logger,
+            ref: values.key || "latest",
+            drop: values.drop,
+          });
+          if (values.json) {
+            console.log(JSON.stringify(res, null, 2));
+          } else {
+            console.log("\nSharded Cluster Restored Successfully");
+            console.log(`Key:          ${res.key}`);
+            console.log(`Cluster Time: ${res.clusterTime}`);
+            console.log(`Shards:       ${res.restoredShards.join(", ")}`);
+          }
+        } catch (error) {
+          logger.error({ err: error }, "Sharded cluster restore failed");
+          process.exit(1);
+        }
+        break;
+      }
+
       const targetUri = values.uri || config.mongo.uri;
       try {
         const result = await restoreBackup(

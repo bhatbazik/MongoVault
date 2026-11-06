@@ -25,9 +25,52 @@ export interface ManifestOplogWindow {
   gapDetected?: boolean;
 }
 
+export type BackupEngine = "logical" | "physical" | "snapshot";
+
+export interface PhysicalBackupFile {
+  name: string;
+  size: number;
+}
+
+export interface PhysicalBackupMeta {
+  dbPath?: string;
+  files: PhysicalBackupFile[];
+  checkpointTimestamp?: string;
+  oplogStart?: string;
+  oplogEnd?: string;
+}
+
+export interface CloudSnapshotMeta {
+  provider: "aws-ebs" | "gcp-pd" | "azure-disk" | "custom";
+  snapshotId: string;
+  volumeId: string;
+  region?: string;
+  clusterTime?: string;
+}
+
+export interface ShardedClusterShardBackup {
+  shardId: string;
+  host: string;
+  backupKey: string;
+  manifestKey: string;
+  status: "success" | "failed";
+  size?: number;
+}
+
+export interface ShardedClusterMeta {
+  clusterTime: string;
+  configsvr: {
+    backupKey: string;
+    manifestKey: string;
+    host?: string;
+  };
+  shards: Record<string, ShardedClusterShardBackup>;
+}
+
 export interface BackupManifest {
   version: number;
   type?: string;
+  engine?: BackupEngine;
   key: string;
   database: string;
   createdAt: string;
@@ -41,4 +84,12 @@ export interface BackupManifest {
   oplogWindow?: ManifestOplogWindow | null;
   excludedCollections: string[];
   collections: Record<string, number>;
+  physical?: PhysicalBackupMeta;
+  snapshot?: CloudSnapshotMeta;
+  sharding?: ShardedClusterMeta;
+  objectLock?: {
+    mode: "GOVERNANCE" | "COMPLIANCE";
+    retainUntil: string;
+    legalHold?: boolean;
+  };
 }

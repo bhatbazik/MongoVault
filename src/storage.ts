@@ -205,6 +205,7 @@ export function createStorage(options: StorageOptions): StorageClient {
     forcePathStyle,
     partSizeMb = 32,
     queueSize = 2,
+    objectLock,
   } = options;
   const clientConfig: S3ClientConfig = {
     region,
@@ -227,16 +228,38 @@ export function createStorage(options: StorageOptions): StorageClient {
     async upload(
       key: string,
       body: unknown,
-      { contentType = "application/octet-stream", signal, onProgress }: UploadOptions = {},
+      {
+        contentType = "application/octet-stream",
+        signal,
+        onProgress,
+        objectLockMode,
+        objectLockRetainUntilDate,
+        objectLockLegalHoldStatus,
+      }: UploadOptions = {},
     ): Promise<void> {
+      const mode = objectLockMode || (objectLock?.enabled ? objectLock.mode : undefined);
+      const retainDate =
+        objectLockRetainUntilDate ||
+        (objectLock?.enabled && objectLock.retentionDays
+          ? new Date(Date.now() + objectLock.retentionDays * 86_400_000)
+          : undefined);
+      const legalHold =
+        objectLockLegalHoldStatus ||
+        (objectLock?.enabled && objectLock.legalHold ? "ON" : undefined);
+
+      const params: PutObjectCommandInput = {
+        Bucket: bucket,
+        Key: key,
+        Body: body as PutObjectCommandInput["Body"],
+        ContentType: contentType,
+        ...(mode ? { ObjectLockMode: mode } : {}),
+        ...(retainDate ? { ObjectLockRetainUntilDate: retainDate } : {}),
+        ...(legalHold ? { ObjectLockLegalHoldStatus: legalHold } : {}),
+      };
+
       const upload = new Upload({
         client,
-        params: {
-          Bucket: bucket,
-          Key: key,
-          Body: body as PutObjectCommandInput["Body"],
-          ContentType: contentType,
-        },
+        params,
         partSize,
         queueSize: concurrency,
         leavePartsOnError: false,
@@ -276,12 +299,22 @@ export function createStorage(options: StorageOptions): StorageClient {
     },
 
     async putJson(key: string, value: unknown): Promise<void> {
+      const mode = objectLock?.enabled ? objectLock.mode : undefined;
+      const retainDate =
+        objectLock?.enabled && objectLock.retentionDays
+          ? new Date(Date.now() + objectLock.retentionDays * 86_400_000)
+          : undefined;
+      const legalHold = objectLock?.legalHold ? "ON" : undefined;
+
       await client.send(
         new PutObjectCommand({
           Bucket: bucket,
           Key: key,
           Body: JSON.stringify(value, null, 2),
           ContentType: "application/json",
+          ...(mode ? { ObjectLockMode: mode } : {}),
+          ...(retainDate ? { ObjectLockRetainUntilDate: retainDate } : {}),
+          ...(legalHold ? { ObjectLockLegalHoldStatus: legalHold } : {}),
         }),
       );
     },

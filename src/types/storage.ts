@@ -1,6 +1,13 @@
 import type { Readable } from "node:stream";
 export type StorageType = "s3" | "filesystem";
 
+export interface ObjectLockOptions {
+  enabled?: boolean;
+  mode?: "GOVERNANCE" | "COMPLIANCE";
+  retentionDays?: number;
+  legalHold?: boolean;
+}
+
 export interface StorageOptions {
   type?: StorageType;
   path?: string;
@@ -12,12 +19,16 @@ export interface StorageOptions {
   forcePathStyle?: boolean;
   partSizeMb?: number;
   queueSize?: number;
+  objectLock?: ObjectLockOptions;
 }
 
 export interface UploadOptions {
   contentType?: string;
   signal?: AbortSignal;
   onProgress?: (progress: { loaded?: number; total?: number }) => void;
+  objectLockMode?: "GOVERNANCE" | "COMPLIANCE";
+  objectLockRetainUntilDate?: Date;
+  objectLockLegalHoldStatus?: "ON" | "OFF";
 }
 
 export interface StorageHeadResult {

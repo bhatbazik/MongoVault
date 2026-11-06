@@ -64,6 +64,22 @@ const schema = z
     S3_QUEUE_SIZE: z.coerce.number().int().min(1).max(16).default(2),
     R2_ACCOUNT_ID: z.string().optional(),
 
+    S3_OBJECT_LOCK_ENABLED: flag(false),
+    S3_OBJECT_LOCK_MODE: z.enum(["GOVERNANCE", "COMPLIANCE"]).default("GOVERNANCE"),
+    S3_OBJECT_LOCK_RETENTION_DAYS: z.coerce.number().int().positive().default(30),
+    S3_OBJECT_LOCK_LEGAL_HOLD: flag(false),
+
+    BACKUP_ENGINE: z.enum(["logical", "physical", "snapshot"]).default("logical"),
+    PHYSICAL_DB_PATH: z.string().optional(),
+
+    SNAPSHOT_PROVIDER: z.enum(["aws-ebs", "gcp-pd", "azure-disk", "custom"]).default("aws-ebs"),
+    SNAPSHOT_VOLUME_ID: z.string().optional(),
+    SNAPSHOT_REGION: z.string().optional(),
+    SNAPSHOT_COMMAND_HOOK: z.string().optional(),
+
+    SHARDING_ENABLED: flag(false),
+    SHARDING_CONFIGSVR_URI: z.string().optional(),
+
     BACKUP_CRON: cronExpression.default("0 2 * * *"),
     BACKUP_TIMEZONE: timezone.default("UTC"),
     BACKUP_TIMEOUT_MINUTES: z.coerce.number().positive().default(180),
@@ -237,6 +253,7 @@ function toConfig(env: z.infer<typeof schema>): AppConfig {
   }
 
   return {
+    engine: env.BACKUP_ENGINE,
     mongo: {
       uri: env.MONGODB_URI,
       database: env.MONGODB_DATABASE,
@@ -263,6 +280,14 @@ function toConfig(env: z.infer<typeof schema>): AppConfig {
       prefix: env.S3_PREFIX.replace(/^\/+|\/+$/g, ""),
       partSizeMb: env.S3_PART_SIZE_MB,
       queueSize: env.S3_QUEUE_SIZE,
+      objectLock: env.S3_OBJECT_LOCK_ENABLED
+        ? {
+            enabled: true,
+            mode: env.S3_OBJECT_LOCK_MODE,
+            retentionDays: env.S3_OBJECT_LOCK_RETENTION_DAYS,
+            legalHold: env.S3_OBJECT_LOCK_LEGAL_HOLD,
+          }
+        : undefined,
     },
     schedule: {
       cron: env.BACKUP_CRON,
@@ -279,6 +304,21 @@ function toConfig(env: z.infer<typeof schema>): AppConfig {
     retention: retentionEnabled ? retention : null,
     drill: env.DRILL_MONGODB_URI
       ? { uri: env.DRILL_MONGODB_URI, cron: env.DRILL_CRON ?? null }
+      : null,
+    physical: env.PHYSICAL_DB_PATH ? { dbPath: env.PHYSICAL_DB_PATH } : null,
+    snapshot: env.SNAPSHOT_VOLUME_ID
+      ? {
+          provider: env.SNAPSHOT_PROVIDER,
+          volumeId: env.SNAPSHOT_VOLUME_ID,
+          region: env.SNAPSHOT_REGION,
+          commandHook: env.SNAPSHOT_COMMAND_HOOK,
+        }
+      : null,
+    sharding: env.SHARDING_ENABLED
+      ? {
+          enabled: true,
+          configsvrUri: env.SHARDING_CONFIGSVR_URI,
+        }
       : null,
     notifications: {
       onSuccess: env.NOTIFY_ON_SUCCESS,

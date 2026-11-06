@@ -39,6 +39,10 @@ A streaming MongoDB backup daemon and CLI tool with S3/Cloudflare R2 multipart u
 ### Highlights
 
 - **Zero-disk streaming pipeline (Backup & Restore):** Streams `mongodump` archive output directly into S3 multipart uploads and streams downloads directly into `mongorestore` stdin through in-flight hashing and encryption transforms. A 100 GB database requires 0 bytes of temporary disk space during both backup and restore.
+- **Physical Hot Backup Engine ($backupCursor / WiredTiger Hot Copy):** Streams raw WiredTiger storage files directly into encrypted S3 archives without BSON serialization overhead or index recreation, restoring multi-terabyte databases in minutes rather than hours.
+- **Cloud Volume Snapshot Driver (AWS EBS / GCP PD / Azure Disks):** Orchestrates instantaneous block storage volume snapshots by acquiring MongoDB write freeze (`fsyncLock`), invoking cloud snapshot APIs, and releasing writes immediately.
+- **S3 Object Lock & WORM Compliance:** Protects backups against ransomware attacks or compromised admin credentials using S3 Compliance or Governance Object Lock and legal holds.
+- **Multi-Shard Cluster Coordination:** Synchronizes distributed backups across mongos routers, config servers, and all shard replica sets with global cluster-time alignment and automated balancer management.
 - **Chunked AEAD Envelope Encryption (`aes-256-gcm-chunked`):** Archives are encrypted in 64 KB frames, each with an independent nonce and 128-bit authentication tag. Tampering, corruption, or stream truncation is detected immediately at the corrupted frame, aborting before corrupt data reaches the restore target. Backward-compatible with legacy single-block AES-GCM.
 - **Cluster-Wide & Multi-Database Backups:** Back up entire clusters (`MONGODB_DATABASE=*`) or individual databases. Collections are automatically namespaced (`database.collection`) to avoid collisions.
 - **Distributed S3 & Atomic Local Locking:** Hybrid lease locking coordinates multiple daemon instances across Kubernetes pods or Docker containers via S3 object leases with automatic heartbeat renewal, while atomic POSIX rename prevents local TOCTOU race conditions.
@@ -106,6 +110,18 @@ node src/index.js check
 
 # Run manual backup (prioritizing secondary replica set nodes)
 node src/index.js backup
+
+# Run physical hot backup using WiredTiger $backupCursor
+node src/index.js backup --engine physical --db-path /var/lib/mongodb
+
+# Restore physical hot backup directly into target WiredTiger directory
+node src/index.js restore --key <key> --db-path /var/lib/mongodb
+
+# Run cloud volume snapshot under fsyncLock
+node src/index.js backup --engine snapshot --volume-id vol-0123456789abcdef0
+
+# Run synchronized multi-shard cluster backup across all shards and configsvr
+node src/index.js backup --sharding
 
 # Run manual backup with point-in-time oplog capture
 node src/index.js backup --oplog

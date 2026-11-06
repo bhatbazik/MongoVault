@@ -61,4 +61,16 @@ export interface SystemStatus {
   pitr: PitrStatus;
   operation: OperationLockStatus;
   recentBackups: BackupSummary[];
+  engine?: "logical" | "physical" | "snapshot";
+  objectLock?: {
+    enabled: boolean;
+    mode?: string;
+    retentionDays?: number;
+  };
+  sharding?: {
+    isSharded: boolean;
+    shardsCount?: number;
+    shards?: string[];
+    balancerEnabled?: boolean;
+  };
 }

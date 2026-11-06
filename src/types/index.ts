@@ -15,3 +15,6 @@ export * from "./backup.js";
 export * from "./restore.js";
 export * from "./drill.js";
 export * from "./scheduler.js";
+export * from "./physical.js";
+export * from "./snapshot.js";
+export * from "./sharding.js";

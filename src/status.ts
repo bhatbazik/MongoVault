@@ -229,6 +229,20 @@ export async function getStatus({
     pitr,
     operation,
     recentBackups,
+    engine: config.engine || "logical",
+    objectLock: config.storage.objectLock
+      ? {
+          enabled: Boolean(config.storage.objectLock.enabled),
+          mode: config.storage.objectLock.mode,
+          retentionDays: config.storage.objectLock.retentionDays,
+        }
+      : undefined,
+    sharding: config.sharding
+      ? {
+          isSharded: cluster.role === "mongos",
+          shardsCount: cluster.hosts?.length,
+        }
+      : undefined,
   };
 }
 
@@ -317,6 +331,24 @@ export function formatStatus(status: SystemStatus): string {
     }
   } else {
     lines.push("  Status:          Idle (no active backup/restore operation)");
+  }
+  lines.push("");
+
+  // Engine & Security Section
+  lines.push("Engine & Compliance:");
+  lines.push("====================");
+  lines.push(`  Backup Engine:   ${(status.engine || "logical").toUpperCase()}`);
+  if (status.objectLock?.enabled) {
+    lines.push(
+      `  S3 Object Lock:  ACTIVE (WORM ${status.objectLock.mode}, ${status.objectLock.retentionDays} days retention)`,
+    );
+  } else {
+    lines.push("  S3 Object Lock:  Disabled");
+  }
+  if (status.sharding) {
+    lines.push(
+      `  Sharded Cluster: ${status.sharding.isSharded ? "Active (Multi-Shard Coordinated)" : "Inactive"}`,
+    );
   }
 
   // Recent Backups Table

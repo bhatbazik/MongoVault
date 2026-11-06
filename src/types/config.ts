@@ -1,4 +1,6 @@
 import type { LogLevel } from "./logger.js";
+import type { ObjectLockOptions } from "./storage.js";
+import type { BackupEngine } from "./catalog.js";
 
 export type MongoReadPreference =
   "primary" | "primaryPreferred" | "secondary" | "secondaryPreferred" | "nearest";
@@ -30,6 +32,7 @@ export interface StorageConfig {
   prefix: string;
   partSizeMb: number;
   queueSize: number;
+  objectLock?: ObjectLockOptions;
 }
 
 export interface ScheduleConfig {
@@ -48,6 +51,22 @@ export interface RetentionPolicy {
 export interface DrillConfig {
   uri: string;
   cron: string | null;
+}
+
+export interface PhysicalConfig {
+  dbPath?: string;
+}
+
+export interface CloudSnapshotConfig {
+  provider: "aws-ebs" | "gcp-pd" | "azure-disk" | "custom";
+  volumeId?: string;
+  region?: string;
+  commandHook?: string;
+}
+
+export interface ShardingConfig {
+  enabled: boolean;
+  configsvrUri?: string;
 }
 
 export interface SmtpConfig {
@@ -74,6 +93,7 @@ export interface HttpConfig {
 }
 
 export interface AppConfig {
+  engine?: BackupEngine;
   mongo: MongoConfig;
   pitr: PitrConfig;
   storage: StorageConfig;
@@ -84,6 +104,9 @@ export interface AppConfig {
   encryptionKeyRing: Buffer[];
   retention: RetentionPolicy | null;
   drill: DrillConfig | null;
+  physical?: PhysicalConfig | null;
+  snapshot?: CloudSnapshotConfig | null;
+  sharding?: ShardingConfig | null;
   notifications: NotificationsConfig;
   http: HttpConfig;
   logLevel: LogLevel;

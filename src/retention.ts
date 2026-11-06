@@ -23,6 +23,18 @@ const PERIODS: Record<string, (parts: DateParts) => string> = {
   keepMonthly: ({ year, month }) => `${year}-${month}`,
 };
 
+function isObjectLockError(error: unknown): boolean {
+  const err = error as { name?: string; message?: string; Code?: string };
+  const str = `${err?.name || ""} ${err?.message || ""} ${err?.Code || ""}`.toLowerCase();
+  return (
+    str.includes("object lock") ||
+    str.includes("worm") ||
+    str.includes("legal hold") ||
+    str.includes("retention period") ||
+    str.includes("immutable")
+  );
+}
+
 export function planRetention(
   backups: BackupSummary[],
   policy: RetentionPolicy,
@@ -97,11 +109,22 @@ export async function prune(
       logger.debug({ key: backup.key }, "Marked backup for deletion");
     }
 
-    if (typeof storage.removeMany === "function") {
-      await storage.removeMany(keysToDelete);
-    } else {
-      for (const key of keysToDelete) {
-        await storage.remove(key);
+    try {
+      if (typeof storage.removeMany === "function") {
+        await storage.removeMany(keysToDelete);
+      } else {
+        for (const key of keysToDelete) {
+          await storage.remove(key);
+        }
+      }
+    } catch (err) {
+      if (isObjectLockError(err)) {
+        logger.warn(
+          { err },
+          "Some retention targets could not be deleted because they are protected under S3 WORM Object Lock",
+        );
+      } else {
+        throw err;
       }
     }
   }
@@ -124,7 +147,7 @@ export async function deleteBackup(
     }
   }
 
-  // Active PITR base safety check (mirroring Percona's ErrBaseForPITR)
+  // Active PITR base safety check (ErrBaseForPITR)
   if (!force) {
     const slices = (await listOplogSlices(storage, scope)).filter((s) => s.complete);
     if (slices.length > 0) {
@@ -139,12 +162,22 @@ export async function deleteBackup(
 
   if (!dryRun) {
     const keysToDelete = [manifestKey(resolvedKey), resolvedKey];
-    if (typeof storage.removeMany === "function") {
-      await storage.removeMany(keysToDelete);
-    } else {
-      for (const k of keysToDelete) {
-        await storage.remove(k);
+    try {
+      if (typeof storage.removeMany === "function") {
+        await storage.removeMany(keysToDelete);
+      } else {
+        for (const k of keysToDelete) {
+          await storage.remove(k);
+        }
       }
+    } catch (err) {
+      if (isObjectLockError(err)) {
+        throw new Error(
+          `Cannot delete backup "${resolvedKey}": It is protected by active S3 WORM Compliance Object Lock and cannot be deleted until retention expires.`,
+          { cause: err },
+        );
+      }
+      throw err;
     }
   }
 
