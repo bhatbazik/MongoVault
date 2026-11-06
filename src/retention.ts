@@ -14,6 +14,7 @@ import type {
   RetentionPlan,
   RetentionTarget,
 } from "./types/retention.js";
+import type { StorageClient } from "./types/storage.js";
 
 const ORPHAN_AGE_MS = 60 * 60 * 1000;
 
@@ -33,6 +34,17 @@ function isObjectLockError(error: unknown): boolean {
     str.includes("retention period") ||
     str.includes("immutable")
   );
+}
+
+async function deleteKeysFromStorage(storage: StorageClient, keys: string[]): Promise<void> {
+  if (keys.length === 0) return;
+  if (typeof storage.removeMany === "function") {
+    await storage.removeMany(keys);
+  } else {
+    for (const key of keys) {
+      await storage.remove(key);
+    }
+  }
 }
 
 export function planRetention(
@@ -110,13 +122,7 @@ export async function prune(
     }
 
     try {
-      if (typeof storage.removeMany === "function") {
-        await storage.removeMany(keysToDelete);
-      } else {
-        for (const key of keysToDelete) {
-          await storage.remove(key);
-        }
-      }
+      await deleteKeysFromStorage(storage, keysToDelete);
     } catch (err) {
       if (isObjectLockError(err)) {
         logger.warn(
@@ -163,13 +169,7 @@ export async function deleteBackup(
   if (!dryRun) {
     const keysToDelete = [manifestKey(resolvedKey), resolvedKey];
     try {
-      if (typeof storage.removeMany === "function") {
-        await storage.removeMany(keysToDelete);
-      } else {
-        for (const k of keysToDelete) {
-          await storage.remove(k);
-        }
-      }
+      await deleteKeysFromStorage(storage, keysToDelete);
     } catch (err) {
       if (isObjectLockError(err)) {
         throw new Error(
@@ -204,13 +204,7 @@ export async function pruneOplogSlices(
   }
 
   if (!dryRun && keysToDelete.length > 0) {
-    if (typeof storage.removeMany === "function") {
-      await storage.removeMany(keysToDelete);
-    } else {
-      for (const k of keysToDelete) {
-        await storage.remove(k);
-      }
-    }
+    await deleteKeysFromStorage(storage, keysToDelete);
   }
 
   logger.info(

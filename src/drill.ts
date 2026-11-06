@@ -1,6 +1,7 @@
 import { type Db, MongoClient } from "mongodb";
 import { isClusterScope, readManifest, resolveBackup, scopeOf } from "./catalog.js";
 import { restoreBackup } from "./restore.js";
+import type { BackupManifest } from "./types/catalog.js";
 import type { DrillContext, DrillMismatch, DrillResult, DrillVariance } from "./types/drill.js";
 
 export class DrillError extends Error {
@@ -15,6 +16,46 @@ export class DrillError extends Error {
     this.name = "DrillError";
     this.mismatches = mismatches;
   }
+}
+
+interface CollectionCountReader {
+  hasCollection(colKey: string): boolean | null;
+  countDocuments(colKey: string): Promise<number | null>;
+}
+
+async function verifyCollections(
+  manifest: BackupManifest,
+  reader: CollectionCountReader,
+  hasOplog: boolean,
+): Promise<{ mismatches: DrillMismatch[]; variances: DrillVariance[] }> {
+  const mismatches: DrillMismatch[] = [];
+  const variances: DrillVariance[] = [];
+
+  for (const [colKey, expected] of Object.entries(manifest.collections || {})) {
+    const exists = reader.hasCollection(colKey);
+    if (exists === false) {
+      if (expected > 0) {
+        mismatches.push({ collection: colKey, expected, actual: "missing" });
+      }
+      continue;
+    }
+
+    const actual = await reader.countDocuments(colKey);
+
+    if (actual === null) {
+      if (expected > 0) {
+        mismatches.push({ collection: colKey, expected, actual: "missing" });
+      }
+    } else if (actual !== expected) {
+      if (hasOplog && actual > 0) {
+        variances.push({ collection: colKey, expected, actual, diff: actual - expected });
+      } else {
+        mismatches.push({ collection: colKey, expected, actual });
+      }
+    }
+  }
+
+  return { mismatches, variances };
 }
 
 export async function runDrill(ctx: DrillContext): Promise<DrillResult> {
@@ -67,36 +108,21 @@ export async function runDrill(ctx: DrillContext): Promise<DrillResult> {
       const db = client.db(database);
       const existingCollections = await getExistingCollectionNames(db);
       const hasOplog = Boolean(manifest.oplog);
-      const mismatches: DrillMismatch[] = [];
-      const variances: DrillVariance[] = [];
 
-      for (const [colKey, expected] of Object.entries(manifest.collections || {})) {
-        if (existingCollections && !existingCollections.has(colKey)) {
-          if (expected > 0) {
-            mismatches.push({ collection: colKey, expected, actual: "missing" });
+      const reader: CollectionCountReader = {
+        hasCollection(colKey: string) {
+          return existingCollections ? existingCollections.has(colKey) : null;
+        },
+        async countDocuments(colKey: string) {
+          try {
+            return await db.collection(colKey).countDocuments();
+          } catch {
+            return null;
           }
-          continue;
-        }
+        },
+      };
 
-        let actual: number | null;
-        try {
-          actual = await db.collection(colKey).countDocuments();
-        } catch {
-          actual = null;
-        }
-
-        if (actual === null) {
-          if (expected > 0) {
-            mismatches.push({ collection: colKey, expected, actual: "missing" });
-          }
-        } else if (actual !== expected) {
-          if (hasOplog && actual > 0) {
-            variances.push({ collection: colKey, expected, actual, diff: actual - expected });
-          } else {
-            mismatches.push({ collection: colKey, expected, actual });
-          }
-        }
-      }
+      const { mismatches, variances } = await verifyCollections(manifest, reader, hasOplog);
 
       if (mismatches.length > 0) {
         throw new DrillError(key, mismatches);
@@ -121,7 +147,6 @@ export async function runDrill(ctx: DrillContext): Promise<DrillResult> {
       return result;
     } else {
       // Cluster-wide restore drill
-      // Identify all databases present in the manifest collections
       for (const colKey of Object.keys(manifest.collections || {})) {
         const firstDot = colKey.indexOf(".");
         if (firstDot > 0) {
@@ -143,42 +168,30 @@ export async function runDrill(ctx: DrillContext): Promise<DrillResult> {
       }
 
       const hasOplog = Boolean(manifest.oplog);
-      const mismatches: DrillMismatch[] = [];
-      const variances: DrillVariance[] = [];
 
-      for (const [colKey, expected] of Object.entries(manifest.collections || {})) {
-        const firstDot = colKey.indexOf(".");
-        if (firstDot <= 0) continue;
-        const dbName = colKey.substring(0, firstDot);
-        const colName = colKey.substring(firstDot + 1);
-
-        const existingCollections = existingByDb.get(dbName);
-        if (existingCollections && !existingCollections.has(colName)) {
-          if (expected > 0) {
-            mismatches.push({ collection: colKey, expected, actual: "missing" });
+      const reader: CollectionCountReader = {
+        hasCollection(colKey: string) {
+          const firstDot = colKey.indexOf(".");
+          if (firstDot <= 0) return null;
+          const dbName = colKey.substring(0, firstDot);
+          const colName = colKey.substring(firstDot + 1);
+          const existing = existingByDb.get(dbName);
+          return existing ? existing.has(colName) : null;
+        },
+        async countDocuments(colKey: string) {
+          const firstDot = colKey.indexOf(".");
+          if (firstDot <= 0) return null;
+          const dbName = colKey.substring(0, firstDot);
+          const colName = colKey.substring(firstDot + 1);
+          try {
+            return await client.db(dbName).collection(colName).countDocuments();
+          } catch {
+            return null;
           }
-          continue;
-        }
+        },
+      };
 
-        let actual: number | null;
-        try {
-          actual = await client.db(dbName).collection(colName).countDocuments();
-        } catch {
-          actual = null;
-        }
-
-        if (actual === null) {
-          if (expected > 0) {
-            mismatches.push({ collection: colKey, expected, actual: "missing" });
-          }
-        } else if (actual !== expected) {
-          if (hasOplog && actual > 0) {
-            variances.push({ collection: colKey, expected, actual, diff: actual - expected });
-          } else {
-            mismatches.push({ collection: colKey, expected, actual });
-          }
-        }
-      }
+      const { mismatches, variances } = await verifyCollections(manifest, reader, hasOplog);
 
       if (mismatches.length > 0) {
         throw new DrillError(key, mismatches);

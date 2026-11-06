@@ -11,6 +11,7 @@ import type {
   ShardedClusterShardBackup,
 } from "./types/catalog.js";
 import type { AppConfig } from "./types/config.js";
+import type { Logger } from "./types/logger.js";
 import type {
   ClusterTopology,
   ShardInfo,
@@ -19,6 +20,44 @@ import type {
   ShardedRestoreOptions,
   ShardedRestoreResult,
 } from "./types/sharding.js";
+
+/**
+ * Controller for coordinating MongoDB sharded cluster balancer states.
+ */
+export class BalancerController {
+  constructor(
+    private readonly client: MongoClient,
+    private readonly logger?: Logger,
+  ) {}
+
+  async stopAndDrain(timeoutMs = 30_000): Promise<boolean> {
+    try {
+      this.logger?.info("Stopping balancer and waiting for active chunk migrations to complete...");
+      await this.client.db("admin").command({ balancerStop: 1 });
+      const bStatus = await waitForBalancerDisabled(this.client, timeoutMs);
+      if (bStatus.inBalancerRound) {
+        this.logger?.warn(
+          "Active balancer round did not conclude within 30s; proceeding with backup",
+        );
+      } else {
+        this.logger?.info("Cluster balancer disabled and quiet");
+      }
+      return true;
+    } catch (err) {
+      this.logger?.warn({ err }, "Could not stop balancer; proceeding with cluster backup");
+      return false;
+    }
+  }
+
+  async start(): Promise<void> {
+    try {
+      await this.client.db("admin").command({ balancerStart: 1 });
+      this.logger?.info("Cluster balancer restarted");
+    } catch (err) {
+      this.logger?.warn({ err }, "Could not restart cluster balancer automatically");
+    }
+  }
+}
 
 /**
  * Waits for MongoDB balancer to be fully disabled with no active balancing round in flight.
@@ -111,6 +150,7 @@ export async function runShardedClusterBackup({
 
   log.info("Inspecting sharded cluster topology...");
   const client = new MongoClient(config.mongo.uri);
+  const balancer = new BalancerController(client, log);
   let balancerStopped = false;
   let topology: ClusterTopology | null = null;
 
@@ -134,19 +174,7 @@ export async function runShardedClusterBackup({
 
     // 1. Quiesce cluster chunk balancing to prevent migrations during snapshot
     if (topology.balancerEnabled) {
-      try {
-        log.info("Stopping balancer and waiting for active chunk migrations to complete...");
-        await client.db("admin").command({ balancerStop: 1 });
-        balancerStopped = true;
-        const bStatus = await waitForBalancerDisabled(client, 30_000);
-        if (bStatus.inBalancerRound) {
-          log.warn("Active balancer round did not conclude within 30s; proceeding with backup");
-        } else {
-          log.info("Cluster balancer disabled and quiet");
-        }
-      } catch (err) {
-        log.warn({ err }, "Could not stop balancer; proceeding with cluster backup");
-      }
+      balancerStopped = await balancer.stopAndDrain(30_000);
     }
 
     // 2. Capture cluster-wide committed timestamp
@@ -229,13 +257,8 @@ export async function runShardedClusterBackup({
 
     // 5. Restart cluster balancer if it was originally enabled
     if (balancerStopped && topology?.balancerEnabled) {
-      try {
-        await client.db("admin").command({ balancerStart: 1 });
-        balancerStopped = false;
-        log.info("Cluster balancer restarted");
-      } catch (err) {
-        log.warn({ err }, "Could not restart cluster balancer automatically");
-      }
+      await balancer.start();
+      balancerStopped = false;
     }
 
     const completedAt = new Date();
@@ -288,10 +311,7 @@ export async function runShardedClusterBackup({
     return { manifest: clusterManifest, clusterMeta, durationMs };
   } finally {
     if (balancerStopped && topology?.balancerEnabled) {
-      await client
-        .db("admin")
-        .command({ balancerStart: 1 })
-        .catch(() => {});
+      await balancer.start();
     }
     await client.close().catch(() => {});
     controller.dispose();
@@ -319,6 +339,8 @@ export async function restoreShardedCluster({
   }
 
   const client = new MongoClient(config.mongo.uri);
+  const balancer = new BalancerController(client, log);
+
   try {
     await client.connect();
 
@@ -364,9 +386,7 @@ export async function restoreShardedCluster({
     }
 
     // 4. Restart balancer
-    try {
-      await client.db("admin").command({ balancerStart: 1 });
-    } catch {}
+    await balancer.start();
 
     log.info(
       {

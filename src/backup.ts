@@ -1,15 +1,18 @@
 import { PassThrough } from "node:stream";
-import { pipeline } from "node:stream/promises";
 import { linkedController, settleAll } from "./abort.js";
-import { MANIFEST_VERSION, archiveKey, manifestKey, scopeOf } from "./catalog.js";
-import { createEncryptor, signManifest } from "./crypto.js";
+import { MANIFEST_VERSION, archiveKey, scopeOf, writeManifest } from "./catalog.js";
+import { createEncryptor } from "./crypto.js";
 import { DigestStream } from "./digest.js";
 import { formatOplogTimestamp, getOplogBounds } from "./oplog.js";
+import { runStreamPipeline } from "./stream.js";
 import { mongodump } from "./tools.js";
 import type { BackupContext } from "./types/backup.js";
 import type { BackupManifest } from "./types/catalog.js";
 import type { BackupTools } from "./types/tools.js";
 
+/**
+ * Runs a logical mongodump backup with optional encryption and streaming upload.
+ */
 export async function runBackup({
   config,
   storage,
@@ -49,8 +52,7 @@ export async function runBackup({
       encrypted && config.encryptionKey ? createEncryptor(config.encryptionKey) : null;
     const digest = new DigestStream();
     const body = new PassThrough({ highWaterMark: 1024 * 1024 });
-    const stages = [dump.stdout, encryptor?.stream, digest, body].filter(Boolean);
-    const runPipeline = pipeline as unknown as (...args: unknown[]) => Promise<void>;
+    const stages = [dump.stdout, encryptor?.stream, digest, body];
 
     // Query oplog boundary immediately when mongodump finishes collection dumping,
     // rather than waiting for S3 upload to complete, preventing a timeline gap.
@@ -69,7 +71,7 @@ export async function runBackup({
         signal: controller.signal,
         onProgress: ({ loaded }) => log.debug({ uploadedBytes: loaded }, "Upload progress"),
       }),
-      runPipeline(...stages, { signal: controller.signal }),
+      runStreamPipeline(stages, { signal: controller.signal }),
     ]);
 
     if (Object.keys(collections).length === 0) {
@@ -113,10 +115,8 @@ export async function runBackup({
       ...(oplogWindow ? { oplogWindow } : {}),
       collections,
     };
-    if (manifest.encryption && config.encryptionKey) {
-      manifest.encryption.manifestHmac = signManifest(config.encryptionKey, manifest);
-    }
-    await storage.putJson(manifestKey(key), manifest);
+
+    await writeManifest(storage, manifest, config.encryptionKey);
 
     log.info(
       {

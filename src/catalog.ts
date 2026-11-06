@@ -1,3 +1,4 @@
+import { signManifest } from "./crypto.js";
 import type {
   ArchiveKeyOptions,
   BackupManifest,
@@ -98,4 +99,28 @@ export async function readManifest(
   return result && typeof result === "object" && "data" in result
     ? (result.data as unknown as BackupManifest)
     : (result as unknown as BackupManifest);
+}
+
+/**
+ * Signs manifest if encryptionKey is provided and uploads it to storage (DRY).
+ */
+export async function writeManifest(
+  storage: StorageClient,
+  manifest: BackupManifest,
+  encryptionKey?: Buffer | null,
+): Promise<void> {
+  if (manifest.encryption && encryptionKey) {
+    manifest.encryption.manifestHmac = signManifest(encryptionKey, manifest);
+  }
+  await storage.putJson(manifestKey(manifest.key), manifest);
+}
+
+/**
+ * Resolves the active key ring from config (DRY).
+ */
+export function resolveKeyRing(config: {
+  encryptionKeyRing?: Buffer[];
+  encryptionKey?: Buffer | null;
+}): Buffer[] {
+  return config.encryptionKeyRing || (config.encryptionKey ? [config.encryptionKey] : []);
 }

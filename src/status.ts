@@ -3,7 +3,8 @@ import { MongoClient } from "mongodb";
 import { listBackups, readManifest, scopeOf } from "./catalog.js";
 import { formatBytes, formatDate } from "./format.js";
 import { readLock } from "./lock.js";
-import { formatOplogTimestamp, getOplogBounds, listOplogSlices } from "./oplog.js";
+import { inspectMongoCluster } from "./mongo.js";
+import { formatOplogTimestamp, listOplogSlices } from "./oplog.js";
 import type { AppConfig } from "./types/config.js";
 import type { Logger } from "./types/logger.js";
 import type {
@@ -34,51 +35,10 @@ export async function getStatus({
   const client = createMongoClient(config.mongo.uri);
   try {
     await client.connect();
-    const admin = client.db("admin");
-    const [hello, buildInfo] = await Promise.all([
-      admin.command({ hello: 1 }).catch(() => admin.command({ isMaster: 1 })),
-      admin.command({ buildInfo: 1 }).catch(() => ({ version: "unknown" })),
-    ]);
-
-    let role: ClusterStatus["role"] = "standalone";
-    if (hello.msg === "isdbgrid") {
-      role = "mongos";
-    } else if (hello.setName) {
-      if (hello.isWritablePrimary) role = "primary";
-      else if (hello.secondary) role = "secondary";
-      else if (hello.arbiterOnly) role = "arbiter";
-      else role = "unknown";
-    }
-
-    let oplogInfo: ClusterStatus["oplog"] = undefined;
-    if (hello.setName) {
-      try {
-        const bounds = await getOplogBounds(config.mongo.uri, { createMongoClient });
-        if (bounds.oldestTs && bounds.newestTs) {
-          const hours = Number(((bounds.newestTs.t - bounds.oldestTs.t) / 3600).toFixed(1));
-          oplogInfo = {
-            available: true,
-            oldestTs: formatOplogTimestamp(bounds.oldestTs),
-            newestTs: formatOplogTimestamp(bounds.newestTs),
-            retentionHours: Math.max(0, hours),
-          };
-        }
-      } catch {
-        oplogInfo = { available: false };
-      }
-    }
-
-    cluster = {
-      connected: true,
-      version: String(buildInfo.version || "unknown"),
-      setName: hello.setName ? String(hello.setName) : undefined,
-      role,
-      primaryHost: hello.primary ? String(hello.primary) : undefined,
-      me: hello.me ? String(hello.me) : undefined,
-      hosts: Array.isArray(hello.hosts) ? hello.hosts.map(String) : undefined,
+    cluster = await inspectMongoCluster(client, config.mongo.uri, {
       readPreference: config.mongo.readPreference || "secondaryPreferred",
-      oplog: oplogInfo,
-    };
+      createMongoClient,
+    });
   } catch (error) {
     cluster = {
       connected: false,

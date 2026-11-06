@@ -2,6 +2,7 @@ import os from "node:os";
 import { MongoClient } from "mongodb";
 import { listBackups, readManifest, scopeOf } from "./catalog.js";
 import { readLock } from "./lock.js";
+import { maskMongoUri } from "./mongo.js";
 import { checkDatabaseTools } from "./tools.js";
 import type { AppConfig } from "./types/config.js";
 import type { StorageClient } from "./types/storage.js";
@@ -50,14 +51,6 @@ export interface DiagnosticBundle {
   };
 }
 
-function maskUri(uri: string): string {
-  try {
-    return uri.replace(/\/\/[^:]+:[^@]+@/, "//***:***@");
-  } catch {
-    return "masked";
-  }
-}
-
 export async function generateDiagnosticBundle({
   config,
   storage,
@@ -93,7 +86,7 @@ export async function generateDiagnosticBundle({
 
     database = {
       connected: true,
-      maskedUri: maskUri(config.mongo.uri),
+      maskedUri: maskMongoUri(config.mongo.uri),
       targetDatabase: config.mongo.database,
       readPreference: config.mongo.readPreference,
       buildInfo,
@@ -102,7 +95,7 @@ export async function generateDiagnosticBundle({
   } catch (error) {
     database = {
       connected: false,
-      maskedUri: maskUri(config.mongo.uri),
+      maskedUri: maskMongoUri(config.mongo.uri),
       targetDatabase: config.mongo.database,
       error: error instanceof Error ? error.message : String(error),
     };

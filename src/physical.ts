@@ -1,8 +1,6 @@
-import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { PassThrough, Readable } from "node:stream";
-import { pipeline } from "node:stream/promises";
 import { createGunzip, createGzip } from "node:zlib";
 import { MongoClient } from "mongodb";
 import { linkedController, settleAll } from "./abort.js";
@@ -11,6 +9,13 @@ import { createDecryptor, createEncryptor, signManifest, verifyManifest } from "
 import { DigestStream } from "./digest.js";
 import { formatBytes, formatDuration } from "./format.js";
 import { formatOplogTimestamp } from "./oplog.js";
+import { runStreamPipeline } from "./stream.js";
+import {
+  createTarHeader,
+  createTarPackStream,
+  extractTarStream,
+  generateTarStream,
+} from "./tar.js";
 import type { BackupManifest, PhysicalBackupMeta } from "./types/catalog.js";
 import type {
   BackupCursorFile,
@@ -20,6 +25,9 @@ import type {
   PhysicalRestoreOptions,
   PhysicalRestoreResult,
 } from "./types/physical.js";
+
+// Re-export tar utilities for backwards compatibility
+export { createTarHeader, createTarPackStream, generateTarStream, extractTarStream };
 
 const CURSOR_CREATE_RETRIES = 10;
 const OPEN_CONFLICT_WITH_CHECKPOINT_ERR_CODE = 50915;
@@ -52,178 +60,6 @@ export async function createBackupCursorWithRetries(
     }
   }
   throw new Error("Tries limit exceeded establishing $backupCursor");
-}
-
-export function createTarHeader(name: string, size: number, mtime: number = Date.now()): Buffer {
-  const buf = Buffer.alloc(512, 0);
-
-  // name: 0..100
-  const normName = name.replace(/\\/g, "/").slice(0, 100);
-  buf.write(normName, 0, "utf8");
-
-  // mode: 100..108
-  buf.write("0000644\0", 100, "ascii");
-  // uid: 108..116
-  buf.write("0000000\0", 108, "ascii");
-  // gid: 116..124
-  buf.write("0000000\0", 116, "ascii");
-
-  // size: 124..136 (11 octal digits + null)
-  const sizeOctal = size.toString(8).padStart(11, "0") + "\0";
-  buf.write(sizeOctal, 124, "ascii");
-
-  // mtime: 136..148
-  const mtimeOctal =
-    Math.floor(mtime / 1000)
-      .toString(8)
-      .padStart(11, "0") + "\0";
-  buf.write(mtimeOctal, 136, "ascii");
-
-  // typeflag: 156
-  buf.write("0", 156, "ascii");
-
-  // magic: 257..263
-  buf.write("ustar\0", 257, "ascii");
-  buf.write("00", 263, "ascii");
-
-  // Compute checksum over 512 bytes with chksum field treated as 8 spaces (ASCII 32)
-  buf.fill(32, 148, 156);
-  let checksum = 0;
-  for (let i = 0; i < 512; i++) {
-    checksum += buf[i]!;
-  }
-  const chksumOctal = checksum.toString(8).padStart(6, "0") + "\0 ";
-  buf.write(chksumOctal, 148, "ascii");
-
-  return buf;
-}
-
-export function createTarPackStream(
-  files: Array<{ name: string; fullPath: string; size: number }>,
-  signal?: AbortSignal,
-): Readable {
-  return Readable.from(generateTarStream(files, signal));
-}
-
-export async function* generateTarStream(
-  files: Array<{ name: string; fullPath: string; size: number }>,
-  signal?: AbortSignal,
-): AsyncGenerator<Buffer, void, unknown> {
-  for (const file of files) {
-    if (signal?.aborted) return;
-    let stat;
-    try {
-      stat = await fs.stat(file.fullPath);
-    } catch {
-      continue;
-    }
-    const header = createTarHeader(file.name, stat.size, stat.mtimeMs);
-    yield header;
-
-    // Stream file contents in 64KB chunks
-    const stream = fsSync.createReadStream(file.fullPath, { highWaterMark: 64 * 1024 });
-    for await (const chunk of stream) {
-      if (signal?.aborted) {
-        stream.destroy();
-        return;
-      }
-      yield Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    }
-
-    // Pad file data to 512-byte block boundary
-    const remainder = stat.size % 512;
-    if (remainder > 0) {
-      yield Buffer.alloc(512 - remainder, 0);
-    }
-  }
-
-  // End of archive: two 512-byte zero blocks
-  yield Buffer.alloc(1024, 0);
-}
-
-export async function extractTarStream(
-  stream: Readable,
-  targetDir: string,
-  signal?: AbortSignal,
-): Promise<{ extractedCount: number; totalBytes: number }> {
-  await fs.mkdir(targetDir, { recursive: true });
-
-  let buffer = Buffer.alloc(0);
-  let currentHeader: { name: string; size: number } | null = null;
-  let remainingBytes = 0;
-  let remainingPad = 0;
-  let currentFileHandle: fs.FileHandle | null = null;
-  let extractedCount = 0;
-  let totalBytes = 0;
-
-  for await (const chunk of stream) {
-    if (signal?.aborted) break;
-    buffer = Buffer.concat([buffer, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)]);
-
-    while (buffer.length > 0) {
-      if (remainingPad > 0) {
-        const toDiscard = Math.min(buffer.length, remainingPad);
-        buffer = buffer.subarray(toDiscard);
-        remainingPad -= toDiscard;
-        if (remainingPad > 0) break;
-      }
-
-      if (!currentHeader) {
-        if (buffer.length < 512) break; // Need full header
-
-        const headerBuf = buffer.subarray(0, 512);
-        buffer = buffer.subarray(512);
-
-        // Check for 512-byte zero block (end of tar)
-        const isZero = headerBuf.every((b) => b === 0);
-        if (isZero) continue;
-
-        const rawName = headerBuf.toString("utf8", 0, 100).replace(/\0.*$/, "").trim();
-        if (!rawName) continue;
-
-        // Prevent path traversal
-        const safeName = path.normalize(rawName).replace(/^(\.\.[/\\])+/, "");
-        const rawSize = headerBuf.toString("ascii", 124, 136).replace(/\0.*$/, "").trim();
-        const size = parseInt(rawSize, 8) || 0;
-
-        currentHeader = { name: safeName, size };
-        remainingBytes = size;
-
-        const fullPath = path.join(targetDir, safeName);
-        await fs.mkdir(path.dirname(fullPath), { recursive: true });
-        currentFileHandle = await fs.open(fullPath, "w", 0o600);
-      }
-
-      if (currentHeader && currentFileHandle) {
-        if (remainingBytes > 0) {
-          const toWrite = Math.min(buffer.length, remainingBytes);
-          const slice = buffer.subarray(0, toWrite);
-          await currentFileHandle.writeFile(slice);
-          buffer = buffer.subarray(toWrite);
-          remainingBytes -= toWrite;
-          totalBytes += toWrite;
-        }
-
-        if (remainingBytes === 0) {
-          await currentFileHandle.close();
-          currentFileHandle = null;
-          extractedCount++;
-
-          const remainder = currentHeader.size % 512;
-          remainingPad = remainder > 0 ? 512 - remainder : 0;
-          currentHeader = null;
-        } else {
-          break; // Need more data for current file
-        }
-      }
-    }
-  }
-
-  if (currentFileHandle) {
-    await currentFileHandle.close().catch(() => {});
-  }
-
-  return { extractedCount, totalBytes };
 }
 
 export async function probePhysicalCapability(
@@ -456,8 +292,7 @@ export async function runPhysicalBackup({
     const body = new PassThrough({ highWaterMark: 1024 * 1024 });
 
     const tarSource = Readable.from(generateTarStream(filesToArchive, controller.signal));
-    const stages = [tarSource, gzip, encryptor?.stream, digest, body].filter(Boolean);
-    const runPipeline = pipeline as unknown as (...args: unknown[]) => Promise<void>;
+    const stages = [tarSource, gzip, encryptor?.stream, digest, body];
 
     await settleAll(controller, [
       storage.upload(key, body, {
@@ -466,7 +301,7 @@ export async function runPhysicalBackup({
         onProgress: ({ loaded }) =>
           log.debug({ uploadedBytes: loaded }, "Physical upload progress"),
       }),
-      runPipeline(...stages, { signal: controller.signal }),
+      runStreamPipeline(stages, { signal: controller.signal }),
     ]);
 
     // Unlock MongoDB write lock if acquired
@@ -581,10 +416,9 @@ export async function restorePhysicalBackup({
   const unpackPass = new PassThrough();
 
   const stages = [downloadStream, digest, ...decryptStage, gunzip, unpackPass];
-  const runPipeline = pipeline as unknown as (...args: unknown[]) => Promise<void>;
 
   const [_, { extractedCount, totalBytes }] = await Promise.all([
-    runPipeline(...stages, { signal }),
+    runStreamPipeline(stages, { signal }),
     extractTarStream(unpackPass, targetDbPath, signal),
   ]);
 

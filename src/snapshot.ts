@@ -14,74 +14,104 @@ import type {
 } from "./types/snapshot.js";
 
 /**
- * Creates a command-based or cloud provider snapshot driver.
+ * Driver that executes an external shell command hook for creating and restoring volume snapshots.
  */
-export function createSnapshotDriver(options: SnapshotDriverOptions): CloudSnapshotDriver {
-  const { provider, volumeId: defaultVolumeId, commandHook } = options;
+export class CommandHookSnapshotDriver implements CloudSnapshotDriver {
+  constructor(
+    private readonly commandHook: string,
+    private readonly defaultVolumeId?: string,
+  ) {}
 
-  if (commandHook) {
-    return {
-      async createSnapshot({ volumeId, description, tags }) {
-        const effectiveVolume = volumeId || defaultVolumeId || "vol-default";
-        const env = {
-          ...process.env,
-          SNAPSHOT_VOLUME_ID: effectiveVolume,
-          SNAPSHOT_DESCRIPTION: description,
-          SNAPSHOT_TAGS: JSON.stringify(tags || {}),
-        };
-
-        return new Promise((resolve, reject) => {
-          const child = spawn(commandHook, ["create", effectiveVolume], { env });
-          let stdout = "";
-          let stderr = "";
-          child.stdout?.on("data", (chunk: Buffer) => {
-            stdout += chunk.toString();
-          });
-          child.stderr?.on("data", (chunk: Buffer) => {
-            stderr += chunk.toString();
-          });
-
-          child.on("close", (code) => {
-            if (code === 0) {
-              const snapshotId = stdout.trim() || `snap-${Date.now()}`;
-              resolve({ snapshotId, status: "completed" });
-            } else {
-              reject(
-                new Error(`Snapshot command hook failed with code ${code}: ${stderr || stdout}`),
-              );
-            }
-          });
-          child.on("error", reject);
-        });
-      },
-
-      async getSnapshotStatus(_snapshotId) {
-        return { status: "completed", progress: "100%" };
-      },
-
-      async restoreSnapshot({ snapshotId }) {
-        return { newVolumeId: `vol-restored-${snapshotId}` };
-      },
+  async createSnapshot(params: {
+    volumeId?: string;
+    description: string;
+    tags?: Record<string, string>;
+    signal?: AbortSignal;
+  }): Promise<{ snapshotId: string; status: string }> {
+    const effectiveVolume = params.volumeId || this.defaultVolumeId || "vol-default";
+    const env = {
+      ...process.env,
+      SNAPSHOT_VOLUME_ID: effectiveVolume,
+      SNAPSHOT_DESCRIPTION: params.description,
+      SNAPSHOT_TAGS: JSON.stringify(params.tags || {}),
     };
+
+    return new Promise((resolve, reject) => {
+      const child = spawn(this.commandHook, ["create", effectiveVolume], { env });
+      let stdout = "";
+      let stderr = "";
+      child.stdout?.on("data", (chunk: Buffer) => {
+        stdout += chunk.toString();
+      });
+      child.stderr?.on("data", (chunk: Buffer) => {
+        stderr += chunk.toString();
+      });
+
+      child.on("close", (code) => {
+        if (code === 0) {
+          const snapshotId = stdout.trim() || `snap-${Date.now()}`;
+          resolve({ snapshotId, status: "completed" });
+        } else {
+          reject(new Error(`Snapshot command hook failed with code ${code}: ${stderr || stdout}`));
+        }
+      });
+      child.on("error", reject);
+    });
   }
 
-  // Built-in cloud snapshot driver (generates standard cloud provider snapshot records)
-  return {
-    async createSnapshot({ volumeId: _volumeId, description: _description }) {
-      const snapPrefix =
-        provider === "aws-ebs" ? "snap" : provider === "gcp-pd" ? "gcp-snap" : "az-snap";
-      const snapshotId = `${snapPrefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-      return { snapshotId, status: "completed" };
-    },
+  async getSnapshotStatus(_snapshotId: string): Promise<{ status: string; progress?: string }> {
+    return { status: "completed", progress: "100%" };
+  }
 
-    async getSnapshotStatus(_snapshotId) {
-      return { status: "completed", progress: "100%" };
-    },
+  async restoreSnapshot(params: {
+    snapshotId: string;
+    targetZone?: string;
+    signal?: AbortSignal;
+  }): Promise<{ newVolumeId: string }> {
+    return { newVolumeId: `vol-restored-${params.snapshotId}` };
+  }
+}
 
-    async restoreSnapshot({ snapshotId }) {
-      return { newVolumeId: `vol-restored-${snapshotId}` };
-    },
-  };
+/**
+ * Built-in cloud volume snapshot driver for standard cloud provider records.
+ */
+export class BuiltinCloudSnapshotDriver implements CloudSnapshotDriver {
+  constructor(private readonly provider: string) {}
+
+  async createSnapshot(_params: {
+    volumeId?: string;
+    description: string;
+    tags?: Record<string, string>;
+    signal?: AbortSignal;
+  }): Promise<{ snapshotId: string; status: string }> {
+    const snapPrefix =
+      this.provider === "aws-ebs" ? "snap" : this.provider === "gcp-pd" ? "gcp-snap" : "az-snap";
+    const snapshotId = `${snapPrefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    return { snapshotId, status: "completed" };
+  }
+
+  async getSnapshotStatus(_snapshotId: string): Promise<{ status: string; progress?: string }> {
+    return { status: "completed", progress: "100%" };
+  }
+
+  async restoreSnapshot(params: {
+    snapshotId: string;
+    targetZone?: string;
+    signal?: AbortSignal;
+  }): Promise<{ newVolumeId: string }> {
+    return { newVolumeId: `vol-restored-${params.snapshotId}` };
+  }
+}
+
+/**
+ * Creates a command-based or cloud provider snapshot driver (Factory Pattern).
+ */
+export function createSnapshotDriver(options: SnapshotDriverOptions): CloudSnapshotDriver {
+  const { provider, volumeId, commandHook } = options;
+  if (commandHook) {
+    return new CommandHookSnapshotDriver(commandHook, volumeId);
+  }
+  return new BuiltinCloudSnapshotDriver(provider);
 }
 
 /**

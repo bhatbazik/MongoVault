@@ -2,13 +2,13 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { type Transform, Writable } from "node:stream";
-import { pipeline } from "node:stream/promises";
 import { createGunzip } from "node:zlib";
 import { linkedController, settleAll } from "./abort.js";
-import { isClusterScope, readManifest, resolveBackup, scopeOf } from "./catalog.js";
+import { isClusterScope, readManifest, resolveBackup, resolveKeyRing, scopeOf } from "./catalog.js";
 import { createDecryptor, verifyManifest } from "./crypto.js";
 import { DigestStream } from "./digest.js";
 import { downloadAndExtractOplogSlice, formatOplogTimestamp, resolvePitrPlan } from "./oplog.js";
+import { runStreamPipeline } from "./stream.js";
 import { mongorestore, replayOplogFile } from "./tools.js";
 import type { BackupManifest } from "./types/catalog.js";
 import type { AppConfig } from "./types/config.js";
@@ -44,7 +44,7 @@ export async function describeBackup(
   }
   const checksum = manifest?.sha256 ?? object?.metadata?.sha256 ?? null;
 
-  const keyRing = config.encryptionKeyRing || (config.encryptionKey ? [config.encryptionKey] : []);
+  const keyRing = resolveKeyRing(config);
   if (manifest?.encryption) {
     if (keyRing.length === 0) {
       throw new Error(`${key} is encrypted, but ENCRYPTION_KEY is not set`);
@@ -59,7 +59,7 @@ export async function describeBackup(
 }
 
 function decryptStage(config: AppConfig, manifest: BackupManifest | null): Transform[] {
-  const keyRing = config.encryptionKeyRing || (config.encryptionKey ? [config.encryptionKey] : []);
+  const keyRing = resolveKeyRing(config);
   return manifest?.encryption ? [createDecryptor(keyRing, manifest.encryption)] : [];
 }
 
@@ -91,8 +91,7 @@ export async function verifyBackup(
       createGunzip(),
       discard,
     ];
-    const runPipeline = pipeline as unknown as (...args: unknown[]) => Promise<void>;
-    await runPipeline(...stages, { signal });
+    await runStreamPipeline(stages, { signal });
   } catch (error: unknown) {
     const err = error as { name?: string; message?: string };
     if (err.name === "AbortError") throw error;
@@ -200,9 +199,7 @@ export async function restoreBackup(
 
     const [summary] = await settleAll(controller, [
       restore.done,
-      (pipeline as unknown as (...args: unknown[]) => Promise<void>)(...stages, {
-        signal: controller.signal,
-      }),
+      runStreamPipeline(stages, { signal: controller.signal }),
     ]);
 
     assertChecksum(key, checksum, digest.digest());

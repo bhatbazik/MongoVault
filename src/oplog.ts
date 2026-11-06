@@ -1,7 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { PassThrough, Readable } from "node:stream";
-import { pipeline } from "node:stream/promises";
 import { createGunzip, createGzip } from "node:zlib";
 import { BSON, MongoClient, Timestamp } from "mongodb";
 import { linkedController, settleAll } from "./abort.js";
@@ -10,12 +9,14 @@ import {
   MANIFEST_VERSION,
   databasePrefix,
   listBackups,
-  manifestKey,
   readManifest,
+  resolveKeyRing,
   scopeOf,
+  writeManifest,
 } from "./catalog.js";
-import { createDecryptor, createEncryptor, signManifest, verifyManifest } from "./crypto.js";
+import { createDecryptor, createEncryptor, verifyManifest } from "./crypto.js";
 import { DigestStream } from "./digest.js";
+import { runStreamPipeline } from "./stream.js";
 import type { BackupManifest, BackupScope, BackupSummary } from "./types/catalog.js";
 import type { AppConfig } from "./types/config.js";
 import type {
@@ -246,15 +247,14 @@ export async function uploadOplogSlice({
       encrypted && config.encryptionKey ? createEncryptor(config.encryptionKey) : null;
     const digest = new DigestStream();
     const body = new PassThrough({ highWaterMark: 1024 * 1024 });
-    const stages = [Readable.from(rawDocs), gzip, encryptor?.stream, digest, body].filter(Boolean);
-    const runPipeline = pipeline as unknown as (...args: unknown[]) => Promise<void>;
+    const stages = [Readable.from(rawDocs), gzip, encryptor?.stream, digest, body];
 
     await settleAll(controller, [
       storage.upload(key, body, {
         contentType: encrypted ? "application/octet-stream" : "application/gzip",
         signal: controller.signal,
       }),
-      runPipeline(...stages, { signal: controller.signal }),
+      runStreamPipeline(stages, { signal: controller.signal }),
     ]);
 
     const stored = await storage.head(key);
@@ -289,11 +289,8 @@ export async function uploadOplogSlice({
       collections: {},
     };
 
-    if (manifest.encryption && config.encryptionKey) {
-      manifest.encryption.manifestHmac = signManifest(config.encryptionKey, manifest);
-    }
+    await writeManifest(storage, manifest, config.encryptionKey);
 
-    await storage.putJson(manifestKey(key), manifest);
     log.info(
       {
         startTs: manifest.oplogWindow!.startTs,
@@ -367,8 +364,7 @@ export async function captureOplogSlice({
       );
     }
 
-    // Query replica set status to identify the majority commit point
-    // This prevents archiving uncommitted writes that may subsequently be rolled back
+    // Query replica set status to identify majority commit point
     const adminDb = typeof client.db === "function" ? client.db("admin") : null;
     const replStatus =
       adminDb && typeof adminDb.command === "function"
@@ -512,8 +508,6 @@ export async function resolvePitrPlan(
     const prevEndTs = prevEndStr ? parseOplogTimestamp(prevEndStr) : null;
 
     if (prevEndTs) {
-      // Because previousEndTs is the exact lastTs of the preceding checkpoint,
-      // it must be <= expectedPrevEndTs to ensure zero missing operations.
       if (compareTimestamps(prevEndTs, expectedPrevEndTs) > 0) {
         throw new Error(
           `PITR timeline gap detected between ${formatOplogTimestamp(expectedPrevEndTs)} and slice ${slice.key} (starts after ${formatOplogTimestamp(prevEndTs)})`,
@@ -570,7 +564,7 @@ export async function downloadAndExtractOplogSlice(
   destBsonFile: string,
 ): Promise<ExtractOplogSliceResult> {
   const manifest = await readManifest(storage, sliceKey);
-  const keyRing = config.encryptionKeyRing || (config.encryptionKey ? [config.encryptionKey] : []);
+  const keyRing = resolveKeyRing(config);
 
   if (manifest?.encryption) {
     if (keyRing.length === 0) {
@@ -589,8 +583,7 @@ export async function downloadAndExtractOplogSlice(
   try {
     const downloadStream = await storage.download(sliceKey, { signal });
     const stages = [downloadStream, digest, ...decryptStage, createGunzip(), writeStream];
-    const runPipeline = pipeline as unknown as (...args: unknown[]) => Promise<void>;
-    await runPipeline(...stages, { signal });
+    await runStreamPipeline(stages, { signal });
   } finally {
     await fileHandle.close().catch(() => {});
   }
