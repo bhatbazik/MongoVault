@@ -51,8 +51,18 @@ export async function runBackup({
     const stages = [dump.stdout, encryptor?.stream, digest, body].filter(Boolean);
     const runPipeline = pipeline as unknown as (...args: unknown[]) => Promise<void>;
 
-    const [{ collections }] = await settleAll(controller, [
-      dump.done,
+    // Query oplog boundary immediately when mongodump finishes collection dumping,
+    // rather than waiting for S3 upload to complete, preventing a timeline gap.
+    const dumpTask = dump.done.then(async (res) => {
+      const dumpEndOplog =
+        config.mongo.oplog && effectiveTools.getOplogBounds
+          ? await effectiveTools.getOplogBounds(config.mongo.uri).catch(() => null)
+          : null;
+      return { collections: res.collections, dumpEndOplog };
+    });
+
+    const [{ collections, dumpEndOplog }] = await settleAll(controller, [
+      dumpTask,
       storage.upload(key, body, {
         contentType: encrypted ? "application/octet-stream" : "application/gzip",
         signal: controller.signal,
@@ -75,11 +85,7 @@ export async function runBackup({
       );
     }
 
-    const postOplog =
-      config.mongo.oplog && effectiveTools.getOplogBounds
-        ? await effectiveTools.getOplogBounds(config.mongo.uri).catch(() => null)
-        : null;
-
+    const postOplog = dumpEndOplog;
     const completedAt = new Date();
     const oplogEndTs = postOplog?.newestTs ?? preOplog?.newestTs ?? null;
     const oplogStartTs = preOplog?.newestTs ?? oplogEndTs;

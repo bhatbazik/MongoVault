@@ -367,10 +367,41 @@ export async function captureOplogSlice({
       );
     }
 
-    const query = cursorStartTs ? { ts: { $gt: toBsonTimestamp(cursorStartTs) } } : {};
+    // Query replica set status to identify the majority commit point
+    // This prevents archiving uncommitted writes that may subsequently be rolled back
+    const adminDb = typeof client.db === "function" ? client.db("admin") : null;
+    const replStatus =
+      adminDb && typeof adminDb.command === "function"
+        ? await adminDb.command({ replSetGetStatus: 1 }).catch(() => null)
+        : null;
+    const majorityTs = replStatus?.optimes?.lastCommittedOpTime?.ts
+      ? fromBsonTimestamp(replStatus.optimes.lastCommittedOpTime.ts)
+      : replStatus?.optimes?.readConcernMajorityOpTime?.ts
+        ? fromBsonTimestamp(replStatus.optimes.readConcernMajorityOpTime.ts)
+        : null;
+
+    if (majorityTs && cursorStartTs && compareTimestamps(cursorStartTs, majorityTs) >= 0) {
+      logger.debug(
+        {
+          cursorStartTs: formatOplogTimestamp(cursorStartTs),
+          majorityTs: formatOplogTimestamp(majorityTs),
+        },
+        "No new majority-committed oplog entries",
+      );
+      return null;
+    }
+
+    const query: Record<string, unknown> = {};
+    if (cursorStartTs || majorityTs) {
+      query.ts = {
+        ...(cursorStartTs ? { $gt: toBsonTimestamp(cursorStartTs) } : {}),
+        ...(majorityTs ? { $lte: toBsonTimestamp(majorityTs) } : {}),
+      };
+    }
 
     const maxBytes = (config.pitr?.maxSliceMb ?? 16) * 1024 * 1024;
-    const cursor = oplog.find(query).sort({ $natural: 1 });
+    // promoteValues: false preserves exact BSON types (Double, Long, Int32) upon serialization
+    const cursor = oplog.find(query, { promoteValues: false }).sort({ $natural: 1 });
 
     const rawDocs: Buffer[] = [];
     let accumulatedBytes = 0;
@@ -468,7 +499,7 @@ export async function resolvePitrPlan(
   const allSlices = (await listOplogSlices(storage, scope)).filter((s) => s.complete);
   const candidateSlices = allSlices.filter(
     (s) =>
-      compareTimestamps(s.endTs, baseEndTs!) > 0 && compareTimestamps(s.startTs, targetTs) <= 0,
+      compareTimestamps(s.endTs, baseEndTs!) >= 0 && compareTimestamps(s.startTs, targetTs) <= 0,
   );
 
   // Read manifests and verify contiguity of the oplog chain

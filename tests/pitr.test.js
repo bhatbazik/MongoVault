@@ -114,7 +114,14 @@ describe("Continuous Oplog Archiver and PITR Restore Coordinator", () => {
     return () => ({
       async connect() {},
       async close() {},
-      db() {
+      db(name) {
+        if (name === "admin") {
+          return {
+            async command() {
+              return {};
+            },
+          };
+        }
         return {
           collection() {
             return {
@@ -124,6 +131,12 @@ describe("Continuous Oplog Archiver and PITR Restore Coordinator", () => {
                   const gt = fromBsonTimestamp(filter.ts.$gt);
                   filtered = filtered.filter(
                     (doc) => compareTimestamps(fromBsonTimestamp(doc.ts), gt) > 0,
+                  );
+                }
+                if (filter.ts?.$lte) {
+                  const lte = fromBsonTimestamp(filter.ts.$lte);
+                  filtered = filtered.filter(
+                    (doc) => compareTimestamps(fromBsonTimestamp(doc.ts), lte) <= 0,
                   );
                 }
                 const cursor = {
