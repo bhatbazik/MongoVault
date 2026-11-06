@@ -1,11 +1,15 @@
 import type { LogLevel } from "./logger.js";
 
+export type MongoReadPreference =
+  "primary" | "primaryPreferred" | "secondary" | "secondaryPreferred" | "nearest";
+
 export interface MongoConfig {
   uri: string;
   database: string;
   excludeCollections: string[];
   oplog: boolean;
   parallelCollections: number;
+  readPreference?: MongoReadPreference;
 }
 
 export interface PitrConfig {
@@ -15,6 +19,8 @@ export interface PitrConfig {
 }
 
 export interface StorageConfig {
+  type: "s3" | "filesystem";
+  path?: string;
   bucket: string;
   endpoint?: string;
   region: string;

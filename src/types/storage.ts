@@ -1,11 +1,14 @@
 import type { Readable } from "node:stream";
+export type StorageType = "s3" | "filesystem";
 
 export interface StorageOptions {
+  type?: StorageType;
+  path?: string;
   endpoint?: string;
   region?: string;
-  bucket: string;
-  accessKeyId: string;
-  secretAccessKey: string;
+  bucket?: string;
+  accessKeyId?: string;
+  secretAccessKey?: string;
   forcePathStyle?: boolean;
   partSizeMb?: number;
   queueSize?: number;

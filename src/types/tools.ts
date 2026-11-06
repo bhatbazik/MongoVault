@@ -32,6 +32,7 @@ export interface MongodumpOptions {
   excludeCollections?: string[];
   parallelCollections?: number;
   oplog?: boolean;
+  readPreference?: string;
   workDir: string;
   signal?: AbortSignal;
   timeoutMs?: number;
@@ -48,6 +49,7 @@ export interface MongorestoreOptions {
   uri: string;
   workDir: string;
   nsInclude?: string;
+  nsExclude?: string;
   nsFrom?: string;
   nsTo?: string;
   drop?: boolean;
@@ -84,4 +86,15 @@ export interface BackupTools {
 export interface RestoreTools {
   mongorestore?: (options: MongorestoreOptions) => Promise<MongorestoreResult>;
   replayOplogFile?: (options: ReplayOplogFileOptions) => Promise<void>;
+}
+
+export interface ToolVersionInfo {
+  available: boolean;
+  version?: string;
+  error?: string;
+}
+
+export interface DatabaseToolsStatus {
+  mongodump: ToolVersionInfo;
+  mongorestore: ToolVersionInfo;
 }

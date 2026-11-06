@@ -58,6 +58,30 @@ describe("config", () => {
     expect(() => loadConfig({ ...minimalValidEnv, ENCRYPTION_KEY: "invalid-key" })).toThrow();
   });
 
+  it("loads filesystem storage configuration without requiring S3 credentials", () => {
+    const fsEnv = {
+      MONGODB_URI: "mongodb://localhost:27017",
+      MONGODB_DATABASE: "testdb",
+      STORAGE_TYPE: "filesystem",
+      STORAGE_PATH: "/var/backups/mongodb",
+      MONGODB_READ_PREFERENCE: "secondary",
+    };
+    const config = loadConfig(fsEnv);
+    expect(config.storage.type).toBe("filesystem");
+    expect(config.storage.path).toBe("/var/backups/mongodb");
+    expect(config.storage.bucket).toBe("/var/backups/mongodb");
+    expect(config.mongo.readPreference).toBe("secondary");
+  });
+
+  it("rejects filesystem storage if STORAGE_PATH is omitted", () => {
+    const fsEnv = {
+      MONGODB_URI: "mongodb://localhost:27017",
+      MONGODB_DATABASE: "testdb",
+      STORAGE_TYPE: "filesystem",
+    };
+    expect(() => loadConfig(fsEnv)).toThrow("STORAGE_PATH is required");
+  });
+
   it("rejects MONGODB_OPLOG with single database scope", () => {
     expect(() =>
       loadConfig({

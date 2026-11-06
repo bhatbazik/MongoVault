@@ -6,6 +6,7 @@ import path from "node:path";
 import readline from "node:readline";
 import { formatDuration } from "./format.js";
 import type {
+  DatabaseToolsStatus,
   DumpLineResult,
   MongodumpOptions,
   MongodumpResult,
@@ -15,6 +16,7 @@ import type {
   RestoreLineResult,
   RunToolOptions,
   RunToolResult,
+  ToolVersionInfo,
 } from "./types/tools.js";
 
 const KILL_GRACE_MS = 10_000;
@@ -120,6 +122,7 @@ export async function mongodump({
   excludeCollections = [],
   parallelCollections,
   oplog = false,
+  readPreference,
   workDir,
   signal,
   timeoutMs,
@@ -145,6 +148,9 @@ export async function mongodump({
   }
   if (parallelCollections && parallelCollections > 0) {
     args.push(`--numParallelCollections=${parallelCollections}`);
+  }
+  if (readPreference) {
+    args.push(`--readPreference=${readPreference}`);
   }
   if (oplog) {
     args.push("--oplog");
@@ -177,6 +183,7 @@ export async function mongorestore({
   uri,
   workDir,
   nsInclude,
+  nsExclude,
   nsFrom,
   nsTo,
   drop = false,
@@ -191,13 +198,14 @@ export async function mongorestore({
   if (oplogLimit && !oplogReplay) {
     throw new Error("cannot use --oplogLimit without --oplogReplay enabled");
   }
-  if (oplogReplay && (nsInclude || (nsFrom && nsTo))) {
+  if (oplogReplay && (nsInclude || nsExclude || (nsFrom && nsTo))) {
     throw new Error("cannot use --oplogReplay with namespace includes or renames specified");
   }
 
   const { file: configFile, cleanup: cleanupConfig } = await writeUriConfig(workDir, uri);
   const args = [`--config=${configFile}`, "--archive", "--gzip"];
   if (nsInclude) args.push(`--nsInclude=${nsInclude}`);
+  if (nsExclude) args.push(`--nsExclude=${nsExclude}`);
   if (nsFrom && nsTo) args.push(`--nsFrom=${nsFrom}`, `--nsTo=${nsTo}`);
   if (drop) args.push("--drop");
   if (oplogReplay) args.push("--oplogReplay");
@@ -288,4 +296,47 @@ async function writeUriConfig(
   };
 
   return { file, cleanup };
+}
+
+export async function checkTool(command: string): Promise<ToolVersionInfo> {
+  return new Promise((resolve) => {
+    const child = spawn(command, ["--version"], { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.on("data", (chunk) => {
+      stdout += String(chunk);
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+    child.once("error", (error: Error & { code?: string }) => {
+      resolve({
+        available: false,
+        error: error.code === "ENOENT" ? `${command} not found in PATH` : error.message,
+      });
+    });
+    child.once("close", (code) => {
+      if (code === 0) {
+        const text = stdout || stderr;
+        const match = /version\s+([v\d.]+)/i.exec(text);
+        resolve({
+          available: true,
+          version: match ? match[1] : text.trim().split("\n")[0],
+        });
+      } else {
+        resolve({
+          available: false,
+          error: `${command} exited with code ${code}: ${stderr || stdout}`,
+        });
+      }
+    });
+  });
+}
+
+export async function checkDatabaseTools(): Promise<DatabaseToolsStatus> {
+  const [dump, restore] = await Promise.all([checkTool("mongodump"), checkTool("mongorestore")]);
+  return {
+    mongodump: dump,
+    mongorestore: restore,
+  };
 }

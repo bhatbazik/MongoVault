@@ -16,6 +16,8 @@ export interface RestoreOptions {
   ref?: string;
   uri: string;
   database?: string;
+  nsInclude?: string;
+  nsExclude?: string;
   drop?: boolean;
   preVerify?: boolean;
   oplogReplay?: boolean;

@@ -47,10 +47,15 @@ const schema = z
     MONGODB_EXCLUDE_COLLECTIONS: list,
     MONGODB_OPLOG: flag(false),
     MONGODB_PARALLEL_COLLECTIONS: z.coerce.number().int().min(1).max(32).default(2),
+    MONGODB_READ_PREFERENCE: z
+      .enum(["primary", "primaryPreferred", "secondary", "secondaryPreferred", "nearest"])
+      .default("secondaryPreferred"),
 
-    S3_BUCKET: z.string().min(1),
-    S3_ACCESS_KEY_ID: z.string().min(1),
-    S3_SECRET_ACCESS_KEY: z.string().min(1),
+    STORAGE_TYPE: z.enum(["s3", "filesystem"]).default("s3"),
+    STORAGE_PATH: z.string().optional(),
+    S3_BUCKET: z.string().default("mongodb-backups"),
+    S3_ACCESS_KEY_ID: z.string().default(""),
+    S3_SECRET_ACCESS_KEY: z.string().default(""),
     S3_ENDPOINT: z.string().url().optional(),
     S3_REGION: z.string().optional(),
     S3_FORCE_PATH_STYLE: flag(false),
@@ -158,6 +163,37 @@ const schema = z
           "MONGODB_EXCLUDE_COLLECTIONS cannot be used with full cluster backup (MONGODB_DATABASE: * or all); mongodump requires --db when --excludeCollection is specified",
       });
     }
+    if (env.STORAGE_TYPE === "s3") {
+      if (!env.S3_BUCKET || env.S3_BUCKET.trim() === "") {
+        ctx.addIssue({
+          code: "custom",
+          path: ["S3_BUCKET"],
+          message: "S3_BUCKET is required when STORAGE_TYPE is s3",
+        });
+      }
+      if (!env.S3_ACCESS_KEY_ID || env.S3_ACCESS_KEY_ID.trim() === "") {
+        ctx.addIssue({
+          code: "custom",
+          path: ["S3_ACCESS_KEY_ID"],
+          message: "S3_ACCESS_KEY_ID is required when STORAGE_TYPE is s3",
+        });
+      }
+      if (!env.S3_SECRET_ACCESS_KEY || env.S3_SECRET_ACCESS_KEY.trim() === "") {
+        ctx.addIssue({
+          code: "custom",
+          path: ["S3_SECRET_ACCESS_KEY"],
+          message: "S3_SECRET_ACCESS_KEY is required when STORAGE_TYPE is s3",
+        });
+      }
+    } else if (env.STORAGE_TYPE === "filesystem") {
+      if (!env.STORAGE_PATH || env.STORAGE_PATH.trim() === "") {
+        ctx.addIssue({
+          code: "custom",
+          path: ["STORAGE_PATH"],
+          message: "STORAGE_PATH is required when STORAGE_TYPE is filesystem",
+        });
+      }
+    }
   });
 
 export class ConfigError extends Error {
@@ -207,6 +243,7 @@ function toConfig(env: z.infer<typeof schema>): AppConfig {
       excludeCollections: env.MONGODB_EXCLUDE_COLLECTIONS,
       oplog: env.MONGODB_OPLOG || env.PITR_ENABLED,
       parallelCollections: env.MONGODB_PARALLEL_COLLECTIONS,
+      readPreference: env.MONGODB_READ_PREFERENCE,
     },
     pitr: {
       enabled: env.PITR_ENABLED,
@@ -214,7 +251,10 @@ function toConfig(env: z.infer<typeof schema>): AppConfig {
       maxSliceMb: env.PITR_MAX_SLICE_MB,
     },
     storage: {
-      bucket: env.S3_BUCKET,
+      type: env.STORAGE_TYPE,
+      path: env.STORAGE_PATH,
+      bucket:
+        env.STORAGE_TYPE === "filesystem" ? (env.STORAGE_PATH ?? "filesystem") : env.S3_BUCKET,
       endpoint,
       region: env.S3_REGION ?? (env.R2_ACCOUNT_ID ? "auto" : process.env.AWS_REGION || "us-east-1"),
       forcePathStyle: env.S3_FORCE_PATH_STYLE,

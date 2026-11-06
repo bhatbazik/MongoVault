@@ -26,3 +26,25 @@ export interface PruneResult {
   keep: BackupSummary[];
   remove: RetentionTarget[];
 }
+
+export interface DeleteBackupOptions {
+  key: string;
+  force?: boolean;
+  dryRun?: boolean;
+}
+
+export interface DeleteBackupResult {
+  key: string;
+  deleted: boolean;
+  message?: string;
+}
+
+export interface PruneOplogOptions {
+  olderThan: string;
+  dryRun?: boolean;
+}
+
+export interface PruneOplogResult {
+  cutoffTs: string;
+  deletedSlices: string[];
+}

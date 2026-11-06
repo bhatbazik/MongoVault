@@ -38,6 +38,7 @@ export async function runBackup({
       excludeCollections: config.mongo.excludeCollections,
       parallelCollections: config.mongo.parallelCollections,
       oplog: config.mongo.oplog,
+      readPreference: config.mongo.readPreference,
       workDir: config.workDir,
       timeoutMs: config.timeoutMs,
       signal: controller.signal,

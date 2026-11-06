@@ -16,7 +16,9 @@ export function formatDuration(ms: number): string {
   return hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m ${seconds}s`;
 }
 
-export function formatDate(date: Date, timeZone?: string): string {
+export function formatDate(date: Date | string | number, timeZone?: string): string {
+  const d = date instanceof Date ? date : new Date(date);
+  if (Number.isNaN(d.getTime())) return String(date);
   const parts = Object.fromEntries(
     new Intl.DateTimeFormat("en-CA", {
       timeZone,
@@ -28,7 +30,7 @@ export function formatDate(date: Date, timeZone?: string): string {
       second: "2-digit",
       hourCycle: "h23",
     })
-      .formatToParts(date)
+      .formatToParts(d)
       .map(({ type, value }) => [type, value]),
   ) as Record<string, string>;
   return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`;

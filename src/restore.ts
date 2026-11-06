@@ -27,7 +27,7 @@ export class IntegrityError extends Error {
   }
 }
 
-async function describeBackup(
+export async function describeBackup(
   { config, storage }: RestoreContext,
   ref: string,
 ): Promise<DescribeBackupResult> {
@@ -117,6 +117,8 @@ export async function restoreBackup(
     ref = "latest",
     uri,
     database,
+    nsInclude,
+    nsExclude,
     drop = false,
     preVerify = drop,
     oplogReplay,
@@ -130,6 +132,8 @@ export async function restoreBackup(
       pitr,
       uri,
       database,
+      nsInclude,
+      nsExclude,
       drop,
       preVerify,
       parallelCollections,
@@ -144,11 +148,12 @@ export async function restoreBackup(
   const isCluster = isClusterScope(source);
   const isFilteredCluster = isCluster && !isClusterScope(target);
   const isRenamedDb = !isCluster && target !== source;
-  const hasNamespaceFilter = isFilteredCluster || isRenamedDb;
+  const hasNamespaceFilter =
+    isFilteredCluster || isRenamedDb || Boolean(nsInclude) || Boolean(nsExclude);
 
   if (hasNamespaceFilter && (oplogReplay === true || Boolean(oplogLimit))) {
     throw new Error(
-      "Cannot use --oplog-replay or --oplog-limit when filtering or renaming target database",
+      "Cannot use --oplog-replay or --oplog-limit when filtering namespaces or renaming target database",
     );
   }
 
@@ -166,13 +171,17 @@ export async function restoreBackup(
     await verifyBackup(ctx, ref);
   }
 
+  const effectiveNsInclude =
+    nsInclude ?? (isFilteredCluster ? `${target}.*` : isRenamedDb ? `${source}.*` : undefined);
+
   const controller = linkedController(signal);
   try {
     const effectiveMongorestore = tools.mongorestore ?? mongorestore;
     const restore = await effectiveMongorestore({
       uri,
       workDir: config.workDir,
-      nsInclude: isFilteredCluster ? `${target}.*` : isRenamedDb ? `${source}.*` : undefined,
+      nsInclude: effectiveNsInclude,
+      nsExclude,
       nsFrom: isRenamedDb ? `${source}.*` : undefined,
       nsTo: isRenamedDb ? `${target}.*` : undefined,
       drop,

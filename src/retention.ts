@@ -1,10 +1,14 @@
-import { listBackups, manifestKey, scopeOf } from "./catalog.js";
-import { listOplogSlices } from "./oplog.js";
+import { listBackups, manifestKey, readManifest, resolveBackup, scopeOf } from "./catalog.js";
+import { formatOplogTimestamp, listOplogSlices, parsePitrTarget } from "./oplog.js";
 import type { BackupSummary } from "./types/catalog.js";
 import type { DateParts } from "./types/common.js";
 import type { RetentionPolicy } from "./types/config.js";
 import type {
+  DeleteBackupOptions,
+  DeleteBackupResult,
   PruneContext,
+  PruneOplogOptions,
+  PruneOplogResult,
   PruneOptions,
   PruneResult,
   RetentionPlan,
@@ -104,6 +108,87 @@ export async function prune(
 
   logger.info({ kept: keep.length, removed: targets.length, dryRun }, "Retention policy applied");
   return { keep, remove: targets };
+}
+
+export async function deleteBackup(
+  { config, storage, logger }: PruneContext,
+  { key, force = false, dryRun = false }: DeleteBackupOptions,
+): Promise<DeleteBackupResult> {
+  const scope = scopeOf(config);
+  const resolvedKey = await resolveBackup(storage, scope, key);
+  const manifest = await readManifest(storage, resolvedKey);
+  if (!manifest) {
+    const head = await storage.head(resolvedKey);
+    if (!head) {
+      throw new Error(`Backup not found: ${key}`);
+    }
+  }
+
+  // Active PITR base safety check (mirroring Percona's ErrBaseForPITR)
+  if (!force) {
+    const slices = (await listOplogSlices(storage, scope)).filter((s) => s.complete);
+    if (slices.length > 0) {
+      const backups = (await listBackups(storage, scope)).filter((b) => b.complete);
+      if (backups.length > 0 && backups[0]?.key === resolvedKey) {
+        throw new Error(
+          `Cannot delete backup "${resolvedKey}": it is the active base snapshot anchoring PITR continuous oplog slices. Deleting it would invalidate point-in-time recovery. Pass --force to override.`,
+        );
+      }
+    }
+  }
+
+  if (!dryRun) {
+    const keysToDelete = [manifestKey(resolvedKey), resolvedKey];
+    if (typeof storage.removeMany === "function") {
+      await storage.removeMany(keysToDelete);
+    } else {
+      for (const k of keysToDelete) {
+        await storage.remove(k);
+      }
+    }
+  }
+
+  logger.info({ key: resolvedKey, dryRun, force }, "Backup deleted");
+  return {
+    key: resolvedKey,
+    deleted: !dryRun,
+    message: dryRun ? `[Dry Run] Would delete ${resolvedKey}` : `Deleted ${resolvedKey}`,
+  };
+}
+
+export async function pruneOplogSlices(
+  { config, storage, logger }: PruneContext,
+  { olderThan, dryRun = false }: PruneOplogOptions,
+): Promise<PruneOplogResult> {
+  const scope = scopeOf(config);
+  const cutoff = parsePitrTarget(olderThan);
+  const slices = await listOplogSlices(storage, scope);
+  const toDelete = slices.filter((s) => s.endTs.t < cutoff.t);
+
+  const keysToDelete: string[] = [];
+  for (const slice of toDelete) {
+    keysToDelete.push(manifestKey(slice.key), slice.key);
+  }
+
+  if (!dryRun && keysToDelete.length > 0) {
+    if (typeof storage.removeMany === "function") {
+      await storage.removeMany(keysToDelete);
+    } else {
+      for (const k of keysToDelete) {
+        await storage.remove(k);
+      }
+    }
+  }
+
+  logger.info(
+    { cutoff: formatOplogTimestamp(cutoff), count: toDelete.length, dryRun },
+    "Pruned expired PITR oplog slices",
+  );
+
+  return {
+    cutoffTs: formatOplogTimestamp(cutoff),
+    deletedSlices: toDelete.map((s) => s.key),
+  };
 }
 
 function zonedDate(date: Date, timeZone?: string): DateParts {

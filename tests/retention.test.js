@@ -1,6 +1,6 @@
 import pino from "pino";
 import { describe, expect, it } from "vitest";
-import { planRetention, prune } from "../src/retention.js";
+import { deleteBackup, planRetention, prune, pruneOplogSlices } from "../src/retention.js";
 
 describe("retention", () => {
   function makeBackup(iso) {
@@ -83,5 +83,87 @@ describe("retention", () => {
     expect(deletedKeys).toContain(
       "mongodb/prod/2026-03-01/20260301T000000Z.archive.gz.manifest.json",
     );
+  });
+
+  it("blocks deleting active PITR base snapshot without force", async () => {
+    const key = "mongodb/prod/2026-03-01/20260301T000000Z.archive.gz";
+    const sliceKey =
+      "mongodb/prod_pitr/2026-03-01/1709251200_00000001__1709254800_00000001.oplog.bson.gz";
+    const mockStorage = {
+      async *list(prefix) {
+        if (prefix.includes("_pitr")) {
+          yield { key: sliceKey, size: 50 };
+          yield { key: `${sliceKey}.manifest.json`, size: 5 };
+        } else {
+          yield { key, size: 100 };
+          yield { key: `${key}.manifest.json`, size: 10 };
+        }
+      },
+      async getJson(k) {
+        if (k.endsWith(".manifest.json")) {
+          return {
+            data: { key: k.replace(".manifest.json", ""), completedAt: "2026-03-01T00:00:00Z" },
+          };
+        }
+        return null;
+      },
+      async head(_k) {
+        return { size: 100, lastModified: new Date() };
+      },
+      async remove() {},
+    };
+
+    const config = {
+      mongo: { database: "prod" },
+      storage: { prefix: "mongodb" },
+    };
+    const logger = pino({ level: "silent" });
+
+    // Should throw safety error without force
+    await expect(deleteBackup({ config, storage: mockStorage, logger }, { key })).rejects.toThrow(
+      "anchoring PITR continuous oplog slices",
+    );
+
+    // Should succeed with force
+    const deleted = await deleteBackup(
+      { config, storage: mockStorage, logger },
+      { key, force: true },
+    );
+    expect(deleted.deleted).toBe(true);
+  });
+
+  it("prunes oplog slices older than target cutoff", async () => {
+    const removedKeys = [];
+    const slice1 =
+      "mongodb/prod_pitr/2026-03-01/1709251200_00000001__1709254800_00000001.oplog.bson.gz";
+    const slice2 =
+      "mongodb/prod_pitr/2026-03-02/1709337600_00000001__1709341200_00000001.oplog.bson.gz";
+    const mockStorage = {
+      async *list() {
+        yield { key: slice1, size: 50 };
+        yield { key: `${slice1}.manifest.json`, size: 5 };
+        yield { key: slice2, size: 60 };
+        yield { key: `${slice2}.manifest.json`, size: 6 };
+      },
+      async removeMany(keys) {
+        removedKeys.push(...keys);
+      },
+    };
+
+    const config = {
+      mongo: { database: "prod" },
+      storage: { prefix: "mongodb" },
+    };
+    const logger = pino({ level: "silent" });
+
+    const result = await pruneOplogSlices(
+      { config, storage: mockStorage, logger },
+      { olderThan: "1709300000:1" },
+    );
+
+    expect(result.deletedSlices).toContain(slice1);
+    expect(result.deletedSlices).not.toContain(slice2);
+    expect(removedKeys).toContain(slice1);
+    expect(removedKeys).toContain(`${slice1}.manifest.json`);
   });
 });

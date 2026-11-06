@@ -1,7 +1,10 @@
+import fs from "node:fs/promises";
 import { parseArgs } from "node:util";
 import { runBackup } from "./backup.js";
 import { isClusterScope, listBackups, scopeOf } from "./catalog.js";
+import { formatPreflightCheck, runPreflightCheck } from "./check.js";
 import { generateKey } from "./crypto.js";
+import { generateDiagnosticBundle } from "./diagnostic.js";
 import { runDrill } from "./drill.js";
 import { formatBytes, formatDate, formatDuration } from "./format.js";
 import { createLogger } from "./logger.js";
@@ -13,46 +16,58 @@ import {
   listOplogSlices,
   startOplogArchiver,
 } from "./oplog.js";
-import { restoreBackup, verifyBackup } from "./restore.js";
-import { prune } from "./retention.js";
+import { describeBackup, restoreBackup, verifyBackup } from "./restore.js";
+import { deleteBackup, prune, pruneOplogSlices } from "./retention.js";
 import { createScheduler } from "./scheduler.js";
+import { formatStatus, getStatus } from "./status.js";
 import { createStorage } from "./storage.js";
 import type { AppConfig } from "./types/config.js";
 
 function printHelp(): void {
   console.log(`
-mongodb-backup-service CLI
+MongoVault CLI - Enterprise-Grade MongoDB Backup & PITR Daemon
 
 Usage:
   mongodb-backup <command> [options]
   node src/index.js <command> [options]
 
 Commands:
-  daemon               Run backup service in daemon mode with scheduler and metrics
+  status               Display real-time cluster topology, storage health, and PITR status
+  check                Verify system prerequisites (MongoDB, tools, storage, and crypto)
   backup               Execute an immediate backup to configured storage
   restore              Restore a backup archive (or continuous PITR target) to MongoDB
+  describe             Show detailed metadata and collection breakdown of a backup
   verify               Stream and verify backup checksum and decompression
-  list                 List available backups in configured bucket
+  list                 List available backups in configured storage
+  delete               Safely delete a specific backup (protected against PITR invalidation)
   prune                Apply retention policy and clean up expired backups
+  diagnostic           Generate sanitized environment and database diagnostic report
   drill                Run automated restore drill and verify document counts
   oplog:tail           Run continuous oplog archiver daemon for second-level PITR
   oplog:slice          Capture and upload a single incremental oplog slice now
-  oplog:list           List archived PITR oplog slices in configured bucket
+  oplog:list           List archived PITR oplog slices in configured storage
+  oplog:prune          Prune archived PITR oplog slices older than a target timestamp
   key:generate         Generate a new random AES-256 base64 encryption key
 
 Options:
-  --key <string>          Target backup key (default: latest)
-  --uri <string>          Target MongoDB URI for restore (default: MONGODB_URI)
-  --database <string>     Target database name for restore (default: original database)
-  --drop                  Drop existing collections before restoring
-  --oplog                 Capture point-in-time oplog during backup
-  --oplog-replay          Replay captured oplog during restore
-  --oplog-limit <ts:inc>  Target timestamp for snapshot oplog replay (e.g. 1774092000:1)
-  --pitr <iso|ts:inc>     Restore to exact point-in-time using base backup + oplog slices
-  --parallel <number>     Number of collections to dump/restore concurrently (default: 2)
-  --dry-run               Simulate retention prune without deleting objects
-  --json                  Output machine-readable JSON format
-  --help, -h              Show this help message
+  --key <string>            Target backup key (default: latest)
+  --uri <string>            Target MongoDB URI for restore (default: MONGODB_URI)
+  --database <string>       Target database name for restore (default: original database)
+  --ns-include <string>     Selective restore collection pattern (e.g. "mydb.users,mydb.orders*")
+  --ns-exclude <string>     Selective restore exclusion pattern (e.g. "mydb.audit_log")
+  --read-preference <str>   Read preference for backup dumps (secondaryPreferred, secondary, etc.)
+  --drop                    Drop existing collections before restoring
+  --oplog                   Capture point-in-time oplog during backup
+  --oplog-replay            Replay captured oplog during restore
+  --oplog-limit <ts:inc>    Target timestamp for snapshot oplog replay (e.g. 1774092000:1)
+  --pitr <iso|ts:inc>       Restore to exact point-in-time using base backup + oplog slices
+  --older-than <ts|iso>     Cutoff timestamp for pruning oplog slices
+  --parallel <number>       Number of collections to dump/restore concurrently (default: 2)
+  --force                   Bypass safety checks when deleting backups
+  --dry-run                 Simulate deletion/prune without modifying storage
+  --output <path>           File path for diagnostic output bundle
+  --json                    Output machine-readable JSON format
+  --help, -h                Show this help message
 `);
 }
 
@@ -79,6 +94,12 @@ export async function runCli(
       key: { type: "string" },
       uri: { type: "string" },
       database: { type: "string" },
+      "ns-include": { type: "string" },
+      "ns-exclude": { type: "string" },
+      "read-preference": { type: "string" },
+      "older-than": { type: "string" },
+      output: { type: "string" },
+      force: { type: "boolean", default: false },
       drop: { type: "boolean", default: false },
       oplog: { type: "boolean", default: false },
       "oplog-replay": { type: "boolean", default: false },
@@ -111,6 +132,129 @@ export async function runCli(
   const metrics = createMetricsRegistry();
 
   switch (command) {
+    case "status": {
+      try {
+        const status = await getStatus({ config, storage, logger });
+        if (values.json) {
+          console.log(JSON.stringify(status, null, 2));
+        } else {
+          console.log("\n" + formatStatus(status));
+        }
+      } catch (error) {
+        logger.error({ err: error }, "Failed to retrieve system status");
+        process.exit(1);
+      }
+      break;
+    }
+
+    case "check": {
+      try {
+        const result = await runPreflightCheck({ config, storage });
+        if (values.json) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          console.log("\n" + formatPreflightCheck(result));
+        }
+        if (!result.allPassed) {
+          process.exit(1);
+        }
+      } catch (error) {
+        logger.error({ err: error }, "Preflight check failed");
+        process.exit(1);
+      }
+      break;
+    }
+
+    case "describe": {
+      try {
+        const { key, manifest, checksum } = await describeBackup(
+          { config, storage, logger },
+          values.key || "latest",
+        );
+        if (values.json) {
+          console.log(JSON.stringify({ key, checksum, manifest }, null, 2));
+        } else if (manifest) {
+          console.log("\nBackup Metadata Details");
+          console.log("=======================");
+          console.log(`Key:          ${manifest.key}`);
+          console.log(`Database:     ${manifest.database}`);
+          console.log(`Created At:   ${formatDate(manifest.createdAt)}`);
+          console.log(`Completed At: ${formatDate(manifest.completedAt)}`);
+          console.log(`Duration:     ${formatDuration(manifest.durationMs)}`);
+          console.log(`Archive Size: ${formatBytes(manifest.size)} (${manifest.size} bytes)`);
+          console.log(`SHA-256:      ${manifest.sha256}`);
+          console.log(`Compression:  ${manifest.compression}`);
+          if (manifest.encryption) {
+            console.log(
+              `Encryption:   ${manifest.encryption.algorithm} (Key ID: ${manifest.encryption.keyId})`,
+            );
+          } else {
+            console.log("Encryption:   None (Unencrypted)");
+          }
+          if (manifest.oplogWindow) {
+            console.log(
+              `Oplog Window: ${manifest.oplogWindow.startTs} -> ${manifest.oplogWindow.endTs}`,
+            );
+          }
+          if (manifest.excludedCollections && manifest.excludedCollections.length > 0) {
+            console.log(`Excluded:     ${manifest.excludedCollections.join(", ")}`);
+          }
+          if (manifest.collections && Object.keys(manifest.collections).length > 0) {
+            console.log("\nCollections & Document Counts:");
+            console.log("------------------------------");
+            for (const [coll, count] of Object.entries(manifest.collections)) {
+              console.log(`  • ${coll.padEnd(35)} : ${count.toLocaleString()} docs`);
+            }
+          }
+        } else {
+          console.log(`Backup found: ${key} (No .manifest.json available)`);
+        }
+      } catch (error) {
+        logger.error({ err: error }, "Failed to describe backup");
+        process.exit(1);
+      }
+      break;
+    }
+
+    case "delete": {
+      if (!values.key) {
+        console.error("Error: --key <string> is required for delete command");
+        process.exit(1);
+      }
+      try {
+        const result = await deleteBackup(
+          { config, storage, logger },
+          { key: values.key, force: values.force, dryRun: values["dry-run"] },
+        );
+        if (values.json) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          console.log(result.message);
+        }
+      } catch (error) {
+        logger.error({ err: error }, "Delete failed");
+        process.exit(1);
+      }
+      break;
+    }
+
+    case "diagnostic": {
+      try {
+        const bundle = await generateDiagnosticBundle({ config, storage });
+        const jsonOutput = JSON.stringify(bundle, null, 2);
+        if (values.output) {
+          await fs.writeFile(values.output, jsonOutput, "utf8");
+          console.log(`Diagnostic bundle written to ${values.output}`);
+        } else {
+          console.log(jsonOutput);
+        }
+      } catch (error) {
+        logger.error({ err: error }, "Failed to generate diagnostic bundle");
+        process.exit(1);
+      }
+      break;
+    }
+
     case "daemon": {
       const scheduler = createScheduler({ config, storage, logger, notifier, metrics });
       const httpServer = startHttpServer({
@@ -155,6 +299,9 @@ export async function runCli(
           ...config.mongo,
           database: targetDb,
           oplog: targetOplog,
+          readPreference:
+            (values["read-preference"] as AppConfig["mongo"]["readPreference"]) ||
+            config.mongo.readPreference,
           parallelCollections: values.parallel
             ? Number(values.parallel)
             : config.mongo.parallelCollections,
@@ -195,6 +342,8 @@ export async function runCli(
             ref: values.key || "latest",
             uri: targetUri,
             database: values.database,
+            nsInclude: values["ns-include"],
+            nsExclude: values["ns-exclude"],
             drop: values.drop,
             oplogReplay: values["oplog-replay"],
             oplogLimit: values["oplog-limit"],
@@ -375,6 +524,30 @@ export async function runCli(
             ].join(" "),
           );
         }
+      }
+      break;
+    }
+
+    case "oplog:prune": {
+      if (!values["older-than"]) {
+        console.error("Error: --older-than <timestamp|iso> is required for oplog:prune command");
+        process.exit(1);
+      }
+      try {
+        const result = await pruneOplogSlices(
+          { config, storage, logger },
+          { olderThan: values["older-than"], dryRun: values["dry-run"] },
+        );
+        if (values.json) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          console.log(
+            `Pruned ${result.deletedSlices.length} oplog slices older than ${result.cutoffTs}`,
+          );
+        }
+      } catch (error) {
+        logger.error({ err: error }, "Oplog prune failed");
+        process.exit(1);
       }
       break;
     }

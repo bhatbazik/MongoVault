@@ -98,17 +98,29 @@ npm start
 The service ships with an executable CLI (`mongodb-backup`):
 
 ```bash
-# Run manual backup
+# Check cluster topology, storage health, PITR timeline, and running locks
+node src/index.js status
+
+# Run preflight system verification (tools, MongoDB, storage probe, crypto)
+node src/index.js check
+
+# Run manual backup (prioritizing secondary replica set nodes)
 node src/index.js backup
 
 # Run manual backup with point-in-time oplog capture
 node src/index.js backup --oplog
 
+# Run manual backup with custom read preference
+node src/index.js backup --read-preference secondaryPreferred
+
 # Run manual backup with JSON output
 node src/index.js backup --json
 
-# List backups in bucket
+# List backups in storage
 node src/index.js list
+
+# Describe detailed backup metadata and collection document breakdown without downloading archive
+node src/index.js describe --key mongodb/production/2026-03-10/20260310T020000Z.archive.gz.enc
 
 # Verify integrity and checksum of latest backup
 node src/index.js verify
@@ -119,17 +131,38 @@ node src/index.js verify --key mongodb/production/2026-03-10/20260310T020000Z.ar
 # Restore latest backup to source database (drops collections first)
 node src/index.js restore --drop
 
+# Selective restore of specific collections or patterns
+node src/index.js restore --ns-include "production.users,production.orders*" --drop
+
+# Selective restore with excluded collections
+node src/index.js restore --ns-exclude "production.audit_log" --drop
+
 # Restore with point-in-time oplog replay to an exact second
 node src/index.js restore --oplog-replay --oplog-limit 1774092000:1 --drop
 
+# Restore using base backup + continuous PITR oplog slices
+node src/index.js restore --pitr 2026-03-10T14:30:00Z --drop
+
 # Restore to a different target database or cluster
 node src/index.js restore --key <key> --uri "mongodb://staging:27017" --database staging_db --drop
+
+# Safely delete a backup (blocks if backup anchors active PITR slices)
+node src/index.js delete --key mongodb/production/2026-03-10/20260310T020000Z.archive.gz.enc
+
+# Force delete an active base backup
+node src/index.js delete --key <key> --force
 
 # Simulate retention pruning without deleting files
 node src/index.js prune --dry-run
 
 # Apply retention pruning
 node src/index.js prune
+
+# Prune PITR oplog slices older than a specific timestamp
+node src/index.js oplog:prune --older-than 1774000000:1
+
+# Generate sanitized environment and operational diagnostic bundle
+node src/index.js diagnostic --output ./diagnostic-report.json
 
 # Run manual restore drill
 node src/index.js drill
@@ -141,48 +174,51 @@ node src/index.js drill
 
 Set these variables in `.env` or pass them as system environment variables:
 
-| Variable                       |    Type    |    Default    | Description                                              |
-| :----------------------------- | :--------: | :-----------: | :------------------------------------------------------- |
-| `MONGODB_URI`                  |   String   |  _Required_   | Connection string for source MongoDB instance            |
-| `MONGODB_DATABASE`             |   String   |  _Required_   | Target database name                                     |
-| `MONGODB_EXCLUDE_COLLECTIONS`  |   String   |     `""`      | Comma-delimited list of collections to exclude           |
-| `MONGODB_OPLOG`                |  Boolean   |    `false`    | Capture point-in-time oplog during backup (replica sets) |
-| `MONGODB_PARALLEL_COLLECTIONS` |   Number   |      `2`      | Number of collections dumped concurrently                |
-| `S3_BUCKET`                    |   String   |  _Required_   | Target bucket name                                       |
-| `S3_ACCESS_KEY_ID`             |   String   |  _Required_   | S3 API access key ID                                     |
-| `S3_SECRET_ACCESS_KEY`         |   String   |  _Required_   | S3 API secret access key                                 |
-| `S3_PART_SIZE_MB`              |   Number   |     `32`      | S3 multipart chunk size (32MB handles up to 320GB)       |
-| `S3_QUEUE_SIZE`                |   Number   |      `2`      | Concurrent multipart uploads (controls memory footprint) |
-| `R2_ACCOUNT_ID`                |   String   |   Optional    | Cloudflare Account ID (auto-derives endpoint & region)   |
-| `S3_ENDPOINT`                  |    URL     |   Optional    | Custom S3 endpoint URL (MinIO, Wasabi, AWS)              |
-| `S3_REGION`                    |   String   |   `"auto"`    | S3 region identifier                                     |
-| `S3_FORCE_PATH_STYLE`          |  Boolean   |    `false`    | Enable path-style S3 URLs (required for MinIO)           |
-| `S3_PREFIX`                    |   String   |  `"mongodb"`  | Root prefix key in bucket                                |
-| `BACKUP_CRON`                  |   String   | `"0 2 * * *"` | 5-field cron expression for backup schedule              |
-| `BACKUP_TIMEZONE`              |   String   |    `"UTC"`    | Timezone for cron schedules and directory stamps         |
-| `BACKUP_TIMEOUT_MINUTES`       |   Number   |     `180`     | Process execution timeout                                |
-| `BACKUP_ON_START`              |  Boolean   |    `false`    | Run an immediate backup upon daemon boot                 |
-| `WORK_DIR`                     |    Path    |  OS tmp dir   | Scratch folder for lock files and temp restore streams   |
-| `ENCRYPTION_KEY`               | Base64/Hex |   Optional    | 32-byte master key for AES-256-GCM envelope encryption   |
-| `RETENTION_KEEP_LAST`          |   Number   |   Optional    | Keep N most recent backups                               |
-| `RETENTION_KEEP_DAILY`         |   Number   |   Optional    | Keep 1 backup per day for N days                         |
-| `RETENTION_KEEP_WEEKLY`        |   Number   |   Optional    | Keep 1 backup per week for N weeks                       |
-| `RETENTION_KEEP_MONTHLY`       |   Number   |   Optional    | Keep 1 backup per month for N months                     |
-| `DRILL_MONGODB_URI`            |   String   |   Optional    | Target MongoDB instance for restore drills               |
-| `DRILL_CRON`                   |   String   |   Optional    | Cron schedule for automated restore drills               |
-| `HEARTBEAT_URL`                |    URL     |   Optional    | Healthchecks.io / Cronitor heartbeat ping URL            |
-| `NOTIFY_ON_SUCCESS`            |  Boolean   |    `true`     | Send notifications on successful runs                    |
-| `SLACK_WEBHOOK_URL`            |    URL     |   Optional    | Incoming Slack webhook URL                               |
-| `WEBHOOK_URL`                  |    URL     |   Optional    | Generic webhook URL for status events (POST JSON)        |
-| `SMTP_HOST`                    |   String   |   Optional    | SMTP server hostname                                     |
-| `SMTP_PORT`                    |   Number   |     `587`     | SMTP port                                                |
-| `SMTP_SECURE`                  |  Boolean   |    `false`    | Use TLS directly (port 465)                              |
-| `SMTP_USER`                    |   String   |   Optional    | SMTP username                                            |
-| `SMTP_PASSWORD`                |   String   |   Optional    | SMTP password                                            |
-| `SMTP_FROM`                    |   String   |   Optional    | Email sender address                                     |
-| `SMTP_TO`                      |   String   |   Optional    | Comma-delimited recipient email addresses                |
-| `HTTP_PORT`                    |   Number   |    `8080`     | Port for `/healthz` and `/metrics` server (0 disables)   |
-| `LOG_LEVEL`                    |   String   |   `"info"`    | Log level (`trace`, `debug`, `info`, `warn`, `error`)    |
+| Variable                       |    Type    |       Default        | Description                                                             |
+| :----------------------------- | :--------: | :------------------: | :---------------------------------------------------------------------- |
+| `MONGODB_URI`                  |   String   |      _Required_      | Connection string for source MongoDB instance                           |
+| `MONGODB_DATABASE`             |   String   |         `*`          | Target database name (`*` or `all` for cluster-wide)                    |
+| `MONGODB_EXCLUDE_COLLECTIONS`  |   String   |         `""`         | Comma-delimited list of collections to exclude                          |
+| `MONGODB_OPLOG`                |  Boolean   |       `false`        | Capture point-in-time oplog during backup (replica sets)                |
+| `MONGODB_PARALLEL_COLLECTIONS` |   Number   |         `2`          | Number of collections dumped concurrently                               |
+| `MONGODB_READ_PREFERENCE`      |   String   | `secondaryPreferred` | Read preference for dumps (`secondaryPreferred`, `secondary`, etc.)     |
+| `STORAGE_TYPE`                 |   String   |         `s3`         | Storage backend: `s3` or `filesystem`                                   |
+| `STORAGE_PATH`                 |    Path    |       Optional       | Local or mounted NFS/PVC path (required when `STORAGE_TYPE=filesystem`) |
+| `S3_BUCKET`                    |   String   |      _Required_      | Target bucket name (when `STORAGE_TYPE=s3`)                             |
+| `S3_ACCESS_KEY_ID`             |   String   |      _Required_      | S3 API access key ID (when `STORAGE_TYPE=s3`)                           |
+| `S3_SECRET_ACCESS_KEY`         |   String   |      _Required_      | S3 API secret access key (when `STORAGE_TYPE=s3`)                       |
+| `S3_PART_SIZE_MB`              |   Number   |         `32`         | S3 multipart chunk size (32MB handles up to 320GB)                      |
+| `S3_QUEUE_SIZE`                |   Number   |         `2`          | Concurrent multipart uploads (controls memory footprint)                |
+| `R2_ACCOUNT_ID`                |   String   |       Optional       | Cloudflare Account ID (auto-derives endpoint & region)                  |
+| `S3_ENDPOINT`                  |    URL     |       Optional       | Custom S3 endpoint URL (MinIO, Wasabi, AWS)                             |
+| `S3_REGION`                    |   String   |       `"auto"`       | S3 region identifier                                                    |
+| `S3_FORCE_PATH_STYLE`          |  Boolean   |       `false`        | Enable path-style S3 URLs (required for MinIO)                          |
+| `S3_PREFIX`                    |   String   |     `"mongodb"`      | Root prefix key in bucket                                               |
+| `BACKUP_CRON`                  |   String   |    `"0 2 * * *"`     | 5-field cron expression for backup schedule                             |
+| `BACKUP_TIMEZONE`              |   String   |       `"UTC"`        | Timezone for cron schedules and directory stamps                        |
+| `BACKUP_TIMEOUT_MINUTES`       |   Number   |        `180`         | Process execution timeout                                               |
+| `BACKUP_ON_START`              |  Boolean   |       `false`        | Run an immediate backup upon daemon boot                                |
+| `WORK_DIR`                     |    Path    |      OS tmp dir      | Scratch folder for lock files and temp restore streams                  |
+| `ENCRYPTION_KEY`               | Base64/Hex |       Optional       | 32-byte master key for AES-256-GCM envelope encryption                  |
+| `RETENTION_KEEP_LAST`          |   Number   |       Optional       | Keep N most recent backups                                              |
+| `RETENTION_KEEP_DAILY`         |   Number   |       Optional       | Keep 1 backup per day for N days                                        |
+| `RETENTION_KEEP_WEEKLY`        |   Number   |       Optional       | Keep 1 backup per week for N weeks                                      |
+| `RETENTION_KEEP_MONTHLY`       |   Number   |       Optional       | Keep 1 backup per month for N months                                    |
+| `DRILL_MONGODB_URI`            |   String   |       Optional       | Target MongoDB instance for restore drills                              |
+| `DRILL_CRON`                   |   String   |       Optional       | Cron schedule for automated restore drills                              |
+| `HEARTBEAT_URL`                |    URL     |       Optional       | Healthchecks.io / Cronitor heartbeat ping URL                           |
+| `NOTIFY_ON_SUCCESS`            |  Boolean   |        `true`        | Send notifications on successful runs                                   |
+| `SLACK_WEBHOOK_URL`            |    URL     |       Optional       | Incoming Slack webhook URL                                              |
+| `WEBHOOK_URL`                  |    URL     |       Optional       | Generic webhook URL for status events (POST JSON)                       |
+| `SMTP_HOST`                    |   String   |       Optional       | SMTP server hostname                                                    |
+| `SMTP_PORT`                    |   Number   |        `587`         | SMTP port                                                               |
+| `SMTP_SECURE`                  |  Boolean   |       `false`        | Use TLS directly (port 465)                                             |
+| `SMTP_USER`                    |   String   |       Optional       | SMTP username                                                           |
+| `SMTP_PASSWORD`                |   String   |       Optional       | SMTP password                                                           |
+| `SMTP_FROM`                    |   String   |       Optional       | Email sender address                                                    |
+| `SMTP_TO`                      |   String   |       Optional       | Comma-delimited recipient email addresses                               |
+| `HTTP_PORT`                    |   Number   |        `8080`        | Port for `/healthz` and `/metrics` server (0 disables)                  |
+| `LOG_LEVEL`                    |   String   |       `"info"`       | Log level (`trace`, `debug`, `info`, `warn`, `error`)                   |
 
 ---
 
