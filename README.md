@@ -5,7 +5,7 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-6.0-3178C6.svg)](https://www.typescriptlang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**MongoVault** is an enterprise-grade MongoDB backup engine, continuous Point-in-Time Recovery (PITR) daemon, and CLI tool. Built for production clusters and resource-constrained environments (Kubernetes pods, Docker containers, low-memory VPS instances), MongoVault features a **zero-temporary-disk streaming architecture**. It processes database streams directly through gzip compression, chunked authenticated encryption (`aes-256-gcm-chunked`), and SHA-256 checksum hashing into AWS S3 multipart storage or local filesystems without buffering data on local disk.
+**MongoVault** is a MongoDB backup engine, continuous Point-in-Time Recovery (PITR) daemon, and CLI tool. Built for production clusters and resource-constrained environments (Kubernetes pods, Docker containers, low-memory VPS instances), MongoVault features a **zero-temporary-disk streaming architecture**. It processes database streams directly through gzip compression, chunked authenticated encryption (`aes-256-gcm-chunked`), and SHA-256 checksum hashing into AWS S3 multipart storage or local filesystems without buffering data on local disk.
 
 ---
 
@@ -229,9 +229,9 @@ flowchart TD
     Dump --> Gzip --> Crypto --> Digest --> PassThrough
     PassThrough -->|Multipart Upload| Storage
 
-    Crypto -.->|HMAC Manifest| Storage
+    Crypto -.->|"HMAC Manifest"| Storage
     Scheduler -.->|Metrics| Prometheus
-    Scheduler -.->|Failure/Success Alerts| Alerts
+    Scheduler -.->|"Failure/Success Alerts"| Alerts
 ```
 
 ---
@@ -388,7 +388,7 @@ flowchart LR
     CLI --> Config
     Scheduler --> Config
     Config --> LockMgr
-    LockMgr -.->|Conditional PUT| LockObject
+    LockMgr -.->|"Conditional PUT"| LockObject
     LockMgr --> EngineReg
 
     EngineReg --> LogicalEng
@@ -400,7 +400,7 @@ flowchart LR
     PhysicalEng --> StreamSubsystem
 
     StreamSubsystem --> Gzip --> Crypto --> Digest --> PassThrough
-    PassThrough -->|Multipart Upload| StorageMgr
+    PassThrough -->|"Multipart Upload"| StorageMgr
     StorageMgr --> ArchiveDest
     StorageMgr --> ManifestDest
 ```
@@ -818,13 +818,13 @@ MongoVault guarantees memory safety by using standard Node.js stream backpressur
 
 ```mermaid
 flowchart LR
-    A["mongodump stdout\n(Fast Producer)"] -->|pipe| B["Gzip Transform\n(zlib)"]
-    B -->|pipe| C["ChunkedAeadEncryptStream\n(64 KiB framing)"]
-    C -->|pipe| D["DigestStream\n(SHA-256)"]
-    D -->|pipe\nhighWaterMark: 1 MiB| E["PassThrough Buffer"]
-    E -->|write() == false\nBackpressure Pause| F["S3 Multipart Upload\n(Slow Consumer)"]
+    A["mongodump stdout<br/>(Fast Producer)"] -->|pipe| B["Gzip Transform<br/>(zlib)"]
+    B -->|pipe| C["ChunkedAeadEncryptStream<br/>(64 KiB framing)"]
+    C -->|pipe| D["DigestStream<br/>(SHA-256)"]
+    D -->|"pipe<br/>highWaterMark: 1 MiB"| E["PassThrough Buffer"]
+    E -->|"write() == false<br/>Backpressure Pause"| F["S3 Multipart Upload<br/>(Slow Consumer)"]
 
-    F -.->|drain event\nResume Flow| E
+    F -.->|"drain event<br/>Resume Flow"| E
     E -.->|unpause| D -.->|unpause| C -.->|unpause| B -.->|unpause| A
 ```
 
@@ -1017,24 +1017,24 @@ MongoVault prevents race conditions using a two-tier hybrid lock (`src/lock.ts`)
 ```mermaid
 stateDiagram-v2
     [*] --> LocalLock: Request backup execution
-    LocalLock --> CheckLocal: fs.writeFile(workDir/.backup.lock, wx)
+    LocalLock --> CheckLocal: Create local lockfile with wx flag
 
-    CheckLocal --> StaleCheck: EEXIST (File already exists)
-    CheckLocal --> DistributedLock: Success (Local lock acquired)
+    CheckLocal --> StaleCheck: File already exists (EEXIST)
+    CheckLocal --> DistributedLock: Local lock acquired
 
-    StaleCheck --> IsStale: Check mtime > staleAfterMs AND PID dead?
-    IsStale --> StealLock: Yes (Stale lock detected)
-    IsStale --> RejectExecution: No (Active process running)
+    StaleCheck --> IsStale: Inspect holding PID and mtime
+    IsStale --> StealLock: Stale lock detected
+    IsStale --> RejectExecution: Active process running
 
-    StealLock --> AtomicRename: fs.rename(lock, lock.stale.uuid)
+    StealLock --> AtomicRename: Atomic rename tombstone
     AtomicRename --> LocalLock: Removed tombstone; retry acquisition
     AtomicRename --> RejectExecution: Rename failed (Lost race)
 
-    DistributedLock --> CheckS3: S3 PutObject(IfNoneMatch: "*")
+    DistributedLock --> CheckS3: S3 PutObject with IfNoneMatch conditional
     CheckS3 --> HeartbeatStart: 200 OK (Distributed lease acquired)
     CheckS3 --> ReleaseLocalAndExit: 412 PreconditionFailed (Lease held)
 
-    HeartbeatStart --> RunningBackup: Start background refresh (every 30s)
+    HeartbeatStart --> RunningBackup: Heartbeat refresh every 30s
     RunningBackup --> ReleaseAll: Backup finishes or aborts
     ReleaseLocalAndExit --> [*]
     RejectExecution --> [*]
@@ -1175,24 +1175,24 @@ Day 1 (02:00)                          Day 1 (14:30:15)                Day 2 (02
 
 ```mermaid
 flowchart TD
-    A["Operator requests PITR\n(--pitr 2026-03-10T14:30:15Z)"] --> B["Parse Target Timestamp\n(1773153015:4294967295)"]
-    B --> C["resolvePitrPlan()\nFind newest base backup <= target"]
-    C --> D{"Base backup\nfound?"}
+    A["Operator requests PITR<br/>(--pitr 2026-03-10T14:30:15Z)"] --> B["Parse Target Timestamp<br/>(1773153015:4294967295)"]
+    B --> C["resolvePitrPlan()<br/>Find newest base backup at or prior to target"]
+    C --> D{"Base backup<br/>found?"}
     D -- No --> E["Error: No base backup prior to target"]
-    D -- Yes --> F["Gather candidate slices\n(baseEndTs to targetTs)"]
+    D -- Yes --> F["Gather candidate slices<br/>(baseEndTs to targetTs)"]
 
-    F --> G["Verify Oplog Chain Contiguity\n(Check previousEndTs & gaps)"]
-    G --> H{"Gap detected or\nmissing slices?"}
-    H -- Yes --> I["Error: PITR timeline gap detected\nOplog rolled over"]
-    H -- No --> J["Stage 1: Restore Base Backup\n(Stream & drop target tables)"]
+    F --> G["Verify Oplog Chain Contiguity<br/>(Check previousEndTs & gaps)"]
+    G --> H{"Gap detected or<br/>missing slices?"}
+    H -- Yes --> I["Error: PITR timeline gap detected<br/>Oplog rolled over"]
+    H -- No --> J["Stage 1: Restore Base Backup<br/>(Stream & drop target tables)"]
 
     J --> K["Stage 2: Sequential Slice Replay"]
-    K --> L["Download & decrypt slice to\n.pitr-slice-uuid.oplog.bson"]
-    L --> M["mongorestore --oplogReplay\n--oplogLimit=1773153015:4294967295"]
+    K --> L["Download & decrypt slice to<br/>.pitr-slice-uuid.oplog.bson"]
+    L --> M["mongorestore --oplogReplay<br/>--oplogLimit=1773153015:4294967295"]
     M --> N["Delete temporary slice file"]
-    N --> O{"More slices\nin plan?"}
+    N --> O{"More slices<br/>in plan?"}
     O -- Yes --> L
-    O -- No --> P["PITR Restore Complete\n(Database restored to exact second)"]
+    O -- No --> P["PITR Restore Complete<br/>(Database restored to exact second)"]
 ```
 
 ---
@@ -1742,10 +1742,10 @@ Configuration settings are validated at startup via Zod (`src/config.ts`).
 ### Memory Footprint and S3 Multipart Sizing
 
 MongoVault does not buffer dumps to disk. The streaming memory footprint is determined by:
-$$\text{Memory Footprint} \approx (\text{S3\_PART\_SIZE\_MB} \times \text{S3\_QUEUE\_SIZE}) + \text{Node Stream Buffers}$$
+$$\text{Memory Footprint} \approx (\text{Part Size} \times \text{Queue Size}) + \text{Stream Buffers}$$
 
 With defaults (`S3_PART_SIZE_MB=32`, `S3_QUEUE_SIZE=2`):
-$$\text{Memory} \approx (32\text{ MiB} \times 2) + \text{PassThrough}(1\text{ MiB}) \approx 65\text{--}75\text{ MiB}$$
+$$\text{Memory} \approx (32\text{ MiB} \times 2) + 1\text{ MiB} \approx 65\text{--}75\text{ MiB}$$
 
 #### S3 Part Sizing vs Maximum Archive Size
 
@@ -1775,7 +1775,7 @@ When using `--engine physical`:
 
 When using `--sharding`:
 
-1. **Balancer Drain Window:** MongoVault stops the cluster balancer and waits up to 30 seconds for in-flight chunk migrations to complete. If a migration round cannot conclude within 30 seconds, it logs a warning and proceeds.
+1. **Balancer Drain Window:** MongoVault stops the cluster balancer and waits up to 30 seconds for in-flight chunk migrations to complete. If a migration round cannot conclude within 30 seconds, it aborts the backup with an `ActiveChunkMigrationError` to guarantee strict cross-shard consistency and eliminate duplicate or missing documents.
 2. **Network Direct Access:** MongoVault derives direct shard replica set URIs using the seed host addresses stored in `config.shards`. The host running MongoVault must have network route access to every individual shard host, not merely the `mongos` router.
 
 ---
@@ -1783,8 +1783,8 @@ When using `--sharding`:
 ### Recovery Objectives (RPO and RTO)
 
 - **Recovery Point Objective (RPO):**
-  - Logical / Physical Backups: $\text{RPO} = \text{Backup Frequency}$ (e.g., 24 hours with daily cron).
-  - Continuous PITR: $\text{RPO} \le \text{PITR\_FLUSH\_INTERVAL\_SECONDS}$ (default: 60 seconds; reducible to 5 seconds).
+  - Logical / Physical Backups: `RPO = Backup Frequency` (e.g., 24 hours with daily cron).
+  - Continuous PITR: `RPO ≤ PITR_FLUSH_INTERVAL_SECONDS` (default: 60 seconds; reducible to 5 seconds).
 - **Recovery Time Objective (RTO):**
   - Logical Engine: Moderate (governed by network download speed and index rebuild time).
   - Physical Engine: Minimal (governed purely by network download speed and disk write throughput).
