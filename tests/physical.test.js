@@ -117,4 +117,137 @@ describe("physical backup engine", () => {
     expect(attempts).toBe(2);
     expect(cursor).toBeDefined();
   });
+
+  it("trims dbPath prefix from absolute $backupCursor filenames", async () => {
+    const { trimDbPathPrefix } = await import("../src/physical.js");
+    expect(trimDbPathPrefix("/var/lib/mongodb/WiredTiger.wt", "/var/lib/mongodb")).toBe(
+      "WiredTiger.wt",
+    );
+    expect(
+      trimDbPathPrefix("/var/lib/mongodb/journal/WiredTigerLog.0000000001", "/var/lib/mongodb/"),
+    ).toBe("journal/WiredTigerLog.0000000001");
+    expect(trimDbPathPrefix("collection-0-123.wt", "/var/lib/mongodb")).toBe("collection-0-123.wt");
+  });
+
+  it("executes full physical backup and restore with $backupCursor and $backupCursorExtend", async () => {
+    const { runPhysicalBackup, restorePhysicalBackup } = await import("../src/physical.js");
+    const { createFilesystemStorage } = await import("../src/storage.js");
+
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "mv-phys-e2e-"));
+    const sourceDbPath = path.join(tempRoot, "source-db");
+    const restoreDbPath = path.join(tempRoot, "restore-db");
+    const bucketDir = path.join(tempRoot, "bucket");
+
+    await fs.mkdir(path.join(sourceDbPath, "journal"), { recursive: true });
+    await fs.writeFile(path.join(sourceDbPath, "WiredTiger.wt"), "WT_ROOT_DATA");
+    await fs.writeFile(
+      path.join(sourceDbPath, "journal", "WiredTigerLog.0000000001"),
+      "WT_JOURNAL_DATA",
+    );
+
+    const storage = createFilesystemStorage({ basePath: bucketDir });
+    const mockLogger = {
+      child() {
+        return this;
+      },
+      info() {},
+      warn() {},
+      error() {},
+      debug() {},
+    };
+
+    const mockClient = {
+      async connect() {},
+      async close() {},
+      db(name) {
+        if (name === "admin") {
+          return {
+            aggregate(pipeline) {
+              if (pipeline[0]?.$backupCursor) {
+                const docs = [
+                  {
+                    metadata: {
+                      backupId: "b-1",
+                      dbpath: sourceDbPath,
+                      checkpointTimestamp: { t: 1774092000, i: 1 },
+                    },
+                  },
+                  {
+                    filename: path.join(sourceDbPath, "WiredTiger.wt"),
+                  },
+                ];
+                let idx = 0;
+                return {
+                  async next() {
+                    return docs[idx++] ?? null;
+                  },
+                  async *[Symbol.asyncIterator]() {
+                    while (idx < docs.length) {
+                      yield docs[idx++];
+                    }
+                  },
+                  async close() {},
+                };
+              }
+              if (pipeline[0]?.$backupCursorExtend) {
+                const jDocs = [
+                  {
+                    filename: path.join(sourceDbPath, "journal", "WiredTigerLog.0000000001"),
+                  },
+                ];
+                return {
+                  async *[Symbol.asyncIterator]() {
+                    for (const d of jDocs) yield d;
+                  },
+                  async close() {},
+                };
+              }
+              throw new Error("Unexpected pipeline");
+            },
+            async command() {
+              return { ok: 1 };
+            },
+          };
+        }
+        return {};
+      },
+    };
+
+    const config = {
+      mongo: { uri: "mongodb://localhost:27017", database: "*" },
+      storage: { prefix: "phys-test" },
+      encryptionKey: Buffer.alloc(32, 9),
+    };
+
+    const backupRes = await runPhysicalBackup({
+      config,
+      storage,
+      logger: mockLogger,
+      dbPath: sourceDbPath,
+      createMongoClient: () => mockClient,
+    });
+
+    expect(backupRes.filesCount).toBe(2);
+    expect(backupRes.manifest.physical?.cursorType).toBe("$backupCursor");
+    expect(backupRes.manifest.oplogWindow?.endTs).toBe("1774092000:1");
+
+    const restoreRes = await restorePhysicalBackup({
+      config,
+      storage,
+      logger: mockLogger,
+      targetDbPath: restoreDbPath,
+      ref: "latest",
+    });
+
+    expect(restoreRes.restoredFiles).toBe(2);
+    const restoredWt = await fs.readFile(path.join(restoreDbPath, "WiredTiger.wt"), "utf8");
+    const restoredJournal = await fs.readFile(
+      path.join(restoreDbPath, "journal", "WiredTigerLog.0000000001"),
+      "utf8",
+    );
+    expect(restoredWt).toBe("WT_ROOT_DATA");
+    expect(restoredJournal).toBe("WT_JOURNAL_DATA");
+
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  });
 });

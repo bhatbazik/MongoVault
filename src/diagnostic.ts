@@ -1,6 +1,6 @@
 import os from "node:os";
 import { MongoClient } from "mongodb";
-import { listBackups, readManifest, scopeOf } from "./catalog.js";
+import { databasePrefix, listBackups, readManifest, scopeOf } from "./catalog.js";
 import { readLock } from "./lock.js";
 import { maskMongoUri } from "./mongo.js";
 import { checkDatabaseTools } from "./tools.js";
@@ -134,8 +134,12 @@ export async function generateDiagnosticBundle({
     const lockFile = `${config.workDir}/.backup.lock`;
     localLock = (await readLock(lockFile)) as Record<string, unknown> | null;
     if (typeof storage.getJson === "function") {
-      const dist = await storage.getJson(`${config.storage.prefix}/locks/backup.lock`);
-      distributedLock = dist?.data as Record<string, unknown> | null;
+      const primaryLockKey = `${databasePrefix(scope)}.locks/backup.lock.json`;
+      const legacyLockKey = `${config.storage.prefix}/locks/backup.lock`;
+      const dist =
+        (await storage.getJson(primaryLockKey).catch(() => null)) ??
+        (await storage.getJson(legacyLockKey).catch(() => null));
+      distributedLock = (dist?.data as Record<string, unknown> | null) ?? null;
     }
   } catch {}
 

@@ -6,7 +6,7 @@ import type { Logger } from "./types/logger.js";
 import type { EmailOptions, NotificationFailureContext, Notifier } from "./types/notify.js";
 
 /**
- * Strategy interface for notification delivery channels.
+ * Interface for notification delivery channels.
  */
 export interface NotificationChannel {
   readonly name: string;
@@ -15,7 +15,7 @@ export interface NotificationChannel {
 }
 
 /**
- * Encapsulates notification message formatting and payload generation (SRP).
+ * Formats notification messages and webhook payloads.
  */
 export class NotificationMessageBuilder {
   constructor(private readonly defaultDatabase: string) {}
@@ -275,7 +275,7 @@ export class WebhookNotificationChannel implements NotificationChannel {
 }
 
 /**
- * Composite notifier that coordinates dispatch to all configured channels (Composite Pattern).
+ * Dispatches notifications across all configured channels.
  */
 export class CompositeNotifier implements Notifier {
   private readonly channels: NotificationChannel[] = [];

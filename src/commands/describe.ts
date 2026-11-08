@@ -16,6 +16,7 @@ export class DescribeCommand implements CommandHandler {
         console.log("\nBackup Metadata Details");
         console.log("=======================");
         console.log(`Key:          ${manifest.key}`);
+        console.log(`Engine:       ${(manifest.engine || "logical").toUpperCase()}`);
         console.log(`Database:     ${manifest.database}`);
         console.log(`Created At:   ${formatDate(manifest.createdAt)}`);
         console.log(`Completed At: ${formatDate(manifest.completedAt)}`);
@@ -33,6 +34,21 @@ export class DescribeCommand implements CommandHandler {
         if (manifest.oplogWindow) {
           console.log(
             `Oplog Window: ${manifest.oplogWindow.startTs} -> ${manifest.oplogWindow.endTs}`,
+          );
+        }
+        if (manifest.physical) {
+          console.log(
+            `Physical:     ${manifest.physical.cursorType} (${manifest.physical.filesCount} files, dbPath: ${manifest.physical.dbPath})`,
+          );
+        }
+        if (manifest.snapshot) {
+          console.log(
+            `Snapshot:     ${manifest.snapshot.provider} (${manifest.snapshot.snapshotId}, volume: ${manifest.snapshot.volumeId})`,
+          );
+        }
+        if (manifest.sharding) {
+          console.log(
+            `Sharding:     ${Object.keys(manifest.sharding.shards).length} shards (clusterTime: ${manifest.sharding.clusterTime})`,
           );
         }
         if (manifest.excludedCollections && manifest.excludedCollections.length > 0) {

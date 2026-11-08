@@ -1,6 +1,15 @@
 import { spawn } from "node:child_process";
 import { MongoClient } from "mongodb";
-import { MANIFEST_VERSION, manifestKey, scopeOf } from "./catalog.js";
+import {
+  MANIFEST_VERSION,
+  databasePrefix,
+  readManifest,
+  resolveBackup,
+  resolveKeyRing,
+  scopeOf,
+  writeManifest,
+} from "./catalog.js";
+import { verifyManifest } from "./crypto.js";
 import { formatDuration } from "./format.js";
 import { fromBsonTimestamp } from "./oplog.js";
 import type { BackupManifest, CloudSnapshotMeta } from "./types/catalog.js";
@@ -68,7 +77,37 @@ export class CommandHookSnapshotDriver implements CloudSnapshotDriver {
     targetZone?: string;
     signal?: AbortSignal;
   }): Promise<{ newVolumeId: string }> {
-    return { newVolumeId: `vol-restored-${params.snapshotId}` };
+    const env = {
+      ...process.env,
+      SNAPSHOT_ID: params.snapshotId,
+      ...(params.targetZone ? { SNAPSHOT_TARGET_ZONE: params.targetZone } : {}),
+    };
+
+    return new Promise((resolve, reject) => {
+      const child = spawn(this.commandHook, ["restore", params.snapshotId], { env });
+      let stdout = "";
+      let stderr = "";
+      child.stdout?.on("data", (chunk: Buffer) => {
+        stdout += chunk.toString();
+      });
+      child.stderr?.on("data", (chunk: Buffer) => {
+        stderr += chunk.toString();
+      });
+
+      child.on("close", (code) => {
+        if (code === 0) {
+          const newVolumeId = stdout.trim() || `vol-restored-${params.snapshotId}`;
+          resolve({ newVolumeId });
+        } else {
+          reject(
+            new Error(
+              `Snapshot restore command hook failed with code ${code}: ${stderr || stdout}`,
+            ),
+          );
+        }
+      });
+      child.on("error", reject);
+    });
   }
 }
 
@@ -104,7 +143,7 @@ export class BuiltinCloudSnapshotDriver implements CloudSnapshotDriver {
 }
 
 /**
- * Creates a command-based or cloud provider snapshot driver (Factory Pattern).
+ * Creates a command-based or cloud provider snapshot driver.
  */
 export function createSnapshotDriver(options: SnapshotDriverOptions): CloudSnapshotDriver {
   const { provider, volumeId, commandHook } = options;
@@ -197,7 +236,7 @@ export async function runCloudSnapshot({
     const completedAt = new Date();
     const durationMs = completedAt.getTime() - startedAt.getTime();
     const scope = scopeOf(config);
-    const key = `${scope.prefix}/${scope.database}/${startedAt.toISOString().slice(0, 10)}/${snapResult.snapshotId}.snapshot`;
+    const key = `${databasePrefix(scope)}${startedAt.toISOString().slice(0, 10)}/${snapResult.snapshotId}.snapshot`;
 
     const snapshotMeta: CloudSnapshotMeta = {
       provider: config.snapshot?.provider || "aws-ebs",
@@ -221,12 +260,18 @@ export async function runCloudSnapshot({
       compression: "none",
       encryption: null,
       oplog: Boolean(clusterTime),
+      oplogWindow: clusterTime
+        ? {
+            startTs: clusterTime,
+            endTs: clusterTime,
+          }
+        : undefined,
       excludedCollections: [],
       collections: {},
       snapshot: snapshotMeta,
     };
 
-    await storage.putJson(manifestKey(key), manifest);
+    await writeManifest(storage, manifest, config.encryptionKey);
 
     log.info(
       {
@@ -260,13 +305,24 @@ export async function restoreCloudSnapshot({
   targetZone,
   signal,
 }: SnapshotRestoreOptions): Promise<SnapshotRestoreResult> {
-  const log = logger.child({ ref });
+  const scope = scopeOf(config);
+  const resolvedKey =
+    ref === "latest" && typeof storage.list === "function"
+      ? await resolveBackup(storage, scope, ref)
+      : ref;
+
+  const log = logger.child({ ref: resolvedKey });
   log.info("Resolving snapshot manifest for restore");
 
-  const manifest = await storage.getJson<BackupManifest>(manifestKey(ref));
-  const snapshotMeta = manifest?.data?.snapshot;
-  if (!snapshotMeta) {
-    throw new Error(`No cloud snapshot metadata found in manifest for ${ref}`);
+  const manifest = await readManifest(storage, resolvedKey);
+  const snapshotMeta = manifest?.snapshot;
+  if (!manifest || !snapshotMeta) {
+    throw new Error(`No cloud snapshot metadata found in manifest for ${resolvedKey}`);
+  }
+
+  const keyRing = resolveKeyRing(config);
+  if (manifest.encryption?.manifestHmac && keyRing.length > 0) {
+    verifyManifest(keyRing, manifest);
   }
 
   const effectiveDriver =

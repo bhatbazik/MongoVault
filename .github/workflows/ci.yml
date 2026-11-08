@@ -26,6 +26,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Typecheck, lint, format check, and build
+        run: npm run check
+
       - name: Run test suite
         run: npm test
 
@@ -44,6 +47,6 @@ jobs:
         with:
           context: .
           push: false
-          tags: mongodb-backup-service:latest
+          tags: mongovault:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max

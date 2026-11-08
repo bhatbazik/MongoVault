@@ -1,8 +1,8 @@
 import path from "node:path";
 import cron, { type ScheduledTask } from "node-cron";
-import { runBackup } from "./backup.js";
 import { databasePrefix, scopeOf } from "./catalog.js";
 import { runDrill } from "./drill.js";
+import { EngineRegistry } from "./engines.js";
 import { acquireHybridLock } from "./lock.js";
 import { startOplogArchiver } from "./oplog.js";
 import { prune } from "./retention.js";
@@ -63,7 +63,8 @@ export function createScheduler({
     activeAbortController = new AbortController();
 
     try {
-      activeBackupPromise = runBackup({
+      const engine = EngineRegistry.resolveForBackup({ config });
+      activeBackupPromise = engine.backup({
         config,
         storage,
         logger,

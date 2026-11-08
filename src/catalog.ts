@@ -10,8 +10,9 @@ import type { StorageClient, StorageObject } from "./types/storage.js";
 export const MANIFEST_SUFFIX = ".manifest.json";
 export const MANIFEST_VERSION = 2;
 
-const ARCHIVE = /\.archive\.gz(\.enc)?$/;
-const STAMP = /(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z\.archive/;
+const ARCHIVE = /\.(?:archive\.gz|physical\.tar\.gz|snapshot|cluster)(\.enc)?$/;
+const STAMP =
+  /(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(?:\.\d+)?Z\.(?:archive|physical|cluster)/;
 
 export function isClusterScope(database?: string | null): boolean {
   return !database || database === "*" || database === "all";
@@ -102,7 +103,7 @@ export async function readManifest(
 }
 
 /**
- * Signs manifest if encryptionKey is provided and uploads it to storage (DRY).
+ * Signs manifest if encryptionKey is provided and uploads it to storage.
  */
 export async function writeManifest(
   storage: StorageClient,
@@ -116,7 +117,7 @@ export async function writeManifest(
 }
 
 /**
- * Resolves the active key ring from config (DRY).
+ * Resolves the active key ring from config.
  */
 export function resolveKeyRing(config: {
   encryptionKeyRing?: Buffer[];

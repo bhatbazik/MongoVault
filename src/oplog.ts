@@ -212,9 +212,36 @@ export async function getOplogBounds(
         .limit(1)
         .next(),
     ]);
+
+    const oldestTs = fromBsonTimestamp(oldestDoc?.ts);
+    let newestTs = fromBsonTimestamp(newestDoc?.ts);
+
+    // Check config.transactions for uncommitted/prepared distributed transactions
+    // so long-running transactions started before the snapshot aren't missed
+    try {
+      const configDb = client.db("config");
+      const txCol =
+        configDb && typeof configDb.collection === "function"
+          ? configDb.collection("transactions")
+          : null;
+      if (txCol && typeof txCol.find === "function") {
+        const activeTx = await txCol
+          .find({ state: { $in: ["prepared", "inProgress"] } })
+          .sort({ startOpTime: 1 })
+          .limit(1)
+          .next();
+        const txTs = fromBsonTimestamp(activeTx?.startOpTime?.ts);
+        if (txTs && newestTs && compareTimestamps(txTs, newestTs) < 0) {
+          newestTs = txTs;
+        }
+      }
+    } catch {
+      // Ignore if config.transactions is inaccessible or mocked
+    }
+
     return {
-      oldestTs: fromBsonTimestamp(oldestDoc?.ts),
-      newestTs: fromBsonTimestamp(newestDoc?.ts),
+      oldestTs,
+      newestTs,
     };
   } finally {
     await client.close().catch(() => {});
@@ -504,6 +531,12 @@ export async function resolvePitrPlan(
 
   for (const slice of candidateSlices) {
     const sliceManifest = await readManifest(storage, slice.key);
+    if (sliceManifest?.oplogWindow?.gapDetected) {
+      throw new Error(
+        `PITR timeline gap detected before slice ${slice.key} (oplog rolled over after ${formatOplogTimestamp(expectedPrevEndTs)})`,
+      );
+    }
+
     const prevEndStr = sliceManifest?.oplogWindow?.previousEndTs;
     const prevEndTs = prevEndStr ? parseOplogTimestamp(prevEndStr) : null;
 

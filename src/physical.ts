@@ -4,8 +4,16 @@ import { PassThrough, Readable } from "node:stream";
 import { createGunzip, createGzip } from "node:zlib";
 import { MongoClient } from "mongodb";
 import { linkedController, settleAll } from "./abort.js";
-import { MANIFEST_VERSION, archiveKey, manifestKey, scopeOf } from "./catalog.js";
-import { createDecryptor, createEncryptor, signManifest, verifyManifest } from "./crypto.js";
+import {
+  MANIFEST_VERSION,
+  archiveKey,
+  readManifest,
+  resolveBackup,
+  resolveKeyRing,
+  scopeOf,
+  writeManifest,
+} from "./catalog.js";
+import { createDecryptor, createEncryptor, verifyManifest } from "./crypto.js";
 import { DigestStream } from "./digest.js";
 import { formatBytes, formatDuration } from "./format.js";
 import { formatOplogTimestamp } from "./oplog.js";
@@ -32,6 +40,19 @@ export { createTarHeader, createTarPackStream, generateTarStream, extractTarStre
 const CURSOR_CREATE_RETRIES = 10;
 const OPEN_CONFLICT_WITH_CHECKPOINT_ERR_CODE = 50915;
 const OPLOG_ROLLED_OVER_ERR_CODE = 50917;
+
+/**
+ * Strips dbPath prefix from a file path returned by $backupCursor / $backupCursorExtend
+ * and normalizes it to a clean relative POSIX path.
+ */
+export function trimDbPathPrefix(filename: string, dbPath: string): string {
+  const normFile = filename.replace(/\\/g, "/");
+  const normDbPath = dbPath.replace(/\\/g, "/").replace(/\/+$/, "");
+  const stripped = normFile.startsWith(`${normDbPath}/`)
+    ? normFile.slice(normDbPath.length + 1)
+    : normFile.replace(/^\/+/, "");
+  return path.posix.normalize(stripped).replace(/^(\.\.\/)+/, "");
+}
 
 /**
  * Creates $backupCursor with retries on WiredTiger checkpoint conflict.
@@ -207,9 +228,41 @@ export async function runPhysicalBackup({
         while (await cursor.hasNext()) {
           const doc = (await cursor.next()) as BackupCursorFile | null;
           if (doc?.filename) {
-            const fullPath = path.join(resolvedDbPath, doc.filename);
+            const relName = trimDbPathPrefix(doc.filename, resolvedDbPath);
+            const fullPath = path.join(resolvedDbPath, relName);
             const size = doc.fileLen || doc.fileSize || 0;
-            filesToArchive.push({ name: doc.filename, fullPath, size });
+            if (!filesToArchive.some((f) => f.name === relName)) {
+              filesToArchive.push({ name: relName, fullPath, size });
+            }
+          }
+        }
+
+        // Request extended journal files via $backupCursorExtend if supported.
+        const extendTargetTs = cursorMeta?.oplogEnd?.ts || cursorMeta?.checkpointTimestamp;
+        if (cursorMeta?.backupId && extendTargetTs) {
+          try {
+            const extCursor = admin.aggregate([
+              {
+                $backupCursorExtend: {
+                  backupId: cursorMeta.backupId,
+                  timestamp: extendTargetTs,
+                },
+              },
+            ]);
+            while (await extCursor.hasNext()) {
+              const jDoc = (await extCursor.next()) as BackupCursorFile | null;
+              if (jDoc?.filename) {
+                const relName = trimDbPathPrefix(jDoc.filename, resolvedDbPath);
+                const fullPath = path.join(resolvedDbPath, relName);
+                const size = jDoc.fileLen || jDoc.fileSize || 0;
+                if (!filesToArchive.some((f) => f.name === relName)) {
+                  filesToArchive.push({ name: relName, fullPath, size });
+                }
+              }
+            }
+            await extCursor.close().catch(() => {});
+          } catch {
+            // $backupCursorExtend is optional if server does not support it
           }
         }
 
@@ -304,6 +357,15 @@ export async function runPhysicalBackup({
       runStreamPipeline(stages, { signal: controller.signal }),
     ]);
 
+    if (typeof storage.head === "function") {
+      const stored = await storage.head(key);
+      if (stored && stored.size !== digest.bytes) {
+        throw new Error(
+          `Physical backup upload verification failed: expected ${digest.bytes} bytes, found ${stored.size}`,
+        );
+      }
+    }
+
     // Unlock MongoDB write lock if acquired
     if (locked) {
       await client
@@ -319,6 +381,8 @@ export async function runPhysicalBackup({
 
     const physicalMeta: PhysicalBackupMeta = {
       dbPath: resolvedDbPath,
+      cursorType: cursorMeta ? "$backupCursor" : "fsyncLock",
+      filesCount: filesToArchive.length,
       files: filesToArchive.map((f) => ({ name: f.name, size: f.size })),
       checkpointTimestamp: cursorMeta?.checkpointTimestamp
         ? formatOplogTimestamp(cursorMeta.checkpointTimestamp)
@@ -328,6 +392,9 @@ export async function runPhysicalBackup({
         : undefined,
       oplogEnd: cursorMeta?.oplogEnd?.ts ? formatOplogTimestamp(cursorMeta.oplogEnd.ts) : undefined,
     };
+
+    const effectiveStartTs = physicalMeta.oplogStart || physicalMeta.checkpointTimestamp;
+    const effectiveEndTs = physicalMeta.oplogEnd || physicalMeta.checkpointTimestamp;
 
     const manifest: BackupManifest = {
       version: MANIFEST_VERSION,
@@ -342,17 +409,21 @@ export async function runPhysicalBackup({
       sha256: digest.digest(),
       compression: "gzip",
       encryption: encryptor?.envelope() ?? null,
-      oplog: Boolean(cursorMeta?.oplogEnd),
+      oplog: Boolean(effectiveEndTs),
+      ...(effectiveStartTs && effectiveEndTs
+        ? {
+            oplogWindow: {
+              startTs: effectiveStartTs,
+              endTs: effectiveEndTs,
+            },
+          }
+        : {}),
       excludedCollections: [],
       collections: {},
       physical: physicalMeta,
     };
 
-    if (manifest.encryption && config.encryptionKey) {
-      manifest.encryption.manifestHmac = signManifest(config.encryptionKey, manifest);
-    }
-
-    await storage.putJson(manifestKey(key), manifest);
+    await writeManifest(storage, manifest, config.encryptionKey);
 
     log.info(
       {
@@ -364,6 +435,11 @@ export async function runPhysicalBackup({
     );
 
     return { manifest, filesCount: filesToArchive.length, totalBytes: digest.bytes };
+  } catch (error) {
+    if (typeof storage.remove === "function") {
+      await storage.remove(key).catch(() => {});
+    }
+    throw error;
   } finally {
     if (keepAliveTimer) clearInterval(keepAliveTimer);
     if (cursor) {
@@ -394,11 +470,14 @@ export async function restorePhysicalBackup({
   const log = logger.child({ targetDbPath });
   log.info({ ref }, "Starting physical backup restore");
 
-  const manifest = await storage.getJson<BackupManifest>(manifestKey(ref));
-  const backupKey = manifest?.data?.key || ref;
-  const manifestData = manifest?.data;
+  const resolvedRef =
+    ref === "latest" && typeof storage.list === "function"
+      ? await resolveBackup(storage, scopeOf(config), ref)
+      : ref;
+  const manifestData = await readManifest(storage, resolvedRef);
+  const backupKey = manifestData?.key || resolvedRef;
 
-  const keyRing = config.encryptionKeyRing || (config.encryptionKey ? [config.encryptionKey] : []);
+  const keyRing = resolveKeyRing(config);
   if (manifestData?.encryption) {
     if (keyRing.length === 0) {
       throw new Error(`Physical backup ${backupKey} is encrypted, but ENCRYPTION_KEY is not set`);
@@ -425,9 +504,15 @@ export async function restorePhysicalBackup({
   if (manifestData?.sha256 && manifestData.sha256 !== digest.digest()) {
     throw new Error(`Checksum mismatch: expected ${manifestData.sha256}, got ${digest.digest()}`);
   }
+  if (manifestData?.size !== undefined && manifestData.size !== digest.bytes) {
+    throw new Error(
+      `Size mismatch for ${backupKey}: expected ${manifestData.size}, got ${digest.bytes}`,
+    );
+  }
 
-  // Remove any stale lock file in target dbPath
+  // Remove any stale lock files in target dbPath (mongod.lock, WiredTiger.lock)
   await fs.rm(path.join(targetDbPath, "mongod.lock"), { force: true }).catch(() => {});
+  await fs.rm(path.join(targetDbPath, "WiredTiger.lock"), { force: true }).catch(() => {});
 
   log.info(
     {

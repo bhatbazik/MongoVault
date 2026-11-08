@@ -36,7 +36,7 @@ export interface RestoreEngineOptions {
 }
 
 /**
- * Strategy interface for backup & restore execution engines (Strategy Pattern).
+ * Interface for backup and restore execution engines.
  */
 export interface BackupEngineStrategy {
   readonly name: string;
@@ -161,7 +161,7 @@ export class ShardedBackupEngine implements BackupEngineStrategy {
 }
 
 /**
- * Registry of available backup & restore engines (Registry Pattern / OCP).
+ * Registry of available backup and restore engines.
  */
 export class EngineRegistry {
   private static readonly engines = new Map<string, BackupEngineStrategy>([
@@ -212,15 +212,24 @@ export class EngineRegistry {
     sharding?: boolean;
     config: AppConfig;
   }): BackupEngineStrategy {
-    if (params.dbPath) {
+    if (
+      params.dbPath ||
+      params.engine === "physical" ||
+      /\.physical\.tar\.gz(\.enc)?$/.test(params.key || "")
+    ) {
       return this.get("physical");
     }
     if (params.engine === "snapshot" || params.key?.endsWith(".snapshot")) {
       return this.get("snapshot");
     }
-    if (params.sharding) {
+    if (
+      params.sharding ||
+      params.engine === "sharded" ||
+      /\.cluster(\.enc)?$/.test(params.key || "") ||
+      params.config.sharding?.enabled
+    ) {
       return this.get("sharded");
     }
-    return this.get(params.engine || "logical");
+    return this.get(params.engine || params.config.engine || "logical");
   }
 }

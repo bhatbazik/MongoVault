@@ -1,10 +1,10 @@
 import path from "node:path";
 import { MongoClient } from "mongodb";
-import { listBackups, readManifest, scopeOf } from "./catalog.js";
+import { databasePrefix, listBackups, readManifest, scopeOf } from "./catalog.js";
 import { formatBytes, formatDate } from "./format.js";
 import { readLock } from "./lock.js";
 import { inspectMongoCluster } from "./mongo.js";
-import { formatOplogTimestamp, listOplogSlices } from "./oplog.js";
+import { formatOplogTimestamp, listOplogSlices, pitrStateKey } from "./oplog.js";
 import type { AppConfig } from "./types/config.js";
 import type { Logger } from "./types/logger.js";
 import type {
@@ -119,6 +119,16 @@ export async function getStatus({
           break;
         }
       }
+
+      if (timelineContinuous && typeof storage.getJson === "function") {
+        const pitrState = await storage
+          .getJson<{ gapDetected?: boolean; lastSliceKey?: string }>(pitrStateKey(scope))
+          .catch(() => null);
+        if (pitrState?.data?.gapDetected) {
+          timelineContinuous = false;
+          gapWarning = `Gap flagged in ${pitrState.data.lastSliceKey || "PITR state"}`;
+        }
+      }
     }
 
     pitr = {
@@ -152,10 +162,15 @@ export async function getStatus({
       data?: { holder?: string; acquiredAt?: string; expiresAt?: number };
     } | null = null;
     if (typeof storage.getJson === "function") {
-      const lockKey = `${config.storage.prefix}/locks/backup.lock`;
-      distributed = await storage
-        .getJson<{ holder?: string; acquiredAt?: string; expiresAt?: number }>(lockKey)
-        .catch(() => null);
+      const primaryLockKey = `${databasePrefix(scope)}.locks/backup.lock.json`;
+      const legacyLockKey = `${config.storage.prefix}/locks/backup.lock`;
+      distributed =
+        (await storage
+          .getJson<{ holder?: string; acquiredAt?: string; expiresAt?: number }>(primaryLockKey)
+          .catch(() => null)) ??
+        (await storage
+          .getJson<{ holder?: string; acquiredAt?: string; expiresAt?: number }>(legacyLockKey)
+          .catch(() => null));
     }
 
     const distData = distributed?.data;

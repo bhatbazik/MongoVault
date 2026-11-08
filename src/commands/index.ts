@@ -21,7 +21,7 @@ import { VerifyCommand } from "./verify.js";
 export * from "./types.js";
 
 /**
- * Registry mapping CLI command names to their respective handlers (Command Pattern).
+ * Registry mapping CLI command names to their respective handlers.
  */
 export class CommandRegistry {
   private static readonly commands = new Map<string, CommandHandler>([

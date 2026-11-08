@@ -34,6 +34,8 @@ export interface PhysicalBackupFile {
 
 export interface PhysicalBackupMeta {
   dbPath?: string;
+  cursorType?: "$backupCursor" | "fsyncLock";
+  filesCount?: number;
   files: PhysicalBackupFile[];
   checkpointTimestamp?: string;
   oplogStart?: string;

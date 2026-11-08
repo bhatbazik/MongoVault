@@ -1,6 +1,9 @@
+import type { MongoClient } from "mongodb";
+import type { BackupContext } from "./backup.js";
 import type { BackupManifest, ShardedClusterMeta } from "./catalog.js";
 import type { AppConfig } from "./config.js";
 import type { Logger } from "./logger.js";
+import type { RestoreContext, RestoreOptions, RestoreResult } from "./restore.js";
 import type { StorageClient } from "./storage.js";
 
 export interface ShardInfo {
@@ -28,6 +31,8 @@ export interface ShardedBackupOptions {
   storage: StorageClient;
   logger: Logger;
   signal?: AbortSignal;
+  createMongoClient?: (uri: string) => MongoClient;
+  backupRunner?: (options: BackupContext) => Promise<BackupManifest>;
 }
 
 export interface ShardedBackupResult {
@@ -43,6 +48,8 @@ export interface ShardedRestoreOptions {
   ref?: string;
   signal?: AbortSignal;
   drop?: boolean;
+  createMongoClient?: (uri: string) => MongoClient;
+  restoreRunner?: (ctx: RestoreContext, opts: RestoreOptions) => Promise<RestoreResult>;
 }
 
 export interface ShardedRestoreResult {

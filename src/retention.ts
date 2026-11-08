@@ -153,7 +153,7 @@ export async function deleteBackup(
     }
   }
 
-  // Active PITR base safety check (ErrBaseForPITR)
+  // Prevent deleting the active base backup that anchors PITR slices unless --force is passed
   if (!force) {
     const slices = (await listOplogSlices(storage, scope)).filter((s) => s.complete);
     if (slices.length > 0) {
@@ -204,7 +204,18 @@ export async function pruneOplogSlices(
   }
 
   if (!dryRun && keysToDelete.length > 0) {
-    await deleteKeysFromStorage(storage, keysToDelete);
+    try {
+      await deleteKeysFromStorage(storage, keysToDelete);
+    } catch (err) {
+      if (isObjectLockError(err)) {
+        logger.warn(
+          { err },
+          "Some PITR oplog slices could not be deleted because they are protected under S3 WORM Object Lock",
+        );
+      } else {
+        throw err;
+      }
+    }
   }
 
   logger.info(

@@ -284,6 +284,7 @@ function canonicalManifestPayload(
   return JSON.stringify({
     version: manifest.version,
     ...("type" in manifest && manifest.type ? { type: manifest.type } : {}),
+    ...("engine" in manifest && manifest.engine ? { engine: manifest.engine } : {}),
     key: manifest.key,
     database: manifest.database,
     createdAt: manifest.createdAt,
@@ -295,6 +296,9 @@ function canonicalManifestPayload(
     ...(manifest.oplogWindow ? { oplogWindow: manifest.oplogWindow } : {}),
     excludedCollections: manifest.excludedCollections ?? [],
     collections: manifest.collections ?? {},
+    ...(manifest.physical ? { physical: manifest.physical } : {}),
+    ...(manifest.snapshot ? { snapshot: manifest.snapshot } : {}),
+    ...(manifest.sharding ? { sharding: manifest.sharding } : {}),
     encryption: cleanEncryption,
   });
 }

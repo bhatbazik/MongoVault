@@ -1,11 +1,32 @@
-# mongodb-backup-service
+# MongoVault
 
-[![CI](https://github.com/bhatbazik/mongodb-backup-service/actions/workflows/ci.yml/badge.svg)](https://github.com/bhatbazik/mongodb-backup-service/actions/workflows/ci.yml)
+[![CI](https://github.com/bhatbazik/MongoVault/actions/workflows/ci.yml/badge.svg)](https://github.com/bhatbazik/MongoVault/actions/workflows/ci.yml)
 [![Node](https://img.shields.io/badge/node-%3E%3D20.0.0-blue.svg)](https://nodejs.org)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Docker](https://img.shields.io/badge/docker-ready-2496ED?logo=docker&logoColor=white)](https://hub.docker.com)
+[![TypeScript](https://img.shields.io/badge/TypeScript-6.0-3178C6.svg)](https://www.typescriptlang.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A streaming MongoDB backup daemon and CLI tool with S3/Cloudflare R2 multipart uploads, client-side AES-256-GCM envelope encryption, automated restore drills, and Prometheus observability.
+Streaming MongoDB backup daemon and CLI with S3/Cloudflare R2 multipart uploads, framed AES-256-GCM envelope encryption, continuous Point-in-Time Recovery (PITR) oplog slicing, automated restore drills, and Prometheus metrics.
+
+---
+
+## Overview
+
+MongoVault is designed for running reliable MongoDB backups on hosts where local scratch disk is limited or ephemeral (such as Kubernetes pods, Docker containers, and small VPS instances). Instead of staging dumps to `/tmp` before uploading, MongoVault streams data directly from MongoDB through compression, chunked authenticated encryption, and SHA-256 hashing into S3-compatible object storage or mounted filesystems.
+
+### Key Capabilities
+
+- **Zero-Temporary-Disk Streaming Pipeline:** Pipes `mongodump --archive` or WiredTiger `$backupCursor` output through `zlib`, `aes-256-gcm-chunked`, and `DigestStream` directly into S3 multipart uploads. Restores stream directly from storage through chunk verification into `mongorestore` or the POSIX UStar extractor.
+- **Four Backup Engines:**
+  - `logical` — Streaming `mongodump` / `mongorestore` archive pipeline with optional oplog capture and namespace filtering.
+  - `physical` — Hot WiredTiger file copy via `$backupCursor` and `$backupCursorExtend` (with `fsyncLock` fallback on standalone instances).
+  - `snapshot` — Quiesces writes with `fsyncLock`, triggers cloud block-volume snapshots (AWS EBS, GCP Persistent Disk, Azure Managed Disk, or custom shell hooks), and immediately releases the lock.
+  - `sharded` — Coordinates sharded cluster backups via `mongos`: stops and drains the balancer, records cluster time, and backs up `configsvr` plus each shard replica set under isolated storage prefixes.
+- **Continuous PITR Oplog Archiver:** Tails `local.oplog.rs` up to the replica set majority commit point (`lastCommittedOpTime`), checks `config.transactions` for in-flight distributed transactions, and archives compressed/encrypted `.oplog.bson.gz` slices. Point-in-time restores (`--pitr`) automatically resolve the latest base backup prior to the target timestamp and replay contiguous slices up to the target second/ordinal.
+- **Framed AEAD Envelope Encryption (`aes-256-gcm-chunked`):** Each backup generates a unique 256-bit Data Encryption Key (DEK) wrapped by the master key. Stream payloads are encrypted in 64 KiB frames with per-chunk nonces, 128-bit GCM authentication tags, and a terminal `0xFFFFFFFF` sentinel frame to detect mid-stream truncation before corrupt bytes reach the database.
+- **Authenticated Manifests & Key Rotation:** Every backup and oplog slice writes a `.manifest.json` signed with HMAC-SHA256. Historical backups encrypted under older master keys remain restorable via `ENCRYPTION_PREVIOUS_KEYS`.
+- **S3 Object Lock (WORM) & GFS Retention:** Supports `GOVERNANCE` and `COMPLIANCE` S3 Object Lock headers and Legal Hold. Timezone-aware Grandfather-Father-Son (`keepLast`, `keepDaily`, `keepWeekly`, `keepMonthly`) pruning uses batched S3 `DeleteObjects` calls and blocks accidental deletion of the base backup anchoring active PITR slices.
+- **Automated Restore Drills:** Periodically restores the latest backup into an isolated `_drill_<db>_<timestamp>` database, verifies collection availability and document counts against the manifest, and cleans up the staging database.
+- **Hybrid Concurrency Locking:** Combines local atomic PID lockfiles (`O_CREAT | O_EXCL`) with distributed S3 lease objects (`.locks/backup.lock.json`) and background heartbeat renewal.
 
 ---
 
@@ -13,85 +34,96 @@ A streaming MongoDB backup daemon and CLI tool with S3/Cloudflare R2 multipart u
 
 ```
                           ┌─────────────────────────────────────────────────────────────┐
-                          │                 mongodb-backup-service                      │
+                          │                         MongoVault                          │
                           │                                                             │
 ┌──────────────┐          │  ┌───────────┐      ┌───────────┐      ┌─────────────────┐  │      ┌─────────────────┐
-│              │ stdout   │  │  Stream   │      │  Digest   │      │  S3 Multipart   │  │ PUT  │  Cloudflare R2  │
-│  mongodump   ├──────────┼─►│ Cipheriv  ├─────►│  Stream   ├─────►│     Upload      ├──┼─────►│     / AWS S3    │
-│              │ (gzip)   │  │(AES-256)  │      │ (SHA-256) │      │  (32MB parts)   │  │      │     / MinIO     │
+│  mongodump   │ stdout   │  │   Gzip    │      │  Chunked  │      │  S3 Multipart   │  │ PUT  │   AWS S3 / R2   │
+│      or      ├──────────┼─►│   Stream  ├─────►│  AES-GCM  ├─────►│   + SHA-256     ├──┼─────►│  / MinIO / FS   │
+│$backupCursor │          │  │           │      │ (64 KiB)  │      │  (32 MiB parts) │  │      │                 │
 └──────────────┘          │  └───────────┘      └───────────┘      └─────────────────┘  │      └────────┬────────┘
                           │                                                             │               │
                           │  ┌───────────────────────┐     ┌─────────────────────────┐  │               │
-                          │  │  Prometheus Metrics   │     │  Atomic Lock & Token    │  │               │
-                          │  │  (/metrics, /healthz) │     │  (Stale PID Recovery)   │  │               │
+                          │  │  Prometheus & Probes  │     │  Hybrid Local + S3 Lock │  │               │
+                          │  │ (/metrics, /healthz)  │     │  (Heartbeat Lease)      │  │               │
                           │  └───────────────────────┘     └─────────────────────────┘  │               │
                           └─────────────────────────────────────────────────────────────┘               │
                                                                                                         │
-                                       WEEKLY AUTOMATED RESTORE DRILL                                   │
+                                       SCHEDULED RESTORE DRILL & PITR REPLAY                            │
                                 ┌───────────────────────────────────────────────────────────────────────┘
                                 ▼
-                     ┌─────────────────────┐      verified?      ┌───────────────────────┐
-                     │   Ephemeral Mongo   ├────────────────────►│  Alerts & Heartbeats  │
-                     │  (count assertion)  │      count match    │ (Healthchecks, Slack) │
+                     ┌─────────────────────┐      verified       ┌───────────────────────┐
+                     │  Ephemeral Restore  ├────────────────────►│  Notifications        │
+                     │  (Manifest Assert)  │                     │ (Slack/Webhook/SMTP)  │
                      └─────────────────────┘                     └───────────────────────┘
 ```
 
-### Highlights
+### Cryptographic Wire Format (`aes-256-gcm-chunked`)
 
-- **Zero-disk streaming pipeline (Backup & Restore):** Streams `mongodump` archive output directly into S3 multipart uploads and streams downloads directly into `mongorestore` stdin through in-flight hashing and encryption transforms. A 100 GB database requires 0 bytes of temporary disk space during both backup and restore.
-- **Physical Hot Backup Engine ($backupCursor / WiredTiger Hot Copy):** Streams raw WiredTiger storage files directly into encrypted S3 archives without BSON serialization overhead or index recreation, restoring multi-terabyte databases in minutes rather than hours.
-- **Cloud Volume Snapshot Driver (AWS EBS / GCP PD / Azure Disks):** Orchestrates instantaneous block storage volume snapshots by acquiring MongoDB write freeze (`fsyncLock`), invoking cloud snapshot APIs, and releasing writes immediately.
-- **S3 Object Lock & WORM Compliance:** Protects backups against ransomware attacks or compromised admin credentials using S3 Compliance or Governance Object Lock and legal holds.
-- **Multi-Shard Cluster Coordination:** Synchronizes distributed backups across mongos routers, config servers, and all shard replica sets with global cluster-time alignment and automated balancer management.
-- **Chunked AEAD Envelope Encryption (`aes-256-gcm-chunked`):** Archives are encrypted in 64 KB frames, each with an independent nonce and 128-bit authentication tag. Tampering, corruption, or stream truncation is detected immediately at the corrupted frame, aborting before corrupt data reaches the restore target. Backward-compatible with legacy single-block AES-GCM.
-- **Cluster-Wide & Multi-Database Backups:** Back up entire clusters (`MONGODB_DATABASE=*`) or individual databases. Collections are automatically namespaced (`database.collection`) to avoid collisions.
-- **Distributed S3 & Atomic Local Locking:** Hybrid lease locking coordinates multiple daemon instances across Kubernetes pods or Docker containers via S3 object leases with automatic heartbeat renewal, while atomic POSIX rename prevents local TOCTOU race conditions.
-- **High-Throughput Batch Pruning:** Prunes retention targets using S3 `DeleteObjectsCommand` batch requests (up to 1,000 objects per API call) instead of sequential deletes.
-- **Automated Restore Drills:** Periodically restores the latest backup to an isolated staging database, verifies collection accessibility, and accounts for point-in-time oplog write shifts to eliminate false alarms.
-- **Native AWS S3, Cloudflare R2, & MinIO:** Works out-of-the-box with AWS S3 regional endpoints, Cloudflare R2, or MinIO.
-- **Grandfather-Father-Son (GFS) Retention:** Automated pruning supports `keep-last`, `keep-daily`, `keep-weekly`, and `keep-monthly` policies natively without relying solely on cloud bucket lifecycle rules.
-- **Process Security & Isolation:** Passes connection credentials to child processes through ephemeral `mode 0600` config files with synchronous process-exit cleanup to avoid leaking connection strings in `ps aux`.
-- **Prometheus & Dead-Man's Switch:** Exposes standard `/metrics` and `/healthz` HTTP endpoints and pings dead-man's switch services (e.g. Healthchecks.io) to catch silent daemon crashes.
+Encrypted archives (`.enc`) use a framed binary layout so decryption can authenticate data in 64 KiB increments without buffering the entire archive on disk:
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│ Header: Magic "MV01" (4B) │ Chunk Index (4B BE) │ Ciphertext Len (4B BE) │
+├──────────────────────────────────────────────────────────────────────────┤
+│ Ciphertext Payload (up to 65,536 bytes)                                  │
+├──────────────────────────────────────────────────────────────────────────┤
+│ GCM Authentication Tag (16 bytes)                                        │
+└──────────────────────────────────────────────────────────────────────────┘
+  ... repeated for chunks 0 .. N-1 ...
+┌──────────────────────────────────────────────────────────────────────────┐
+│ Terminal Sentinel Frame: "MV01" │ 0xFFFFFFFF │ 0x00000000 │ Tag (16B)    │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+- **Per-Frame Nonce Derivation:** A 12-byte base IV is generated per archive; each frame derives its nonce by XORing the big-endian chunk index into bytes `8..11` of the base IV, and the sentinel frame flips bit 7 of byte 0.
+- **Additional Authenticated Data (AAD):** Each frame binds `MV01 || chunkIndex || plainLen` as GCM AAD, preventing frame reordering, splicing, or truncation.
 
 ---
 
 ## Quickstart
 
+### Prerequisites
+
+- **Node.js** `>= 20.0.0`
+- **MongoDB Database Tools** (`mongodump` and `mongorestore` in `PATH` for logical backups and oplog replay)
+
 ### 1. Run with Docker Compose
 
-Spin up a self-contained environment with MongoDB 7.0, MinIO S3 storage, and the backup service:
+Starts MongoDB 7.0, MinIO S3 storage, and the MongoVault daemon:
 
 ```bash
 docker compose up -d
 ```
 
-Check the health and Prometheus metrics endpoints:
+Inspect health and Prometheus metrics:
 
 ```bash
 curl http://localhost:8080/healthz
 curl http://localhost:8080/metrics
 ```
 
-### 2. Run Locally
+### 2. Build and Run Locally
 
 ```bash
-git clone https://github.com/bhatbazik/mongodb-backup-service.git
-cd mongodb-backup-service
+git clone https://github.com/bhatbazik/MongoVault.git
+cd MongoVault
 npm install
+npm run build
 
 cp .env.example .env
-# Edit .env with your MongoDB and S3/R2 credentials
+# Configure MONGODB_URI and storage settings in .env
 ```
 
-Generate an AES-256 encryption key:
+Generate a 32-byte master encryption key:
 
 ```bash
 npm run key:generate
 ```
 
-Start the daemon:
+Run preflight checks and start the daemon:
 
 ```bash
+node dist/index.js check
 npm start
 ```
 
@@ -99,352 +131,191 @@ npm start
 
 ## CLI Reference
 
-The service ships with an executable CLI (`mongodb-backup`):
+After running `npm run build` (or installing the package globally), invoke commands via `node dist/index.js <command>` or the `mongovault` binary:
 
 ```bash
-# Check cluster topology, storage health, PITR timeline, and running locks
-node src/index.js status
+# Inspect cluster topology, storage health, PITR timeline, and active locks
+node dist/index.js status
 
-# Run preflight system verification (tools, MongoDB, storage probe, crypto)
-node src/index.js check
+# Run preflight verification (mongodump/mongorestore, MongoDB, storage R/W probe, crypto roundtrip)
+node dist/index.js check
 
-# Run manual backup (prioritizing secondary replica set nodes)
-node src/index.js backup
+# Run logical backup (defaults to secondaryPreferred read preference)
+node dist/index.js backup
 
-# Run physical hot backup using WiredTiger $backupCursor
-node src/index.js backup --engine physical --db-path /var/lib/mongodb
+# Run logical backup with point-in-time oplog capture
+node dist/index.js backup --oplog
 
-# Restore physical hot backup directly into target WiredTiger directory
-node src/index.js restore --key <key> --db-path /var/lib/mongodb
+# Run physical WiredTiger hot backup ($backupCursor + $backupCursorExtend)
+node dist/index.js backup --engine physical --db-path /var/lib/mongodb
+
+# Restore physical backup into target WiredTiger dbPath
+node dist/index.js restore --engine physical --key latest --db-path /var/lib/mongodb
 
 # Run cloud volume snapshot under fsyncLock
-node src/index.js backup --engine snapshot --volume-id vol-0123456789abcdef0
+node dist/index.js backup --engine snapshot --volume-id vol-0123456789abcdef0
 
-# Run synchronized multi-shard cluster backup across all shards and configsvr
-node src/index.js backup --sharding
+# Run coordinated multi-shard cluster backup via mongos
+node dist/index.js backup --sharding
 
-# Run manual backup with point-in-time oplog capture
-node src/index.js backup --oplog
+# List available backups in storage
+node dist/index.js list
 
-# Run manual backup with custom read preference
-node src/index.js backup --read-preference secondaryPreferred
+# Inspect backup manifest metadata and per-collection document counts without downloading archive
+node dist/index.js describe --key latest
 
-# Run manual backup with JSON output
-node src/index.js backup --json
+# Verify archive integrity (streams archive and validates SHA-256, byte size, and GCM tags)
+node dist/index.js verify --key latest
 
-# List backups in storage
-node src/index.js list
+# Restore latest backup to source database (dropping target collections first)
+node dist/index.js restore --drop
 
-# Describe detailed backup metadata and collection document breakdown without downloading archive
-node src/index.js describe --key mongodb/production/2026-03-10/20260310T020000Z.archive.gz.enc
+# Selective restore by namespace pattern
+node dist/index.js restore --ns-include "production.users,production.orders*" --drop
+node dist/index.js restore --ns-exclude "production.audit_log" --drop
 
-# Verify integrity and checksum of latest backup
-node src/index.js verify
+# Restore to a different database or cluster (automatically remaps namespaces when needed)
+node dist/index.js restore --key <key> --uri "mongodb://staging:27017" --database staging_db --drop
 
-# Verify specific backup key
-node src/index.js verify --key mongodb/production/2026-03-10/20260310T020000Z.archive.gz.enc
+# Point-in-time restore using base backup + continuous PITR oplog slices
+node dist/index.js restore --pitr "2026-03-10T14:30:00Z" --drop
+node dist/index.js restore --pitr "1774092000:1" --drop
 
-# Restore latest backup to source database (drops collections first)
-node src/index.js restore --drop
+# Continuous PITR oplog operations
+node dist/index.js oplog:slice
+node dist/index.js oplog:tail
+node dist/index.js oplog:list
+node dist/index.js oplog:prune --older-than "2026-03-01T00:00:00Z"
 
-# Selective restore of specific collections or patterns
-node src/index.js restore --ns-include "production.users,production.orders*" --drop
+# Delete a specific backup (blocks if it anchors active PITR slices unless --force is set)
+node dist/index.js delete --key <key>
+node dist/index.js delete --key <key> --force
 
-# Selective restore with excluded collections
-node src/index.js restore --ns-exclude "production.audit_log" --drop
+# Evaluate or apply GFS retention pruning
+node dist/index.js prune --dry-run
+node dist/index.js prune
 
-# Restore with point-in-time oplog replay to an exact second
-node src/index.js restore --oplog-replay --oplog-limit 1774092000:1 --drop
+# Execute an immediate automated restore verification drill
+node dist/index.js drill
 
-# Restore using base backup + continuous PITR oplog slices
-node src/index.js restore --pitr 2026-03-10T14:30:00Z --drop
-
-# Restore to a different target database or cluster
-node src/index.js restore --key <key> --uri "mongodb://staging:27017" --database staging_db --drop
-
-# Safely delete a backup (blocks if backup anchors active PITR slices)
-node src/index.js delete --key mongodb/production/2026-03-10/20260310T020000Z.archive.gz.enc
-
-# Force delete an active base backup
-node src/index.js delete --key <key> --force
-
-# Simulate retention pruning without deleting files
-node src/index.js prune --dry-run
-
-# Apply retention pruning
-node src/index.js prune
-
-# Prune PITR oplog slices older than a specific timestamp
-node src/index.js oplog:prune --older-than 1774000000:1
-
-# Generate sanitized environment and operational diagnostic bundle
-node src/index.js diagnostic --output ./diagnostic-report.json
-
-# Run manual restore drill
-node src/index.js drill
+# Export sanitized diagnostic bundle (system resources, tool versions, topology, recent manifests)
+node dist/index.js diagnostic --output ./diagnostic-bundle.json
 ```
 
 ---
 
 ## Configuration Reference
 
-Set these variables in `.env` or pass them as system environment variables:
+All settings are validated at startup via Zod ([`src/config.ts`](src/config.ts)):
 
-| Variable                       |    Type    |       Default        | Description                                                             |
-| :----------------------------- | :--------: | :------------------: | :---------------------------------------------------------------------- |
-| `MONGODB_URI`                  |   String   |      _Required_      | Connection string for source MongoDB instance                           |
-| `MONGODB_DATABASE`             |   String   |         `*`          | Target database name (`*` or `all` for cluster-wide)                    |
-| `MONGODB_EXCLUDE_COLLECTIONS`  |   String   |         `""`         | Comma-delimited list of collections to exclude                          |
-| `MONGODB_OPLOG`                |  Boolean   |       `false`        | Capture point-in-time oplog during backup (replica sets)                |
-| `MONGODB_PARALLEL_COLLECTIONS` |   Number   |         `2`          | Number of collections dumped concurrently                               |
-| `MONGODB_READ_PREFERENCE`      |   String   | `secondaryPreferred` | Read preference for dumps (`secondaryPreferred`, `secondary`, etc.)     |
-| `STORAGE_TYPE`                 |   String   |         `s3`         | Storage backend: `s3` or `filesystem`                                   |
-| `STORAGE_PATH`                 |    Path    |       Optional       | Local or mounted NFS/PVC path (required when `STORAGE_TYPE=filesystem`) |
-| `S3_BUCKET`                    |   String   |      _Required_      | Target bucket name (when `STORAGE_TYPE=s3`)                             |
-| `S3_ACCESS_KEY_ID`             |   String   |      _Required_      | S3 API access key ID (when `STORAGE_TYPE=s3`)                           |
-| `S3_SECRET_ACCESS_KEY`         |   String   |      _Required_      | S3 API secret access key (when `STORAGE_TYPE=s3`)                       |
-| `S3_PART_SIZE_MB`              |   Number   |         `32`         | S3 multipart chunk size (32MB handles up to 320GB)                      |
-| `S3_QUEUE_SIZE`                |   Number   |         `2`          | Concurrent multipart uploads (controls memory footprint)                |
-| `R2_ACCOUNT_ID`                |   String   |       Optional       | Cloudflare Account ID (auto-derives endpoint & region)                  |
-| `S3_ENDPOINT`                  |    URL     |       Optional       | Custom S3 endpoint URL (MinIO, Wasabi, AWS)                             |
-| `S3_REGION`                    |   String   |       `"auto"`       | S3 region identifier                                                    |
-| `S3_FORCE_PATH_STYLE`          |  Boolean   |       `false`        | Enable path-style S3 URLs (required for MinIO)                          |
-| `S3_PREFIX`                    |   String   |     `"mongodb"`      | Root prefix key in bucket                                               |
-| `BACKUP_CRON`                  |   String   |    `"0 2 * * *"`     | 5-field cron expression for backup schedule                             |
-| `BACKUP_TIMEZONE`              |   String   |       `"UTC"`        | Timezone for cron schedules and directory stamps                        |
-| `BACKUP_TIMEOUT_MINUTES`       |   Number   |        `180`         | Process execution timeout                                               |
-| `BACKUP_ON_START`              |  Boolean   |       `false`        | Run an immediate backup upon daemon boot                                |
-| `WORK_DIR`                     |    Path    |      OS tmp dir      | Scratch folder for lock files and temp restore streams                  |
-| `ENCRYPTION_KEY`               | Base64/Hex |       Optional       | 32-byte master key for AES-256-GCM envelope encryption                  |
-| `RETENTION_KEEP_LAST`          |   Number   |       Optional       | Keep N most recent backups                                              |
-| `RETENTION_KEEP_DAILY`         |   Number   |       Optional       | Keep 1 backup per day for N days                                        |
-| `RETENTION_KEEP_WEEKLY`        |   Number   |       Optional       | Keep 1 backup per week for N weeks                                      |
-| `RETENTION_KEEP_MONTHLY`       |   Number   |       Optional       | Keep 1 backup per month for N months                                    |
-| `DRILL_MONGODB_URI`            |   String   |       Optional       | Target MongoDB instance for restore drills                              |
-| `DRILL_CRON`                   |   String   |       Optional       | Cron schedule for automated restore drills                              |
-| `HEARTBEAT_URL`                |    URL     |       Optional       | Healthchecks.io / Cronitor heartbeat ping URL                           |
-| `NOTIFY_ON_SUCCESS`            |  Boolean   |        `true`        | Send notifications on successful runs                                   |
-| `SLACK_WEBHOOK_URL`            |    URL     |       Optional       | Incoming Slack webhook URL                                              |
-| `WEBHOOK_URL`                  |    URL     |       Optional       | Generic webhook URL for status events (POST JSON)                       |
-| `SMTP_HOST`                    |   String   |       Optional       | SMTP server hostname                                                    |
-| `SMTP_PORT`                    |   Number   |        `587`         | SMTP port                                                               |
-| `SMTP_SECURE`                  |  Boolean   |       `false`        | Use TLS directly (port 465)                                             |
-| `SMTP_USER`                    |   String   |       Optional       | SMTP username                                                           |
-| `SMTP_PASSWORD`                |   String   |       Optional       | SMTP password                                                           |
-| `SMTP_FROM`                    |   String   |       Optional       | Email sender address                                                    |
-| `SMTP_TO`                      |   String   |       Optional       | Comma-delimited recipient email addresses                               |
-| `HTTP_PORT`                    |   Number   |        `8080`        | Port for `/healthz` and `/metrics` server (0 disables)                  |
-| `LOG_LEVEL`                    |   String   |       `"info"`       | Log level (`trace`, `debug`, `info`, `warn`, `error`)                   |
+| Variable                           |     Type      |       Default        | Description                                                                 |
+| :--------------------------------- | :-----------: | :------------------: | :-------------------------------------------------------------------------- |
+| **MongoDB**                        |               |                      |                                                                             |
+| `MONGODB_URI`                      |    String     |      _Required_      | MongoDB connection string                                                   |
+| `MONGODB_DATABASE`                 |    String     |        `"*"`         | Database name (`*` or `all` for cluster-wide backup)                        |
+| `MONGODB_EXCLUDE_COLLECTIONS`      |    String     |         `""`         | Comma-separated collections to exclude                                      |
+| `MONGODB_OPLOG`                    |    Boolean    |       `false`        | Capture oplog during logical dump (requires `MONGODB_DATABASE=*`)           |
+| `MONGODB_PARALLEL_COLLECTIONS`     |    Number     |         `2`          | Collections dumped/restored in parallel (`1`–`32`)                          |
+| `MONGODB_READ_PREFERENCE`          |    String     | `secondaryPreferred` | `primary`, `primaryPreferred`, `secondary`, `secondaryPreferred`, `nearest` |
+| **Backup Engines & Sharding**      |               |                      |                                                                             |
+| `BACKUP_ENGINE`                    |    String     |      `logical`       | Default engine: `logical`, `physical`, or `snapshot`                        |
+| `PHYSICAL_DB_PATH`                 |     Path      |       Optional       | WiredTiger `dbPath` on local filesystem (for `physical` engine)             |
+| `SNAPSHOT_PROVIDER`                |    String     |      `aws-ebs`       | `aws-ebs`, `gcp-pd`, `azure-disk`, or `custom`                              |
+| `SNAPSHOT_VOLUME_ID`               |    String     |       Optional       | Cloud volume identifier to snapshot                                         |
+| `SNAPSHOT_REGION`                  |    String     |       Optional       | Cloud provider region for volume snapshots                                  |
+| `SNAPSHOT_COMMAND_HOOK`            |    String     |       Optional       | External executable invoked for custom snapshot create/restore              |
+| `SHARDING_ENABLED`                 |    Boolean    |       `false`        | Coordinate multi-shard backup across `mongos`, `configsvr`, and shards      |
+| `SHARDING_CONFIGSVR_URI`           |    String     |       Optional       | Optional dedicated Config Server connection URI                             |
+| **Point-in-Time Recovery (PITR)**  |               |                      |                                                                             |
+| `PITR_ENABLED`                     |    Boolean    |       `false`        | Run continuous background oplog slicer in daemon mode                       |
+| `PITR_FLUSH_INTERVAL_SECONDS`      |    Number     |         `60`         | Interval between oplog slice flushes (`5`–`3600` seconds)                   |
+| `PITR_MAX_SLICE_MB`                |    Number     |         `16`         | Maximum uncompressed BSON size per oplog slice (`1`–`512` MiB)              |
+| **Storage (`s3` or `filesystem`)** |               |                      |                                                                             |
+| `STORAGE_TYPE`                     |    String     |         `s3`         | `s3` or `filesystem`                                                        |
+| `STORAGE_PATH`                     |     Path      |       Optional       | Directory path when `STORAGE_TYPE=filesystem`                               |
+| `S3_BUCKET`                        |    String     |   _Required (S3)_    | Target S3 / R2 / MinIO bucket name                                          |
+| `S3_ACCESS_KEY_ID`                 |    String     |   _Required (S3)_    | S3 access key ID                                                            |
+| `S3_SECRET_ACCESS_KEY`             |    String     |   _Required (S3)_    | S3 secret access key                                                        |
+| `S3_PREFIX`                        |    String     |     `"mongodb"`      | Object key prefix inside bucket                                             |
+| `S3_REGION`                        |    String     |       `"auto"`       | S3 region                                                                   |
+| `S3_ENDPOINT`                      |      URL      |       Optional       | Custom S3 endpoint (Cloudflare R2, MinIO, Wasabi, DigitalOcean)             |
+| `R2_ACCOUNT_ID`                    |    String     |       Optional       | Cloudflare account ID (auto-configures `S3_ENDPOINT` and region)            |
+| `S3_FORCE_PATH_STYLE`              |    Boolean    |       `false`        | Force path-style addressing (required for MinIO)                            |
+| `S3_PART_SIZE_MB`                  |    Number     |         `32`         | Multipart upload chunk size (`5`–`512` MiB)                                 |
+| `S3_QUEUE_SIZE`                    |    Number     |         `2`          | Concurrent multipart upload streams (`1`–`16`)                              |
+| `S3_STORAGE_CLASS`                 |    String     |     `"STANDARD"`     | S3 storage class (`STANDARD`, `STANDARD_IA`, `GLACIER_IR`, etc.)            |
+| **S3 Object Lock (WORM)**          |               |                      |                                                                             |
+| `S3_OBJECT_LOCK_ENABLED`           |    Boolean    |       `false`        | Apply S3 Object Lock headers to uploaded archives                           |
+| `S3_OBJECT_LOCK_MODE`              |    String     |     `GOVERNANCE`     | `GOVERNANCE` or `COMPLIANCE`                                                |
+| `S3_OBJECT_LOCK_RETENTION_DAYS`    |    Number     |         `30`         | Days to retain locked objects (`1`–`36500`)                                 |
+| `S3_OBJECT_LOCK_LEGAL_HOLD`        |    Boolean    |       `false`        | Apply S3 Object Lock Legal Hold (`ON`)                                      |
+| **Encryption**                     |               |                      |                                                                             |
+| `ENCRYPTION_KEY`                   |  Base64/Hex   |       Optional       | 32-byte master key for AES-256-GCM envelope encryption                      |
+| `ENCRYPTION_PREVIOUS_KEYS`         |    String     |       Optional       | Comma-separated historical 32-byte keys for decrypting older backups        |
+| **Schedule & Retention**           |               |                      |                                                                             |
+| `BACKUP_CRON`                      |    String     |    `"0 2 * * *"`     | 5-field cron schedule for automated backups                                 |
+| `BACKUP_TIMEZONE`                  |    String     |       `"UTC"`        | IANA timezone for cron schedules and retention buckets                      |
+| `BACKUP_TIMEOUT_MINUTES`           |    Number     |        `180`         | Maximum backup execution duration before abort                              |
+| `BACKUP_ON_START`                  |    Boolean    |       `false`        | Trigger an immediate backup when daemon starts                              |
+| `WORK_DIR`                         |     Path      |      OS tmpdir       | Local scratch directory for lock files and temporary PITR replay            |
+| `RETENTION_KEEP_LAST`              |    Number     |       Optional       | Always keep the $N$ newest backups                                          |
+| `RETENTION_KEEP_DAILY`             |    Number     |       Optional       | Keep 1 backup per day for $N$ days                                          |
+| `RETENTION_KEEP_WEEKLY`            |    Number     |       Optional       | Keep 1 backup per ISO week for $N$ weeks                                    |
+| `RETENTION_KEEP_MONTHLY`           |    Number     |       Optional       | Keep 1 backup per month for $N$ months                                      |
+| **Restore Drills, Alerts & HTTP**  |               |                      |                                                                             |
+| `DRILL_MONGODB_URI`                |    String     |       Optional       | Staging MongoDB URI used for automated restore drills                       |
+| `DRILL_CRON`                       |    String     |    `"0 4 * * 0"`     | Cron schedule for restore drills                                            |
+| `HEARTBEAT_URL`                    |      URL      |       Optional       | Dead-man's switch ping URL (Healthchecks.io, Cronitor, BetterStack)         |
+| `NOTIFY_ON_SUCCESS`                |    Boolean    |        `true`        | Dispatch notifications on successful runs as well as failures               |
+| `SLACK_WEBHOOK_URL`                |      URL      |       Optional       | Slack incoming webhook URL                                                  |
+| `WEBHOOK_URL`                      |      URL      |       Optional       | Generic JSON webhook URL (compatible with Discord/PagerDuty bridges)        |
+| `SMTP_HOST` / `SMTP_PORT`          | String/Number |        `587`         | SMTP server settings (`SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM`, `SMTP_TO`) |
+| `HTTP_PORT`                        |    Number     |        `8080`        | Port for `/healthz`, `/livez`, `/readyz`, `/metrics` (`0` disables)         |
+| `LOG_LEVEL`                        |    String     |       `"info"`       | `fatal`, `error`, `warn`, `info`, `debug`, `trace`, `silent`                |
 
 ---
 
-## Production Deployment
+## Storage Layout & Manifest Format
 
-### Docker
+```
+s3://<bucket>/<prefix>/
+  ├── _cluster/                              # or <database>/ when scoped to a single DB
+  │   ├── 2026-03-10/
+  │   │   ├── 20260310T020000Z.archive.gz.enc
+  │   │   └── 20260310T020000Z.archive.gz.enc.manifest.json
+  │   └── _pitr/
+  │       ├── state.json
+  │       └── 2026-03-10/
+  │           ├── 1773108000_00000001__1773108060_00000014.oplog.bson.gz.enc
+  │           └── 1773108000_00000001__1773108060_00000014.oplog.bson.gz.enc.manifest.json
+  ├── configsvr/                             # created during --sharding cluster backups
+  └── shards/
+      ├── shard01/
+      └── shard02/
+```
 
-Build and run the non-root container:
+---
+
+## Operational Considerations
+
+- **Physical Engine (`--engine physical`) Locality:** MongoDB's `$backupCursor` returns file descriptors paths residing on the `mongod` node's local `dbPath`. When using the `physical` engine, MongoVault must run on the same host or share a mounted volume with the target `mongod` data directory, and Physical restores must be performed while the target `mongod` process is stopped.
+- **Sharded Cluster Coordination (`--sharding`):** MongoVault operates as a stateless coordinator without requiring agents on individual database nodes. During a sharded backup, it stops the cluster balancer through `mongos`, backs up `configsvr` metadata, and sequentially streams each shard replica set. For multi-terabyte sharded clusters with high cross-shard write rates, keep the balancer window and shard dump duration in mind.
+- **Memory & Multipart Sizing:** With `S3_PART_SIZE_MB=32` and `S3_QUEUE_SIZE=2`, in-flight upload buffers stay under ~70 MiB while supporting single archives up to **320 GiB** within S3's 10,000-part limit. Increase `S3_PART_SIZE_MB` to `64` or `128` for larger single-stream archives.
+
+---
+
+## Development & Testing
 
 ```bash
-docker build -t mongodb-backup-service .
-
-docker run -d \
-  --name mongo-backup \
-  --restart unless-stopped \
-  --env-file .env \
-  -p 8080:8080 \
-  mongodb-backup-service
-```
-
-### PM2
-
-```bash
-npm install -g pm2
-pm2 start src/index.js --name mongo-backup -- daemon
-pm2 save
-pm2 startup
-```
-
-### Kubernetes CronJob
-
-An example CronJob manifest for ephemeral backup execution:
-
-```yaml
-apiVersion: batch/v1
-kind: CronJob
-metadata:
-  name: mongodb-backup
-spec:
-  schedule: "0 2 * * *"
-  concurrencyPolicy: Forbid
-  successfulJobsHistoryLimit: 3
-  failedJobsHistoryLimit: 5
-  jobTemplate:
-    spec:
-      template:
-        spec:
-          restartPolicy: OnFailure
-          containers:
-            - name: backup
-              image: mongodb-backup-service:latest
-              args: ["backup"]
-              envFrom:
-                - secretRef:
-                    name: mongodb-backup-credentials
-```
-
----
-
-## Storage & Manifest Layout
-
-Backups in S3 or Cloudflare R2 are structured hierarchically:
-
-```
-s3://<bucket>/<prefix>/<database>/
-  ├── 2026-03-10/
-  │   ├── 20260310T020000Z.archive.gz.enc
-  │   └── 20260310T020000Z.archive.gz.enc.manifest.json
-  └── 2026-03-11/
-      ├── 20260311T020000Z.archive.gz.enc
-      └── 20260311T020000Z.archive.gz.enc.manifest.json
-```
-
-### Manifest Schema (`.manifest.json`)
-
-Each archive is accompanied by an authenticated JSON manifest written upon successful upload:
-
-```json
-{
-  "version": 2,
-  "key": "mongodb/production/2026-03-10/20260310T020000Z.archive.gz.enc",
-  "database": "production",
-  "createdAt": "2026-03-10T02:00:00.000Z",
-  "completedAt": "2026-03-10T02:02:14.000Z",
-  "durationMs": 134000,
-  "size": 154210940,
-  "sha256": "4b971a82e98fa87c...",
-  "compression": "gzip",
-  "encryption": {
-    "algorithm": "aes-256-gcm-chunked",
-    "keyId": "9f81a7b3c2e10d4f",
-    "wrappedKey": "tGv/F...==",
-    "iv": "3aV+...==",
-    "chunkSize": 65536,
-    "manifestHmac": "8d4c1f0a..."
-  },
-  "excludedCollections": ["sessions"],
-  "oplog": false,
-  "collections": {
-    "users": 154200,
-    "orders": 894102,
-    "products": 4120
-  }
-}
-```
-
----
-
-## 100 GB+ Scaling on Constrained Hosts
-
-Backing up multi-gigabyte or 100 GB+ databases on small VPS hosts (e.g. 1 vCPU, 1 GB RAM, 10 GB disk) requires deliberate resource boundaries:
-
-1. **Zero Temporary Disk Usage (Backup & Restore):**
-   - Traditional backup scripts buffer dumps or restore archives to `/tmp`. A 100 GB database on a 20 GB disk will crash with `ENOSPC`.
-   - `mongodb-backup-service` pipes `mongodump` stdout directly through in-memory cryptographic and hashing transforms straight into S3/R2 multipart uploads without touching local disk. During restore, it streams directly from S3 through chunk-authenticated decryptors into `mongorestore` stdin with 0 bytes saved to disk.
-
-2. **Strict Stream Backpressure (`highWaterMark`):**
-   - If `mongodump` produces data faster than your network uplink can send it, Node.js streams buffer data in heap memory.
-   - We enforce a `1 MB` stream `highWaterMark`. When the buffer fills, backpressure pauses the `mongodump` child process at the Linux kernel pipe level, keeping RSS memory flat throughout a 2-hour 100 GB dump.
-
-3. **S3/R2 10,000 Part Limit & Dynamic Part Sizing:**
-   - S3-compatible APIs enforce a hard limit of **10,000 parts** per multipart upload. A default 5 MB or 10 MB chunk size fails at 50 GB or 100 GB with `TooManyParts`.
-   - Default `S3_PART_SIZE_MB=32` allows up to **320 GB** per archive. Setting `S3_PART_SIZE_MB=64` enables backups up to **640 GB**.
-   - Concurrency is throttled via `S3_QUEUE_SIZE=2` to keep active in-flight buffer memory under ~65 MB.
-
-4. **Cluster I/O Throttling (`--numParallelCollections`):**
-   - By default, `mongodump` reads 4 collections simultaneously, creating severe I/O thrashing on active production databases.
-   - Setting `MONGODB_PARALLEL_COLLECTIONS=2` (or `1`) guarantees smooth, non-disruptive streaming.
-
----
-
-## Point-In-Time Recovery (PITR)
-
-A 100 GB dump takes 1 to 2 hours. Without point-in-time consistency, collections dumped early in the run are out-of-sync with collections dumped later.
-
-### 1. Consistent Snapshot Backups (`--oplog`)
-
-Enable `MONGODB_OPLOG=true` or pass `--oplog` on the CLI:
-
-```bash
-node src/index.js backup --oplog
-```
-
-`mongodump` tails and records all oplog transactions that occur during the dump. Restoring automatically applies these operations, producing a transactionally consistent snapshot of the exact second the backup finished.
-
-### 2. Point-In-Time Replay (`--oplog-limit`)
-
-To roll back the database to a specific second (e.g. right before an accidental table drop):
-
-```bash
-node src/index.js restore --oplog-replay --oplog-limit 1774092000:1 --drop
-```
-
-`mongorestore` applies all oplog operations up to timestamp `1774092000` (Unix epoch seconds) and increment `1`.
-
----
-
-## Cloudflare R2 & Checksum Architecture
-
-### Why Client-Side Envelope Encryption Eliminates Server-Side Checksum Limitations
-
-Older S3 backup scripts relied on AWS S3's `ChecksumAlgorithm: SHA256` where S3 computes hashes server-side on upload. Cloudflare R2 did not historically support this proprietary header for multipart uploads.
-
-In this architecture, client-side **AES-256-GCM** makes server-side hash computation redundant:
-
-- **Cryptographic AEAD Guarantee:** AES-256-GCM produces a 128-bit authentication tag (`authTag`). If a single bit in the R2 object is modified, truncated, or corrupted in transit or at rest, the decryption cipher fails immediately with an authentication error.
-- **In-flight SHA-256:** Computed in-memory during streaming and recorded in the `.manifest.json`.
-- **R2 Multipart Cleanup:** Cloudflare R2 automatically purges incomplete multipart uploads after 7 days, avoiding lingering storage costs from aborted network runs.
-- **Hybrid Retention:** In-app GFS retention prunes backups according to schedule (daily, weekly, monthly) while an R2 bucket lifecycle rule serves as an outer defense-in-depth safety net.
-
----
-
-## Observability & Metrics
-
-The built-in HTTP server exposes standard metrics compatible with Prometheus, Grafana, and Datadog:
-
-| Metric                                                |   Type    | Description                                                             |
-| :---------------------------------------------------- | :-------: | :---------------------------------------------------------------------- |
-| `mongodb_backup_runs_total`                           |  Counter  | Total backups run, labeled by `status` (success/failure) and `database` |
-| `mongodb_backup_duration_seconds`                     | Histogram | Execution time distribution in seconds                                  |
-| `mongodb_backup_size_bytes`                           |   Gauge   | Byte size of the most recent backup archive                             |
-| `mongodb_backup_last_success_timestamp_seconds`       |   Gauge   | Epoch timestamp of last successful backup                               |
-| `mongodb_backup_drill_runs_total`                     |  Counter  | Total restore drills run, labeled by `status`                           |
-| `mongodb_backup_drill_last_success_timestamp_seconds` |   Gauge   | Epoch timestamp of last successful drill                                |
-
----
-
-## Testing
-
-Run unit and integration test suites:
-
-```bash
-# Run all tests once
+# Run unit and pipeline integration tests (Vitest)
 npm test
 
-# Run tests in watch mode
-npm run test:watch
+# Run TypeScript typecheck, ESLint, Prettier check, and build
+npm run check
 ```
-
-Test coverage includes:
-
-- AES-256-GCM envelope encryption & deciphering with auth tag validation
-- Atomic token lock lifecycle, contention, and stale PID recovery
-- GFS retention planning algorithms across day/week/month boundaries
-- Zod configuration validation & edge cases
-- In-flight SHA-256 digest computation & byte streaming
-- Full mock pipeline backup, restore, verify, and corruption rejection
 
 ---
 
 ## License
 
-[MIT](LICENSE)
+Released under the [MIT License](LICENSE).

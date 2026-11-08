@@ -1,7 +1,17 @@
 import { MongoClient } from "mongodb";
 import { linkedController } from "./abort.js";
 import { runBackup } from "./backup.js";
-import { MANIFEST_VERSION, manifestKey, scopeOf } from "./catalog.js";
+import {
+  MANIFEST_VERSION,
+  databasePrefix,
+  manifestKey,
+  readManifest,
+  resolveBackup,
+  resolveKeyRing,
+  scopeOf,
+  writeManifest,
+} from "./catalog.js";
+import { verifyManifest } from "./crypto.js";
 import { formatDuration } from "./format.js";
 import { fromBsonTimestamp } from "./oplog.js";
 import { restoreBackup } from "./restore.js";
@@ -20,6 +30,34 @@ import type {
   ShardedRestoreOptions,
   ShardedRestoreResult,
 } from "./types/sharding.js";
+
+/**
+ * Builds a MongoDB connection URI for an individual shard replica set while
+ * preserving credentials and connection parameters (authSource, tls, etc.) from baseUri.
+ */
+export function buildShardUri(baseUri: string, shardHost: string): string {
+  const slashIdx = shardHost.indexOf("/");
+  const rsName = slashIdx !== -1 ? shardHost.slice(0, slashIdx).trim() : "";
+  const hosts = (slashIdx !== -1 ? shardHost.slice(slashIdx + 1) : shardHost).trim();
+
+  const match = /^mongodb(?:\+srv)?:\/\/(?:([^@/]+)@)?[^/?]+(\/[^?]*)?(?:\?(.*))?$/i.exec(
+    baseUri.trim(),
+  );
+  const authPrefix = match?.[1] ? `${match[1]}@` : "";
+  const rawQuery = match?.[3] ?? "";
+
+  const params = new URLSearchParams(rawQuery);
+  if (rsName) {
+    params.set("replicaSet", rsName);
+  } else {
+    params.delete("replicaSet");
+  }
+  // Remove SRV-only or conflicting options when connecting directly to shard seed hosts
+  params.delete("directConnection");
+
+  const queryStr = params.toString();
+  return `mongodb://${authPrefix}${hosts}/${queryStr ? `?${queryStr}` : ""}`;
+}
 
 /**
  * Controller for coordinating MongoDB sharded cluster balancer states.
@@ -73,7 +111,9 @@ export async function waitForBalancerDisabled(
 
   while (Date.now() < deadline) {
     try {
-      const res = await admin.command({ balancerStatus: 1 });
+      const res = await admin
+        .command({ balancerStatus: 1 })
+        .catch(() => admin.command({ _configsvrBalancerStatus: 1 }));
       status = {
         inBalancerRound: Boolean(res?.inBalancerRound),
         mode: String(res?.mode || "unknown"),
@@ -110,16 +150,20 @@ export async function discoverClusterTopology(client: MongoClient): Promise<Clus
     .db("config")
     .collection<{ _id: string; host: string; tags?: string[] }>("shards");
   const rawShards = await shardsColl.find({}).toArray();
-  const shards: ShardInfo[] = rawShards.map((s) => ({
-    id: s._id,
-    host: s.host,
-    tags: s.tags,
-  }));
+  const shards: ShardInfo[] = rawShards
+    .filter((s) => s._id !== "config")
+    .map((s) => ({
+      id: s._id,
+      host: s.host,
+      tags: s.tags,
+    }));
 
   let balancerEnabled = true;
   let balancerRunning = false;
   try {
-    const balancerStatus = await admin.command({ balancerStatus: 1 });
+    const balancerStatus = await admin
+      .command({ balancerStatus: 1 })
+      .catch(() => admin.command({ _configsvrBalancerStatus: 1 }));
     balancerEnabled = balancerStatus?.mode !== "off";
     balancerRunning = Boolean(balancerStatus?.inBalancerRound);
   } catch {
@@ -143,13 +187,15 @@ export async function runShardedClusterBackup({
   storage,
   logger,
   signal,
+  createMongoClient = (u) => new MongoClient(u),
+  backupRunner = runBackup,
 }: ShardedBackupOptions): Promise<ShardedBackupResult> {
   const startedAt = new Date();
   const controller = linkedController(signal);
   const log = logger.child({ engine: "sharded-cluster" });
 
   log.info("Inspecting sharded cluster topology...");
-  const client = new MongoClient(config.mongo.uri);
+  const client = createMongoClient(config.mongo.uri);
   const balancer = new BalancerController(client, log);
   let balancerStopped = false;
   let topology: ClusterTopology | null = null;
@@ -195,29 +241,36 @@ export async function runShardedClusterBackup({
     log.info("Backing up Config Server metadata...");
     const configsvrConfig: AppConfig = {
       ...config,
+      storage: {
+        ...config.storage,
+        prefix: `${config.storage.prefix}/configsvr`,
+      },
       mongo: {
         ...config.mongo,
         database: "config",
         oplog: false,
       },
     };
-    const configsvrManifest = await runBackup({
+    const configsvrManifest = await backupRunner({
       config: configsvrConfig,
       storage,
       logger: log.child({ component: "configsvr" }),
       signal: controller.signal,
     });
 
-    // 4. Back up each shard replica set
+    // 4. Back up each shard replica set under its own isolated storage prefix
     const shardBackups: Record<string, ShardedClusterShardBackup> = {};
 
     for (const shard of topology.shards) {
       log.info({ shardId: shard.id, host: shard.host }, "Backing up shard...");
-      const shardHosts = shard.host.includes("/") ? shard.host.split("/")[1] : shard.host;
-      const shardUri = `mongodb://${shardHosts}/?replicaSet=${shard.host.split("/")[0]}`;
+      const shardUri = buildShardUri(config.mongo.uri, shard.host);
 
       const shardConfig: AppConfig = {
         ...config,
+        storage: {
+          ...config.storage,
+          prefix: `${config.storage.prefix}/shards/${shard.id}`,
+        },
         mongo: {
           ...config.mongo,
           uri: shardUri,
@@ -227,7 +280,7 @@ export async function runShardedClusterBackup({
       };
 
       try {
-        const shardManifest = await runBackup({
+        const shardManifest = await backupRunner({
           config: shardConfig,
           storage,
           logger: log.child({ shardId: shard.id }),
@@ -264,7 +317,12 @@ export async function runShardedClusterBackup({
     const completedAt = new Date();
     const durationMs = completedAt.getTime() - startedAt.getTime();
     const scope = scopeOf(config);
-    const clusterKey = `${scope.prefix}/cluster/${startedAt.toISOString().slice(0, 10)}/${startedAt.toISOString().replace(/[:.]/g, "")}.cluster`;
+    const encrypted = Boolean(config.encryptionKey);
+    const stamp = startedAt
+      .toISOString()
+      .replace(/[-:]/g, "")
+      .replace(/\.\d{3}Z$/, "Z");
+    const clusterKey = `${databasePrefix(scope)}${startedAt.toISOString().slice(0, 10)}/${stamp}.cluster${encrypted ? ".enc" : ""}`;
 
     const clusterMeta: ShardedClusterMeta = {
       clusterTime: clusterTimeStr,
@@ -281,7 +339,7 @@ export async function runShardedClusterBackup({
       type: "sharded-cluster-backup",
       engine: "logical",
       key: clusterKey,
-      database: "*",
+      database: config.mongo.database,
       createdAt: startedAt.toISOString(),
       completedAt: completedAt.toISOString(),
       durationMs,
@@ -297,7 +355,7 @@ export async function runShardedClusterBackup({
       sharding: clusterMeta,
     };
 
-    await storage.putJson(manifestKey(clusterKey), clusterManifest);
+    await writeManifest(storage, clusterManifest, config.encryptionKey);
 
     log.info(
       {
@@ -328,17 +386,30 @@ export async function restoreShardedCluster({
   ref = "latest",
   signal,
   drop = false,
+  createMongoClient = (u) => new MongoClient(u),
+  restoreRunner = restoreBackup,
 }: ShardedRestoreOptions): Promise<ShardedRestoreResult> {
-  const log = logger.child({ ref });
+  const scope = scopeOf(config);
+  const resolvedKey =
+    ref === "latest" && typeof storage.list === "function"
+      ? await resolveBackup(storage, scope, ref)
+      : ref;
+
+  const log = logger.child({ ref: resolvedKey });
   log.info("Initiating sharded cluster restore");
 
-  const manifest = await storage.getJson<BackupManifest>(manifestKey(ref));
-  const clusterMeta = manifest?.data?.sharding;
-  if (!clusterMeta) {
-    throw new Error(`No sharded cluster metadata found in manifest for ${ref}`);
+  const manifest = await readManifest(storage, resolvedKey);
+  const clusterMeta = manifest?.sharding;
+  if (!manifest || !clusterMeta) {
+    throw new Error(`No sharded cluster metadata found in manifest for ${resolvedKey}`);
   }
 
-  const client = new MongoClient(config.mongo.uri);
+  const keyRing = resolveKeyRing(config);
+  if (manifest.encryption?.manifestHmac && keyRing.length > 0) {
+    verifyManifest(keyRing, manifest);
+  }
+
+  const client = createMongoClient(config.mongo.uri);
   const balancer = new BalancerController(client, log);
 
   try {
@@ -354,7 +425,7 @@ export async function restoreShardedCluster({
       { configsvrKey: clusterMeta.configsvr.backupKey },
       "Restoring Config Server routing metadata...",
     );
-    await restoreBackup(
+    await restoreRunner(
       { config, storage, logger: log.child({ target: "configsvr" }), signal },
       {
         ref: clusterMeta.configsvr.backupKey,
@@ -372,12 +443,16 @@ export async function restoreShardedCluster({
         continue;
       }
 
+      const targetShardUri = shard.host
+        ? buildShardUri(config.mongo.uri, shard.host)
+        : config.mongo.uri;
+
       log.info({ shardId, backupKey: shard.backupKey }, "Restoring shard...");
-      await restoreBackup(
+      await restoreRunner(
         { config, storage, logger: log.child({ target: shardId }), signal },
         {
           ref: shard.backupKey,
-          uri: config.mongo.uri,
+          uri: targetShardUri,
           database: "*",
           drop,
         },
@@ -397,7 +472,7 @@ export async function restoreShardedCluster({
     );
 
     return {
-      key: ref,
+      key: resolvedKey,
       clusterTime: clusterMeta.clusterTime,
       restoredShards,
       configsvrRestored: true,

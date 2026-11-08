@@ -104,5 +104,16 @@ describe("cloud volume snapshot engine", () => {
     expect(unlocked).toBe(true);
     expect(uploadedManifest).toBeDefined();
     expect(uploadedManifest.snapshot.volumeId).toBe("vol-0123456789");
+
+    const { restoreCloudSnapshot } = await import("../src/snapshot.js");
+    mockStorage.getJson = async () => ({ data: uploadedManifest });
+    const restoreRes = await restoreCloudSnapshot({
+      config,
+      storage: mockStorage,
+      logger: mockLogger,
+      ref: result.manifest.key,
+    });
+    expect(restoreRes.snapshotId).toBe("snap-vol-0123456789");
+    expect(restoreRes.newVolumeId).toBe("vol-restored-snap-vol-0123456789");
   });
 });

@@ -15,14 +15,26 @@ export interface TarExtractResult {
 }
 
 /**
- * Creates a standard 512-byte POSIX UStar tar file header.
+ * Creates a standard 512-byte POSIX UStar tar file header, supporting paths up to 255 bytes via UStar prefix.
  */
 export function createTarHeader(name: string, size: number, mtime: number = Date.now()): Buffer {
   const buf = Buffer.alloc(512, 0);
 
-  // name: 0..100 (normalized, POSIX separators)
-  const normName = name.replace(/\\/g, "/").slice(0, 100);
-  buf.write(normName, 0, "utf8");
+  const cleanName = name.replace(/\\/g, "/").replace(/^\/+/, "");
+  if (Buffer.byteLength(cleanName, "utf8") <= 100) {
+    buf.write(cleanName, 0, 100, "utf8");
+  } else {
+    // Split into UStar prefix (up to 155 bytes at offset 345) and basename (up to 100 bytes at offset 0)
+    const slashIdx = cleanName.lastIndexOf("/");
+    if (slashIdx > 0) {
+      const prefix = cleanName.slice(0, slashIdx).slice(0, 155);
+      const base = cleanName.slice(slashIdx + 1).slice(0, 100);
+      buf.write(base, 0, 100, "utf8");
+      buf.write(prefix, 345, 155, "utf8");
+    } else {
+      buf.write(cleanName.slice(0, 100), 0, 100, "utf8");
+    }
+  }
 
   // mode: 100..108 (0644)
   buf.write("0000644\0", 100, "ascii");
@@ -148,11 +160,16 @@ export async function extractTarStream(
         const isZero = headerBuf.every((b) => b === 0);
         if (isZero) continue;
 
-        const rawName = headerBuf.toString("utf8", 0, 100).replace(/\0.*$/, "").trim();
+        const baseName = headerBuf.toString("utf8", 0, 100).replace(/\0.*$/, "").trim();
+        const ustarPrefix = headerBuf.toString("utf8", 345, 500).replace(/\0.*$/, "").trim();
+        const rawName = ustarPrefix ? `${ustarPrefix}/${baseName}` : baseName;
         if (!rawName) continue;
 
         // Path traversal sanitization
-        const safeName = path.normalize(rawName).replace(/^(\.\.[/\\])+/, "");
+        const safeName = path.posix
+          .normalize(rawName.replace(/\\/g, "/"))
+          .replace(/^(\.\.\/)+/, "")
+          .replace(/^\/+/, "");
         const rawSize = headerBuf.toString("ascii", 124, 136).replace(/\0.*$/, "").trim();
         const size = parseInt(rawSize, 8) || 0;
 

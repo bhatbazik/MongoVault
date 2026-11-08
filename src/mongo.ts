@@ -19,7 +19,7 @@ export interface InspectMongoClusterOptions {
 }
 
 /**
- * Inspects a MongoDB instance or cluster for topology, version, role, and oplog availability (DRY).
+ * Inspects a MongoDB instance or cluster for topology, version, role, and oplog availability.
  */
 export async function inspectMongoCluster(
   client: MongoClient,
