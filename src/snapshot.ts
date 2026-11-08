@@ -115,7 +115,7 @@ export class CommandHookSnapshotDriver implements CloudSnapshotDriver {
  * Built-in cloud volume snapshot driver for standard cloud provider records.
  */
 export class BuiltinCloudSnapshotDriver implements CloudSnapshotDriver {
-  constructor(private readonly provider: string) {}
+  constructor(readonly provider: string = "aws-ebs") {}
 
   async createSnapshot(_params: {
     volumeId?: string;
@@ -123,9 +123,7 @@ export class BuiltinCloudSnapshotDriver implements CloudSnapshotDriver {
     tags?: Record<string, string>;
     signal?: AbortSignal;
   }): Promise<{ snapshotId: string; status: string }> {
-    const snapPrefix =
-      this.provider === "aws-ebs" ? "snap" : this.provider === "gcp-pd" ? "gcp-snap" : "az-snap";
-    const snapshotId = `${snapPrefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const snapshotId = `snap-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     return { snapshotId, status: "completed" };
   }
 

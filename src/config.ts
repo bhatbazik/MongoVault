@@ -62,7 +62,6 @@ const schema = z
     S3_PREFIX: z.string().default("mongodb"),
     S3_PART_SIZE_MB: z.coerce.number().int().min(5).max(512).default(32),
     S3_QUEUE_SIZE: z.coerce.number().int().min(1).max(16).default(2),
-    R2_ACCOUNT_ID: z.string().optional(),
 
     S3_OBJECT_LOCK_ENABLED: flag(false),
     S3_OBJECT_LOCK_MODE: z.enum(["GOVERNANCE", "COMPLIANCE"]).default("GOVERNANCE"),
@@ -72,7 +71,7 @@ const schema = z
     BACKUP_ENGINE: z.enum(["logical", "physical", "snapshot"]).default("logical"),
     PHYSICAL_DB_PATH: z.string().optional(),
 
-    SNAPSHOT_PROVIDER: z.enum(["aws-ebs", "gcp-pd", "azure-disk", "custom"]).default("aws-ebs"),
+    SNAPSHOT_PROVIDER: z.enum(["aws-ebs", "custom"]).default("aws-ebs"),
     SNAPSHOT_VOLUME_ID: z.string().optional(),
     SNAPSHOT_REGION: z.string().optional(),
     SNAPSHOT_COMMAND_HOOK: z.string().optional(),
@@ -247,11 +246,6 @@ function toConfig(env: z.infer<typeof schema>): AppConfig {
   };
   const retentionEnabled = Object.values(retention).some((value) => value > 0);
 
-  let endpoint = env.S3_ENDPOINT;
-  if (!endpoint && env.R2_ACCOUNT_ID) {
-    endpoint = `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
-  }
-
   return {
     engine: env.BACKUP_ENGINE,
     mongo: {
@@ -272,8 +266,8 @@ function toConfig(env: z.infer<typeof schema>): AppConfig {
       path: env.STORAGE_PATH,
       bucket:
         env.STORAGE_TYPE === "filesystem" ? (env.STORAGE_PATH ?? "filesystem") : env.S3_BUCKET,
-      endpoint,
-      region: env.S3_REGION ?? (env.R2_ACCOUNT_ID ? "auto" : process.env.AWS_REGION || "us-east-1"),
+      endpoint: env.S3_ENDPOINT,
+      region: env.S3_REGION ?? (process.env.AWS_REGION || "ap-south-1"),
       forcePathStyle: env.S3_FORCE_PATH_STYLE,
       accessKeyId: env.S3_ACCESS_KEY_ID,
       secretAccessKey: env.S3_SECRET_ACCESS_KEY,

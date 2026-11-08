@@ -25,7 +25,7 @@ describe("config", () => {
     expect(config.encryptionKey).toBeNull();
   });
 
-  it("loads native AWS S3 configuration without S3_ENDPOINT or R2_ACCOUNT_ID", () => {
+  it("loads native AWS S3 configuration without S3_ENDPOINT", () => {
     const { S3_ENDPOINT, ...nativeAwsEnv } = minimalValidEnv;
     const config = loadConfig({ ...nativeAwsEnv, S3_REGION: "eu-west-2" });
     expect(config.storage.endpoint).toBeUndefined();
@@ -37,13 +37,6 @@ describe("config", () => {
     const { MONGODB_DATABASE, ...clusterEnv } = minimalValidEnv;
     const config = loadConfig(clusterEnv);
     expect(config.mongo.database).toBe("*");
-  });
-
-  it("supports Cloudflare R2 endpoint derivation from account ID", () => {
-    const { S3_ENDPOINT, ...rest } = minimalValidEnv;
-    const config = loadConfig({ ...rest, R2_ACCOUNT_ID: "acct123" });
-    expect(config.storage.endpoint).toBe("https://acct123.r2.cloudflarestorage.com");
-    expect(config.storage.region).toBe("auto");
   });
 
   it("throws ConfigError on missing required variables", () => {

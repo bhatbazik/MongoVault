@@ -219,7 +219,7 @@ export class FilesystemStorageClient implements StorageClient {
 }
 
 /**
- * StorageClient implementation backed by AWS S3 or S3-compatible object storage (e.g. Cloudflare R2, MinIO).
+ * StorageClient implementation backed by AWS S3.
  */
 export class S3StorageClient implements StorageClient {
   readonly bucket: string;
@@ -437,11 +437,6 @@ export class S3StorageClient implements StorageClient {
       if (isPreconditionFailed(err)) {
         return null;
       }
-      if (isConditionalHeaderUnsupported(err)) {
-        await this.putJson(key, record);
-        const readBack = await this.getJson<LockRecord>(key);
-        return readBack?.data?.token === token ? token : null;
-      }
       throw err;
     }
   }
@@ -464,11 +459,10 @@ export class S3StorageClient implements StorageClient {
         await this.client.send(new PutObjectCommand(putParams));
         return true;
       } catch (err) {
-        if (isConditionalHeaderUnsupported(err)) {
-          await this.putJson(key, updated);
-          return true;
+        if (isPreconditionFailed(err)) {
+          return false;
         }
-        return false;
+        throw err;
       }
     }
     return false;
@@ -489,7 +483,7 @@ export class S3StorageClient implements StorageClient {
           return;
         } catch (err) {
           if (isPreconditionFailed(err)) return;
-          if (!isConditionalHeaderUnsupported(err)) throw err;
+          throw err;
         }
       }
       await this.remove(key);
@@ -536,16 +530,5 @@ function isPreconditionFailed(error: unknown): boolean {
     err?.name === "ConditionalRequestConflict" ||
     status === 412 ||
     status === 409
-  );
-}
-
-function isConditionalHeaderUnsupported(error: unknown): boolean {
-  const err = error as AwsErrorLike | null | undefined;
-  const status = err?.$metadata?.httpStatusCode;
-  return (
-    err?.name === "NotImplemented" ||
-    err?.code === "NotImplemented" ||
-    err?.name === "InvalidArgument" ||
-    status === 501
   );
 }

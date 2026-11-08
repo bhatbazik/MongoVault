@@ -5,7 +5,7 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-6.0-3178C6.svg)](https://www.typescriptlang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Streaming MongoDB backup daemon and CLI with S3/Cloudflare R2 multipart uploads, framed AES-256-GCM envelope encryption, continuous Point-in-Time Recovery (PITR) oplog slicing, automated restore drills, and Prometheus metrics.
+Streaming MongoDB backup daemon and CLI with AWS S3 multipart uploads, framed AES-256-GCM envelope encryption, continuous Point-in-Time Recovery (PITR) oplog slicing, automated restore drills, and Prometheus metrics.
 
 ---
 
@@ -19,7 +19,7 @@ MongoVault is designed for running reliable MongoDB backups on hosts where local
 - **Four Backup Engines:**
   - `logical` — Streaming `mongodump` / `mongorestore` archive pipeline with optional oplog capture and namespace filtering.
   - `physical` — Hot WiredTiger file copy via `$backupCursor` and `$backupCursorExtend` (with `fsyncLock` fallback on standalone instances).
-  - `snapshot` — Quiesces writes with `fsyncLock`, triggers cloud block-volume snapshots (AWS EBS, GCP Persistent Disk, Azure Managed Disk, or custom shell hooks), and immediately releases the lock.
+  - `snapshot` — Quiesces writes with `fsyncLock`, triggers cloud block-volume snapshots (AWS EBS or custom shell hooks), and immediately releases the lock.
   - `sharded` — Coordinates sharded cluster backups via `mongos`: stops and drains the balancer, records cluster time, and backs up `configsvr` plus each shard replica set under isolated storage prefixes.
 - **Continuous PITR Oplog Archiver:** Tails `local.oplog.rs` up to the replica set majority commit point (`lastCommittedOpTime`), checks `config.transactions` for in-flight distributed transactions, and archives compressed/encrypted `.oplog.bson.gz` slices. Point-in-time restores (`--pitr`) automatically resolve the latest base backup prior to the target timestamp and replay contiguous slices up to the target second/ordinal.
 - **Framed AEAD Envelope Encryption (`aes-256-gcm-chunked`):** Each backup generates a unique 256-bit Data Encryption Key (DEK) wrapped by the master key. Stream payloads are encrypted in 64 KiB frames with per-chunk nonces, 128-bit GCM authentication tags, and a terminal `0xFFFFFFFF` sentinel frame to detect mid-stream truncation before corrupt bytes reach the database.
@@ -37,8 +37,8 @@ MongoVault is designed for running reliable MongoDB backups on hosts where local
                           │                         MongoVault                          │
                           │                                                             │
 ┌──────────────┐          │  ┌───────────┐      ┌───────────┐      ┌─────────────────┐  │      ┌─────────────────┐
-│  mongodump   │ stdout   │  │   Gzip    │      │  Chunked  │      │  S3 Multipart   │  │ PUT  │   AWS S3 / R2   │
-│      or      ├──────────┼─►│   Stream  ├─────►│  AES-GCM  ├─────►│   + SHA-256     ├──┼─────►│  / MinIO / FS   │
+│  mongodump   │ stdout   │  │   Gzip    │      │  Chunked  │      │  S3 Multipart   │  │ PUT  │     AWS S3      │
+│      or      ├──────────┼─►│   Stream  ├─────►│  AES-GCM  ├─────►│   + SHA-256     ├──┼─────►│     / FS        │
 │$backupCursor │          │  │           │      │ (64 KiB)  │      │  (32 MiB parts) │  │      │                 │
 └──────────────┘          │  └───────────┘      └───────────┘      └─────────────────┘  │      └────────┬────────┘
                           │                                                             │               │
@@ -89,7 +89,7 @@ Encrypted archives (`.enc`) use a framed binary layout so decryption can authent
 
 ### 1. Run with Docker Compose
 
-Starts MongoDB 7.0, MinIO S3 storage, and the MongoVault daemon:
+Starts MongoDB 7.0, LocalStack (emulating AWS S3), and the MongoVault daemon:
 
 ```bash
 docker compose up -d
@@ -220,9 +220,9 @@ All settings are validated at startup via Zod ([`src/config.ts`](src/config.ts))
 | **Backup Engines & Sharding**      |               |                      |                                                                             |
 | `BACKUP_ENGINE`                    |    String     |      `logical`       | Default engine: `logical`, `physical`, or `snapshot`                        |
 | `PHYSICAL_DB_PATH`                 |     Path      |       Optional       | WiredTiger `dbPath` on local filesystem (for `physical` engine)             |
-| `SNAPSHOT_PROVIDER`                |    String     |      `aws-ebs`       | `aws-ebs`, `gcp-pd`, `azure-disk`, or `custom`                              |
+| `SNAPSHOT_PROVIDER`                |    String     |      `aws-ebs`       | `aws-ebs` or `custom`                                                       |
 | `SNAPSHOT_VOLUME_ID`               |    String     |       Optional       | Cloud volume identifier to snapshot                                         |
-| `SNAPSHOT_REGION`                  |    String     |       Optional       | Cloud provider region for volume snapshots                                  |
+| `SNAPSHOT_REGION`                  |    String     |       Optional       | AWS region for volume snapshots                                             |
 | `SNAPSHOT_COMMAND_HOOK`            |    String     |       Optional       | External executable invoked for custom snapshot create/restore              |
 | `SHARDING_ENABLED`                 |    Boolean    |       `false`        | Coordinate multi-shard backup across `mongos`, `configsvr`, and shards      |
 | `SHARDING_CONFIGSVR_URI`           |    String     |       Optional       | Optional dedicated Config Server connection URI                             |
@@ -233,14 +233,13 @@ All settings are validated at startup via Zod ([`src/config.ts`](src/config.ts))
 | **Storage (`s3` or `filesystem`)** |               |                      |                                                                             |
 | `STORAGE_TYPE`                     |    String     |         `s3`         | `s3` or `filesystem`                                                        |
 | `STORAGE_PATH`                     |     Path      |       Optional       | Directory path when `STORAGE_TYPE=filesystem`                               |
-| `S3_BUCKET`                        |    String     |   _Required (S3)_    | Target S3 / R2 / MinIO bucket name                                          |
-| `S3_ACCESS_KEY_ID`                 |    String     |   _Required (S3)_    | S3 access key ID                                                            |
-| `S3_SECRET_ACCESS_KEY`             |    String     |   _Required (S3)_    | S3 secret access key                                                        |
+| `S3_BUCKET`                        |    String     |   _Required (S3)_    | Target AWS S3 bucket name                                                   |
+| `S3_ACCESS_KEY_ID`                 |    String     |   _Required (S3)_    | AWS access key ID                                                           |
+| `S3_SECRET_ACCESS_KEY`             |    String     |   _Required (S3)_    | AWS secret access key                                                       |
 | `S3_PREFIX`                        |    String     |     `"mongodb"`      | Object key prefix inside bucket                                             |
-| `S3_REGION`                        |    String     |       `"auto"`       | S3 region                                                                   |
-| `S3_ENDPOINT`                      |      URL      |       Optional       | Custom S3 endpoint (Cloudflare R2, MinIO, Wasabi, DigitalOcean)             |
-| `R2_ACCOUNT_ID`                    |    String     |       Optional       | Cloudflare account ID (auto-configures `S3_ENDPOINT` and region)            |
-| `S3_FORCE_PATH_STYLE`              |    Boolean    |       `false`        | Force path-style addressing (required for MinIO)                            |
+| `S3_REGION`                        |    String     |    `"us-east-1"`     | AWS region                                                                  |
+| `S3_ENDPOINT`                      |      URL      |       Optional       | Custom S3 endpoint (e.g. AWS VPC Endpoint, LocalStack)                      |
+| `S3_FORCE_PATH_STYLE`              |    Boolean    |       `false`        | Force path-style addressing (e.g. for LocalStack)                           |
 | `S3_PART_SIZE_MB`                  |    Number     |         `32`         | Multipart upload chunk size (`5`–`512` MiB)                                 |
 | `S3_QUEUE_SIZE`                    |    Number     |         `2`          | Concurrent multipart upload streams (`1`–`16`)                              |
 | `S3_STORAGE_CLASS`                 |    String     |     `"STANDARD"`     | S3 storage class (`STANDARD`, `STANDARD_IA`, `GLACIER_IR`, etc.)            |

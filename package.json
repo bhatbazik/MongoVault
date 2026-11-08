@@ -1,7 +1,7 @@
 {
   "name": "mongodb-backup-service",
   "version": "1.0.0",
-  "description": "Production MongoDB backup daemon with S3/R2 streaming, client-side encryption, automated restore drills, and Prometheus metrics",
+  "description": "Production MongoDB backup daemon with AWS S3 streaming, client-side encryption, automated restore drills, and Prometheus metrics",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
@@ -53,9 +53,10 @@
     "mongodb",
     "backup",
     "restore",
+    "aws",
+    "aws-s3",
     "s3",
-    "r2",
-    "cloudflare-r2",
+    "ebs",
     "encryption",
     "prometheus",
     "streaming"

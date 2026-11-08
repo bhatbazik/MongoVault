@@ -4,7 +4,7 @@ import type { Logger } from "./logger.js";
 import type { StorageClient } from "./storage.js";
 import type { MongoClient } from "mongodb";
 
-export type SnapshotProviderType = "aws-ebs" | "gcp-pd" | "azure-disk" | "custom";
+export type SnapshotProviderType = "aws-ebs" | "custom";
 
 export interface SnapshotDriverOptions {
   provider: SnapshotProviderType;

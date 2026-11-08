@@ -43,7 +43,7 @@ export interface PhysicalBackupMeta {
 }
 
 export interface CloudSnapshotMeta {
-  provider: "aws-ebs" | "gcp-pd" | "azure-disk" | "custom";
+  provider: "aws-ebs" | "custom";
   snapshotId: string;
   volumeId: string;
   region?: string;

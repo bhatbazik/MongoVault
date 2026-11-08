@@ -58,7 +58,7 @@ export interface PhysicalConfig {
 }
 
 export interface CloudSnapshotConfig {
-  provider: "aws-ebs" | "gcp-pd" | "azure-disk" | "custom";
+  provider: "aws-ebs" | "custom";
   volumeId?: string;
   region?: string;
   commandHook?: string;
