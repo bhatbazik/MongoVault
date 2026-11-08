@@ -25,5 +25,5 @@ Contributions, bug reports, and pull requests are welcome.
 ## Guidelines
 
 - **Zero Temporary Disk Invariant:** Changes to backup or restore pipelines (`src/backup.ts`, `src/restore.ts`, `src/physical.ts`) must preserve end-to-end Node.js stream backpressure without buffering full archives in memory or on local disk.
-- **Cryptographic Backward Compatibility:** Any modification to `src/crypto.ts` or `.manifest.json` must preserve backward compatibility with existing `aes-256-gcm-chunked` and legacy `aes-256-gcm` archives, accompanied by unit tests in `tests/crypto.test.js`.
+- **Cryptographic Security & Key Separation:** Any modification to `src/crypto.ts` or `.manifest.json` must adhere strictly to chunked AEAD (`aes-256-gcm-chunked`) framing and RFC 5869 HKDF sub-key derivation (`deriveWrapKey`, `deriveHmacKey`), accompanied by unit tests in `tests/crypto.test.js`.
 - **Tests:** Include unit or pipeline tests in `tests/` for new features or bug fixes.

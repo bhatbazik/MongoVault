@@ -116,6 +116,29 @@ describe("multi-shard cluster coordinator", () => {
     expect(polls).toBe(2);
   });
 
+  it("aborts backup with ActiveChunkMigrationError if chunk migrations fail to drain within timeout", async () => {
+    const mockClient = {
+      db(name) {
+        if (name === "admin") {
+          return {
+            async command(cmd) {
+              if (cmd.balancerStop) return { ok: 1 };
+              if (cmd.balancerStatus) {
+                return { mode: "off", inBalancerRound: true };
+              }
+              return { ok: 1 };
+            },
+          };
+        }
+        return {};
+      },
+    };
+
+    const { BalancerController, ActiveChunkMigrationError } = await import("../src/sharding.js");
+    const balancer = new BalancerController(mockClient);
+    await expect(balancer.stopAndDrain(100)).rejects.toThrow(ActiveChunkMigrationError);
+  });
+
   it("builds shard connection URIs preserving credentials and query options", async () => {
     const { buildShardUri } = await import("../src/sharding.js");
     const uri1 = buildShardUri(

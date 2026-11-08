@@ -104,6 +104,10 @@ MongoVault eliminates intermediate disk staging entirely. It treats backup and r
 - **During Backup:** Data emitted by MongoDB (`mongodump --archive` or WiredTiger `$backupCursor`) is piped directly through memory into gzip compression, chunked authenticated encryption (`aes-256-gcm-chunked`), an inline SHA-256 digest calculator, and straight into an AWS S3 multipart upload (or mounted filesystem). Memory buffers are governed by Node.js stream backpressure (`highWaterMark: 1 MiB`), keeping the resident memory footprint predictable (typically under 70 MiB under default configuration).
 - **During Restore:** Encrypted data is pulled as a byte stream from S3 or disk, verified against per-chunk AEAD authentication tags in 64 KiB frames, decrypted, decompressed, and fed straight into `mongorestore` or a POSIX UStar tar extractor.
 
+> [!NOTE]
+> **Diskless Architecture Scope & PITR Qualification:**
+> The primary backup streaming pipeline, base restore pipeline, physical hot copy, and verification engine are strictly **zero-temporary-disk**. However, incremental Point-in-Time Recovery (PITR) slice replay temporarily stages individual uncompressed oplog slices to `WORK_DIR` as ephemeral `.pitr-slice-<uuid>.oplog.bson` files. This is required because `mongorestore` mandates a seekable filesystem path when using `--oplogFile` with `--oplogLimit`. Each slice file is deleted immediately upon replay completion.
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
 │                             BACKUP STREAM PIPELINE (ZERO DISK)                              │
@@ -775,6 +779,14 @@ sequenceDiagram
     Storage-->>Coord: Manifest committed
 ```
 
+> [!WARNING]
+> **Cross-Shard Consistency & Balancer Timeout Analysis:**
+> During sharded backups, MongoVault invokes `balancerStop` and polls for active migrations to finish for up to 30 seconds.
+>
+> - **In-Flight Migrations:** If a chunk migration is still active when the 30-second timeout expires, proceeding with the backup risks **cross-shard inconsistency**: documents migrating between shards can either appear on both shards (duplicate documents) or be absent from both shards (data loss) depending on whether the source or donor shard is dumped first.
+> - **Cross-Shard Transactions:** MongoDB distributed transactions (spanning multiple shards) commit across shards via two-phase commit. Sequential shard dumping means Shard $N$ reflects write operations that occurred after Shard 1 finished dumping.
+> - **Production Recommendation:** For strict zero-loss consistency across large sharded clusters with frequent chunk balancing, enforce dedicated backup balancing windows where the balancer is turned off ahead of time, or halt the backup if migrations fail to drain rather than proceeding after timeout.
+
 ---
 
 ### Engine Comparison Matrix
@@ -887,13 +899,16 @@ export function computeAad(frameIndex: number, isFinal: boolean): Buffer {
 If a network connection drops or an attacker truncates the file, decryption detects this immediately. If the stream ends without encountering a frame where `isFinal === true`, or if trailing bytes remain, `ChunkedAeadDecryptStream` emits an error:
 `Truncated AEAD stream: end of stream reached before final frame`.
 
-#### Envelope Key Wrapping
+#### Envelope Key Wrapping and HKDF Key Separation
 
 1. A unique 32-byte Data Encryption Key (DEK) is generated per archive using `crypto.randomBytes(32)`.
-2. The DEK is wrapped using the configured Master Key via AES-256-GCM:
+2. MongoVault derives distinct sub-keys from `masterKey` via HKDF (RFC 5869 / NIST SP 800-108) with cryptographic domain separation:
+   - $K_{\text{wrap}} = \text{HKDF-SHA256}(\text{masterKey}, \text{"mongovault-v2-dek-wrap"}, 32)$: Dedicated to ephemeral DEK wrapping.
+   - $K_{\text{manifest}} = \text{HKDF-SHA256}(\text{masterKey}, \text{"mongovault-v2-manifest-hmac"}, 32)$: Dedicated to manifest HMAC authentication.
+3. The DEK is wrapped using $K_{\text{wrap}}$ via AES-256-GCM:
    `wrap(masterKey, dataKey) = Base64( IV[12B] || AuthTag[16B] || Ciphertext[32B] )`.
-3. The wrapped DEK and the Key ID (`sha256(masterKey).slice(0, 16)`) are stored in the manifest.
-4. Historical backups can be decrypted using older keys configured in `ENCRYPTION_KEY_RING`.
+4. The wrapped DEK and the Key ID (`sha256(masterKey).slice(0, 16)`) are stored in the manifest.
+5. Historical backups can be decrypted using older keys configured in `ENCRYPTION_KEY_RING`.
 
 ---
 
@@ -1202,6 +1217,13 @@ flowchart TD
         MK["Master Encryption Key\n(32 bytes / 256 bits)\nFrom ENCRYPTION_KEY"]
     end
 
+    subgraph Derivation["HKDF Subkey Derivation (RFC 5869)"]
+        MK --> HKDF_Wrap["HKDF-SHA256\ninfo: mongovault-v2-dek-wrap"]
+        MK --> HKDF_Hmac["HKDF-SHA256\ninfo: mongovault-v2-manifest-hmac"]
+        HKDF_Wrap --> WrapKey["Wrap Key (32B)"]
+        HKDF_Hmac --> HmacKey["HMAC Signing Key (32B)"]
+    end
+
     subgraph DEKSpace["Per-Backup Ephemeral Crypto"]
         DEK["Data Encryption Key (DEK)\n(32 bytes cryptographically secure random)"]
         BaseIV["Base Nonce (12 bytes random)"]
@@ -1209,7 +1231,7 @@ flowchart TD
     end
 
     subgraph Wrapping["Key Wrapping (AES-256-GCM)"]
-        MK --> WrapEngine["AES-256-GCM Wrap"]
+        WrapKey --> WrapEngine["AES-256-GCM Wrap"]
         DEK --> WrapEngine
         WrapIV --> WrapEngine
         WrapEngine --> WrappedDEK["wrappedKey (Base64)\nIV (12B) + Tag (16B) + Ciphertext (32B)"]
@@ -1251,7 +1273,7 @@ Every frame binds the following 5-byte AAD into the GCM cipher:
 
 Manifests contain metadata that directs restore behavior (e.g. `oplogWindow`, collection counts, DEK envelopes).
 
-- To prevent tampering, MongoVault produces a canonical JSON string of the manifest and signs it with HMAC-SHA256 using the master key.
+- To prevent tampering, MongoVault produces a canonical JSON string of the manifest and signs it with HMAC-SHA256 using the dedicated HKDF-derived manifest key (`deriveHmacKey(masterKey)`).
 - The resulting signature is stored in `encryption.manifestHmac`.
 - Verification uses `crypto.timingSafeEqual` to prevent side-channel timing attacks.
 
@@ -1333,6 +1355,34 @@ If `oplog:slice` reports that an oplog gap was detected:
    node dist/index.js backup --oplog
    ```
 2. Future PITR restores will automatically bind to this new base backup.
+
+#### Runbook 3: Safe Production Restores (Staging & Atomic Cutover)
+
+Running an in-place destructive restore (`restore --drop`) directly against an active production database carries the risk of leaving the database in a partially restored, torn state if the network drops or the process terminates halfway through.
+
+For disaster-safe production restores:
+
+1. **Restore into an Isolated Staging Database:**
+   ```bash
+   node dist/index.js restore \
+     --key latest \
+     --uri "mongodb://cluster:27017" \
+     --database production_staged \
+     --drop
+   ```
+2. **Execute Post-Restore Data Validation:**
+   Query `production_staged` to verify document counts, indexes, and application integrity against the newly restored data.
+3. **Perform Controlled Cutover:**
+   Execute atomic collection swaps using MongoDB's `renameCollection` command with `dropTarget: true`:
+   ```javascript
+   db.adminCommand({
+     renameCollection: "production_staged.orders",
+     to: "production.orders",
+     dropTarget: true,
+   });
+   ```
+4. **Clean up:**
+   Once verified, drop the temporary `production_staged` database.
 
 ---
 

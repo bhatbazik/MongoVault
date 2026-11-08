@@ -59,6 +59,13 @@ export function buildShardUri(baseUri: string, shardHost: string): string {
   return `mongodb://${authPrefix}${hosts}/${queryStr ? `?${queryStr}` : ""}`;
 }
 
+export class ActiveChunkMigrationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ActiveChunkMigrationError";
+  }
+}
+
 /**
  * Controller for coordinating MongoDB sharded cluster balancer states.
  */
@@ -69,22 +76,23 @@ export class BalancerController {
   ) {}
 
   async stopAndDrain(timeoutMs = 30_000): Promise<boolean> {
+    this.logger?.info("Stopping balancer and waiting for active chunk migrations to complete...");
     try {
-      this.logger?.info("Stopping balancer and waiting for active chunk migrations to complete...");
       await this.client.db("admin").command({ balancerStop: 1 });
-      const bStatus = await waitForBalancerDisabled(this.client, timeoutMs);
-      if (bStatus.inBalancerRound) {
-        this.logger?.warn(
-          "Active balancer round did not conclude within 30s; proceeding with backup",
-        );
-      } else {
-        this.logger?.info("Cluster balancer disabled and quiet");
-      }
-      return true;
     } catch (err) {
-      this.logger?.warn({ err }, "Could not stop balancer; proceeding with cluster backup");
-      return false;
+      this.logger?.error({ err }, "Could not issue balancerStop command to cluster");
+      throw err;
     }
+
+    const bStatus = await waitForBalancerDisabled(this.client, timeoutMs);
+    if (bStatus.inBalancerRound) {
+      throw new ActiveChunkMigrationError(
+        `Active chunk migration round did not conclude within ${Math.round(timeoutMs / 1000)}s. Aborting backup to prevent cross-shard data loss or duplicate documents.`,
+      );
+    }
+
+    this.logger?.info("Cluster balancer disabled and quiet");
+    return true;
   }
 
   async start(): Promise<void> {

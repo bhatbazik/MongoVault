@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { createCipheriv, randomBytes } from "node:crypto";
+import { createHmac, randomBytes } from "node:crypto";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { describe, expect, it } from "vitest";
@@ -7,7 +7,9 @@ import {
   CHUNKED_ALGORITHM,
   createDecryptor,
   createEncryptor,
+  deriveHmacKey,
   deriveNonce,
+  deriveWrapKey,
   generateKey,
   keyId,
   parseKey,
@@ -120,38 +122,17 @@ describe("crypto", () => {
     ).rejects.toThrow(/Truncated AEAD stream/);
   });
 
-  it("supports backwards compatibility with legacy single-block aes-256-gcm backups", async () => {
+  it("rejects non-chunked encryption algorithms", () => {
     const masterKey = parseKey(generateKey());
-    const dataKey = randomBytes(32);
-    const iv = randomBytes(12);
-    const cipher = createCipheriv("aes-256-gcm", dataKey, iv);
-    const payload = Buffer.from("legacy database backup content");
-    const ciphertext = Buffer.concat([cipher.update(payload), cipher.final()]);
-    const authTag = cipher.getAuthTag();
-
-    // Wrap dataKey with masterKey using AES-GCM
-    const wrapIv = randomBytes(12);
-    const wrapCipher = createCipheriv("aes-256-gcm", masterKey, wrapIv);
-    const wrappedEnc = Buffer.concat([wrapCipher.update(dataKey), wrapCipher.final()]);
-    const wrappedKey = Buffer.concat([wrapIv, wrapCipher.getAuthTag(), wrappedEnc]).toString(
-      "base64",
-    );
-
-    const legacyEnvelope = {
+    const invalidEnvelope = {
       algorithm: "aes-256-gcm",
       keyId: keyId(masterKey),
-      wrappedKey,
-      iv: iv.toString("base64"),
-      authTag: authTag.toString("base64"),
+      wrappedKey: "dummy",
+      iv: Buffer.alloc(12).toString("base64"),
     };
-
-    const decipher = createDecryptor(masterKey, legacyEnvelope);
-    const decrypted = [];
-    await pipeline(Readable.from(ciphertext), decipher, async function* (source) {
-      for await (const chunk of source) decrypted.push(chunk);
-    });
-
-    expect(Buffer.concat(decrypted)).toEqual(payload);
+    expect(() => createDecryptor(masterKey, invalidEnvelope)).toThrow(
+      "Unsupported encryption algorithm: aes-256-gcm",
+    );
   });
 
   it("fails decryption if keyId does not match master key", async () => {
@@ -243,5 +224,63 @@ describe("crypto", () => {
     const tampered = structuredClone(manifest);
     tampered.oplog = true;
     expect(() => verifyManifest(masterKey, tampered)).toThrow("Manifest HMAC verification failed");
+  });
+
+  it("derives distinct sub-keys via HKDF for wrapping and HMAC signing (domain separation)", () => {
+    const masterKey = parseKey(generateKey());
+    const wrapKey = deriveWrapKey(masterKey);
+    const hmacKey = deriveHmacKey(masterKey);
+
+    expect(wrapKey.length).toBe(32);
+    expect(hmacKey.length).toBe(32);
+    expect(wrapKey).not.toEqual(masterKey);
+    expect(hmacKey).not.toEqual(masterKey);
+    expect(wrapKey).not.toEqual(hmacKey);
+  });
+
+  it("rejects manifests signed with raw masterKey or invalid signature without HKDF", () => {
+    const masterKey = parseKey(generateKey());
+    const manifest = {
+      version: 2,
+      key: "mongodb/prod/2026-03-10/invalid-hmac.archive.gz.enc",
+      database: "prod",
+      createdAt: "2026-03-10T02:00:00.000Z",
+      completedAt: "2026-03-10T02:01:00.000Z",
+      size: 1024,
+      sha256: "abc123raw",
+      compression: "gzip",
+      oplog: false,
+      excludedCollections: [],
+      collections: {},
+      encryption: {
+        algorithm: CHUNKED_ALGORITHM,
+        keyId: keyId(masterKey),
+        wrappedKey: "wrapped",
+        iv: "iv",
+        chunkSize: 65536,
+      },
+    };
+
+    // Sign directly with raw masterKey (which must be rejected because HKDF derivation is strictly required)
+    const cleanEncryption = { ...manifest.encryption };
+    const canonicalPayload = JSON.stringify({
+      version: manifest.version,
+      key: manifest.key,
+      database: manifest.database,
+      createdAt: manifest.createdAt,
+      completedAt: manifest.completedAt,
+      size: manifest.size,
+      sha256: manifest.sha256,
+      compression: manifest.compression,
+      oplog: false,
+      excludedCollections: [],
+      collections: {},
+      encryption: cleanEncryption,
+    });
+    manifest.encryption.manifestHmac = createHmac("sha256", masterKey)
+      .update(canonicalPayload)
+      .digest("hex");
+
+    expect(() => verifyManifest(masterKey, manifest)).toThrow("Manifest HMAC verification failed");
   });
 });

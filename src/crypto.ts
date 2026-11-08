@@ -3,6 +3,7 @@ import {
   createDecipheriv,
   createHash,
   createHmac,
+  hkdfSync,
   randomBytes,
   timingSafeEqual,
 } from "node:crypto";
@@ -229,7 +230,7 @@ export function createDecryptor(
   masterKeys: Buffer | Buffer[],
   envelope: EncryptionEnvelope,
 ): Transform {
-  if (envelope.algorithm !== ALGORITHM && envelope.algorithm !== CHUNKED_ALGORITHM) {
+  if (envelope.algorithm !== CHUNKED_ALGORITHM) {
     throw new Error(`Unsupported encryption algorithm: ${envelope.algorithm}`);
   }
   const keys = Array.isArray(masterKeys) ? masterKeys : [masterKeys];
@@ -243,21 +244,24 @@ export function createDecryptor(
   const dataKey = unwrap(matchedKey, envelope.wrappedKey);
   const ivBuffer = Buffer.from(envelope.iv, "base64");
 
-  if (envelope.algorithm === CHUNKED_ALGORITHM) {
-    return new ChunkedAeadDecryptStream(dataKey, ivBuffer);
-  }
+  return new ChunkedAeadDecryptStream(dataKey, ivBuffer);
+}
 
-  // Backwards compatibility: legacy single-block AES-256-GCM
-  const decipher = createDecipheriv(ALGORITHM, dataKey, ivBuffer);
-  if (envelope.authTag) {
-    decipher.setAuthTag(Buffer.from(envelope.authTag, "base64"));
-  }
-  return decipher;
+export const HKDF_WRAP_INFO = "mongovault-v2-dek-wrap";
+export const HKDF_HMAC_INFO = "mongovault-v2-manifest-hmac";
+
+export function deriveWrapKey(masterKey: Buffer): Buffer {
+  return Buffer.from(hkdfSync("sha256", masterKey, Buffer.alloc(0), HKDF_WRAP_INFO, KEY_LENGTH));
+}
+
+export function deriveHmacKey(masterKey: Buffer): Buffer {
+  return Buffer.from(hkdfSync("sha256", masterKey, Buffer.alloc(0), HKDF_HMAC_INFO, KEY_LENGTH));
 }
 
 function wrap(masterKey: Buffer, dataKey: Buffer): string {
   const iv = randomBytes(IV_LENGTH);
-  const cipher = createCipheriv(ALGORITHM, masterKey, iv);
+  const wrapKey = deriveWrapKey(masterKey);
+  const cipher = createCipheriv(ALGORITHM, wrapKey, iv);
   const encrypted = Buffer.concat([cipher.update(dataKey), cipher.final()]);
   return Buffer.concat([iv, cipher.getAuthTag(), encrypted]).toString("base64");
 }
@@ -267,7 +271,9 @@ function unwrap(masterKey: Buffer, wrapped: string): Buffer {
   const iv = buffer.subarray(0, IV_LENGTH);
   const tag = buffer.subarray(IV_LENGTH, IV_LENGTH + TAG_LENGTH);
   const encrypted = buffer.subarray(IV_LENGTH + TAG_LENGTH);
-  const decipher = createDecipheriv(ALGORITHM, masterKey, iv);
+
+  const derivedKey = deriveWrapKey(masterKey);
+  const decipher = createDecipheriv(ALGORITHM, derivedKey, iv);
   decipher.setAuthTag(tag);
   return Buffer.concat([decipher.update(encrypted), decipher.final()]);
 }
@@ -307,7 +313,8 @@ export function signManifest(
   masterKey: Buffer,
   manifest: BackupManifest | Record<string, unknown>,
 ): string {
-  return createHmac("sha256", masterKey).update(canonicalManifestPayload(manifest)).digest("hex");
+  const hmacKey = deriveHmacKey(masterKey);
+  return createHmac("sha256", hmacKey).update(canonicalManifestPayload(manifest)).digest("hex");
 }
 
 export function verifyManifest(
@@ -324,12 +331,13 @@ export function verifyManifest(
       `Backup was encrypted with key ${enc.keyId}, but configured key ring has: [${configuredIds}]`,
     );
   }
-  const expected = Buffer.from(signManifest(matchedKey, manifest), "hex");
   const actual = Buffer.from(String(enc.manifestHmac), "hex");
-  if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) {
-    throw new Error(
-      `Manifest HMAC verification failed for ${(manifest as Partial<BackupManifest>).key}: manifest has been tampered with`,
-    );
+  const expectedHkdf = Buffer.from(signManifest(matchedKey, manifest), "hex");
+  if (expectedHkdf.length === actual.length && timingSafeEqual(expectedHkdf, actual)) {
+    return true;
   }
-  return true;
+
+  throw new Error(
+    `Manifest HMAC verification failed for ${(manifest as Partial<BackupManifest>).key}: manifest has been tampered with`,
+  );
 }

@@ -21,6 +21,7 @@ import {
   parseOplogTimestamp,
   parsePitrTarget,
   parseSliceKeyTimestamps,
+  pitrStateKey,
   resolvePitrPlan,
   toBsonTimestamp,
   uploadOplogSlice,
@@ -314,6 +315,69 @@ describe("Continuous Oplog Archiver and PITR Restore Coordinator", () => {
 
     const slices = await listOplogSlices(mockStorage, scopeOf(config));
     expect(slices).toHaveLength(2);
+  });
+
+  it("records gapDetected in state.json when CappedPositionLost occurs mid-stream", async () => {
+    const encKey = parseKey(generateKey());
+    const config = createConfig(encKey);
+
+    const failingClientFactory = () => ({
+      async connect() {},
+      async close() {},
+      db(name) {
+        if (name === "admin") {
+          return {
+            async command(cmd) {
+              if (cmd.replSetGetStatus) {
+                return {
+                  optimes: {
+                    lastCommittedOpTime: { ts: toBsonTimestamp({ t: 5000, i: 1 }) },
+                  },
+                };
+              }
+              return { ok: 1 };
+            },
+          };
+        }
+        return {
+          collection(_cName) {
+            return {
+              find() {
+                return {
+                  sort() {
+                    return this;
+                  },
+                  limit() {
+                    return this;
+                  },
+                  async next() {
+                    return { ts: toBsonTimestamp({ t: 1000, i: 1 }) };
+                  },
+                  async *[Symbol.asyncIterator]() {
+                    const err = new Error("collection overflow: CappedPositionLost");
+                    err.code = 136;
+                    throw err;
+                  },
+                };
+              },
+            };
+          },
+        };
+      },
+    });
+
+    await expect(
+      captureOplogSlice({
+        config,
+        storage: mockStorage,
+        logger,
+        createMongoClient: failingClientFactory,
+      }),
+    ).rejects.toThrow("CappedPositionLost");
+
+    const state = await mockStorage.getJson(pitrStateKey(scopeOf(config)));
+    const gap = state?.gapDetected ?? state?.data?.gapDetected;
+    expect(gap).toBe(true);
   });
 
   it("executes full two-stage PITR restore (base snapshot + contiguous oplog slices) and rejects gaps", async () => {

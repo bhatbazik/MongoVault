@@ -431,20 +431,49 @@ export async function captureOplogSlice({
     let firstTs: OplogTimestamp | null = null;
     let lastTs: OplogTimestamp | null = null;
 
-    for await (const doc of cursor) {
-      if (signal?.aborted) break;
-      const docTs = fromBsonTimestamp(doc.ts);
-      if (!docTs) continue;
-      const rawBuf = Buffer.isBuffer(doc) ? doc : Buffer.from(BSON.serialize(doc));
+    try {
+      for await (const doc of cursor) {
+        if (signal?.aborted) break;
+        const docTs = fromBsonTimestamp(doc.ts);
+        if (!docTs) continue;
+        const rawBuf = Buffer.isBuffer(doc) ? doc : Buffer.from(BSON.serialize(doc));
 
-      if (!firstTs) firstTs = docTs;
-      lastTs = docTs;
-      rawDocs.push(rawBuf);
-      accumulatedBytes += rawBuf.length;
+        if (!firstTs) firstTs = docTs;
+        lastTs = docTs;
+        rawDocs.push(rawBuf);
+        accumulatedBytes += rawBuf.length;
 
-      if (accumulatedBytes >= maxBytes) {
-        break;
+        if (accumulatedBytes >= maxBytes) {
+          break;
+        }
       }
+    } catch (cursorError: unknown) {
+      const err = cursorError as { code?: number; message?: string };
+      const isRollover =
+        err?.code === 50917 || // OplogRolledOver
+        err?.code === 136 || // CappedPositionLost
+        String(err?.message || "")
+          .toLowerCase()
+          .includes("cappedpositionlost") ||
+        String(err?.message || "")
+          .toLowerCase()
+          .includes("oplog rolled over");
+
+      if (isRollover) {
+        logger.error(
+          {
+            err: cursorError,
+            lastArchivedTs: cursorStartTs ? formatOplogTimestamp(cursorStartTs) : null,
+          },
+          "CRITICAL: MongoDB oplog rolled over while cursor was streaming. Timeline gap created.",
+        );
+        await storage.putJson(pitrStateKey(scope), {
+          lastTs: lastTs ? formatOplogTimestamp(lastTs) : state?.lastTs,
+          updatedAt: new Date().toISOString(),
+          gapDetected: true,
+        });
+      }
+      throw cursorError;
     }
 
     if (rawDocs.length === 0 || !firstTs || !lastTs) {

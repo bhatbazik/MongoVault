@@ -211,6 +211,14 @@ export async function restoreBackup(
 
     log.info({ restored: summary.restored, target }, "Restore completed");
     return { key, source, target, restored: summary.restored, manifest };
+  } catch (error) {
+    if (drop) {
+      log.error(
+        { err: error, target },
+        "CRITICAL: Destructive restore with --drop failed mid-operation. Target collections may be in a partially dropped or torn state. Immediate operator intervention, staging restore, or re-restore required.",
+      );
+    }
+    throw error;
   } finally {
     controller.dispose();
   }
