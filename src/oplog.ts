@@ -440,8 +440,15 @@ export async function captureOplogSlice({
           effectiveUpperTs = txTs;
         }
       }
-    } catch {
-      // Inaccessible config.transactions (e.g. standalone/mock)
+    } catch (err: unknown) {
+      logger.error(
+        { err },
+        "Failed to inspect config.transactions for active transactions. Aborting oplog slice capture to prevent inconsistent transaction replay.",
+      );
+      throw new Error(
+        `Failed to verify transaction boundaries in config.transactions: ${err instanceof Error ? err.message : String(err)}. Aborting slice capture to guarantee transaction safety.`,
+        { cause: err },
+      );
     }
 
     if (cursorStartTs && compareTimestamps(cursorStartTs, effectiveUpperTs) >= 0) {

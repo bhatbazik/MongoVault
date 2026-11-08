@@ -229,6 +229,10 @@ export async function runShardedClusterBackup({
       "Discovered sharded cluster topology",
     );
 
+    log.warn(
+      "EXPERIMENTAL: The sharded cluster engine coordinates multi-shard backups by stopping chunk balancing and anchoring shard restores to a common $clusterTime. For strict cross-shard consistency with multi-shard distributed transactions, application writes must be quiesced during the backup window or cloud volume snapshots must be used.",
+    );
+
     // 1. Quiesce cluster chunk balancing to prevent migrations during snapshot
     if (topology.balancerEnabled) {
       balancerStopped = await balancer.stopAndDrain(30_000);

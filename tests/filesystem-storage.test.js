@@ -71,4 +71,46 @@ describe("createFilesystemStorage", () => {
       await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
     }
   });
+
+  it("enforces atomic compare-and-set mutual exclusion between concurrent callers", async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "fs-storage-lock-race-"));
+    const storage1 = createFilesystemStorage({ basePath: tmpDir });
+    const storage2 = createFilesystemStorage({ basePath: tmpDir });
+    const storage3 = createFilesystemStorage({ basePath: tmpDir });
+
+    try {
+      // 3 processes concurrently try to acquire the same lock key
+      const results = await Promise.all([
+        storage1.acquireLock("shared.lock", { holder: "node-1", ttlMs: 10_000 }),
+        storage2.acquireLock("shared.lock", { holder: "node-2", ttlMs: 10_000 }),
+        storage3.acquireLock("shared.lock", { holder: "node-3", ttlMs: 10_000 }),
+      ]);
+
+      const winners = results.filter((token) => token !== null);
+      // Strict mutual exclusion: exactly ONE caller must acquire the lock
+      expect(winners).toHaveLength(1);
+
+      // Other 2 must have failed
+      const losers = results.filter((token) => token === null);
+      expect(losers).toHaveLength(2);
+
+      // Now test atomic stale lock takeover
+      // Artificially expire the winner's lock
+      const lockPath = path.join(tmpDir, "shared.lock");
+      const record = JSON.parse(await fs.readFile(lockPath, "utf8"));
+      record.expiresAt = Date.now() - 5000;
+      await fs.writeFile(lockPath, JSON.stringify(record, null, 2));
+
+      // Now node-2 and node-3 race to steal the expired lock
+      const stealResults = await Promise.all([
+        storage2.acquireLock("shared.lock", { holder: "node-2", ttlMs: 10_000 }),
+        storage3.acquireLock("shared.lock", { holder: "node-3", ttlMs: 10_000 }),
+      ]);
+
+      const stealWinners = stealResults.filter((token) => token !== null);
+      expect(stealWinners).toHaveLength(1);
+    } finally {
+      await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+    }
+  });
 });

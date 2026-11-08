@@ -26,6 +26,7 @@ export class RestoreCommand implements CommandHandler {
         nsInclude: values["ns-include"],
         nsExclude: values["ns-exclude"],
         drop: values.drop,
+        preVerify: values["pre-verify"] !== undefined ? Boolean(values["pre-verify"]) : values.drop,
         oplogReplay: values["oplog-replay"],
         oplogLimit: values["oplog-limit"],
         pitr: values.pitr,

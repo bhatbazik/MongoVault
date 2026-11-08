@@ -38,13 +38,14 @@ Options:
   --engine <string>         Backup engine: logical, physical, or snapshot (default: logical)
   --db-path <path>          WiredTiger database path for physical backup or restore
   --volume-id <string>      Cloud volume ID for cloud snapshot engine
-  --sharding                Execute synchronized multi-shard cluster backup
+  --sharding                Execute synchronized multi-shard cluster backup (experimental)
   --uri <string>            Target MongoDB URI for restore (default: MONGODB_URI)
   --database <string>       Target database name for restore (default: original database)
   --ns-include <string>     Selective restore collection pattern (e.g. "mydb.users,mydb.orders*")
   --ns-exclude <string>     Selective restore exclusion pattern (e.g. "mydb.audit_log")
   --read-preference <str>   Read preference for backup dumps (secondaryPreferred, secondary, etc.)
   --drop                    Drop existing collections before restoring
+  --pre-verify              Verify archive integrity and SHA-256 before restoring
   --oplog                   Capture point-in-time oplog during backup
   --oplog-replay            Replay captured oplog during restore
   --oplog-limit <ts:inc>    Target timestamp for snapshot oplog replay (e.g. 1774092000:1)

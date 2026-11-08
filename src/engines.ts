@@ -29,6 +29,7 @@ export interface RestoreEngineOptions {
   nsInclude?: string;
   nsExclude?: string;
   drop?: boolean;
+  preVerify?: boolean;
   oplogReplay?: boolean;
   oplogLimit?: string;
   pitr?: string;
@@ -72,6 +73,7 @@ export class LogicalBackupEngine implements BackupEngineStrategy {
         nsInclude: options.nsInclude,
         nsExclude: options.nsExclude,
         drop: options.drop,
+        preVerify: options.preVerify,
         oplogReplay: options.oplogReplay,
         oplogLimit: options.oplogLimit,
         pitr: options.pitr,
@@ -135,6 +137,10 @@ export class SnapshotBackupEngine implements BackupEngineStrategy {
   }
 }
 
+/**
+ * Sharded cluster backup engine (Experimental).
+ * Coordinates multi-shard cluster backups across mongos, config servers, and shard replica sets.
+ */
 export class ShardedBackupEngine implements BackupEngineStrategy {
   readonly name = "sharded";
 

@@ -101,7 +101,7 @@ Traditional database backup tools stage full database dumps onto local disk befo
 
 MongoVault eliminates intermediate disk staging entirely. It treats backup and restore operations as continuous, backpressured stream pipelines.
 
-- **During Backup:** Data emitted by MongoDB (`mongodump --archive` or WiredTiger `$backupCursor`) is piped directly through memory into gzip compression, chunked authenticated encryption (`aes-256-gcm-chunked`), an inline SHA-256 digest calculator, and straight into an AWS S3 multipart upload (or mounted filesystem). Memory buffers are governed by Node.js stream backpressure (`highWaterMark: 1 MiB`), keeping the resident memory footprint predictable (typically under 70 MiB under default configuration).
+- **During Backup:** Data emitted by MongoDB (`mongodump --archive --gzip` or WiredTiger `$backupCursor`) is piped directly through memory into chunked authenticated encryption (`aes-256-gcm-chunked`), an inline SHA-256 digest calculator, and straight into an AWS S3 multipart upload (or mounted filesystem). Memory buffers are governed by Node.js stream backpressure (`highWaterMark: 1 MiB`), keeping in-flight streaming buffer memory bounded (~65 MiB buffer memory under default configuration).
 - **During Restore:** Encrypted data is pulled as a byte stream from S3 or disk, verified against per-chunk AEAD authentication tags in 64 KiB frames, decrypted, decompressed, and fed straight into `mongorestore` or a POSIX UStar tar extractor.
 
 > [!NOTE]
@@ -112,18 +112,18 @@ MongoVault eliminates intermediate disk staging entirely. It treats backup and r
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
 │                             BACKUP STREAM PIPELINE (ZERO DISK)                              │
 │                                                                                             │
-│  ┌──────────────┐ stdout  ┌──────────────┐        ┌──────────────┐        ┌──────────────┐  │
-│  │  mongodump   ├────────►│  Gzip (zlib) ├───────►│  Chunked GCM ├───────►│ DigestStream │  │
-│  │ (archive/gz) │ (pipe)  │ (inline gz)  │ (pipe) │  Encryptor   │ (pipe) │  (SHA-256)   │  │
-│  └──────────────┘         └──────────────┘        └──────┬───────┘        └──────┬───────┘  │
-│                                                          │                       │          │
-│                                                  64 KiB AEAD Frames         Bytes & Hash    │
-│                                                          │                       │          │
-│                                                          ▼                       ▼          │
-│                                            ┌─────────────────────────────────────────────┐  │
-│                                            │         PassThrough Stream Buffer           │  │
-│                                            └─────────────────────┬───────────────────────┘  │
-└──────────────────────────────────────────────────────────────────┼──────────────────────────┘
+│  ┌───────────────────┐ stdout        ┌───────────────────┐        ┌───────────────────┐     │
+│  │    mongodump      ├──────────────►│    Chunked GCM    ├───────►│   DigestStream    │     │
+│  │ (--archive/--gzip)│ (pipe)        │     Encryptor     │ (pipe) │     (SHA-256)     │     │
+│  └───────────────────┘               └─────────┬─────────┘        └─────────┬─────────┘     │
+│                                                │                            │               │
+│                                       64 KiB AEAD Frames              Bytes & Hash          │
+│                                                │                            │               │
+│                                                ▼                            ▼               │
+│                                 ┌────────────────────────────────────────────────────────┐  │
+│                                 │               PassThrough Stream Buffer                │  │
+│                                 └───────────────────────────┬────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┼───────────────────────────────┘
                                                                    │
                                                    S3 Multipart Upload (32 MiB parts)
                                                                    │
@@ -174,14 +174,14 @@ When a restore is requested:
 
 ### Major Architectural Decisions
 
-| Decision                                        | Rationale                                                                                                                                                                       | Trade-off / Implication                                                                                               |
-| :---------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | :-------------------------------------------------------------------------------------------------------------------- |
-| **Streaming over File Staging**                 | Avoids local disk footprint; enables execution on diskless or small container nodes.                                                                                            | Requires network upload speed to keep pace with database dump speed; uses Node.js backpressure buffers (~70 MiB RAM). |
-| **Framed AEAD (`aes-256-gcm-chunked`)**         | Standard AES-GCM requires the authentication tag at the end, forcing tools to buffer the whole file before decrypting. Chunked framing authenticates data in 64 KiB increments. | Adds 33 bytes of framing overhead per 64 KiB chunk; requires MongoVault (or compatible decryptor) to unpack.          |
-| **Envelope Encryption (DEK + Master Key)**      | Enables master key rotation without re-encrypting large historical backup archives.                                                                                             | Requires secure storage of master keys; wrapped keys are stored in manifests.                                         |
-| **S3 Conditional PUT for Distributed Locking**  | Guarantees atomic distributed mutual exclusion without requiring external coordination clusters like Redis, Consul, or ZooKeeper.                                               | Requires S3-compatible storage supporting ETag conditional headers (`If-Match`, `If-None-Match`).                     |
-| **Process Table Protection via Config Files**   | Passing connection URIs with passwords via CLI flags exposes credentials in `/proc/<pid>/cmdline` and `ps`. MongoVault writes temporary `0o600` YAML configs.                   | Creates ephemeral config files in `WORK_DIR` which are deleted on process exit or signal.                             |
-| **Pre-Verification Before Destructive Restore** | If `--drop` is specified, corrupt archives would wipe production tables before failing. MongoVault tests the stream first.                                                      | Doubles restore read time when `--drop` is active, but prevents unrecoverable data loss.                              |
+| Decision                                        | Rationale                                                                                                                                                                       | Trade-off / Implication                                                                                                             |
+| :---------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | :---------------------------------------------------------------------------------------------------------------------------------- |
+| **Streaming over File Staging**                 | Avoids local disk footprint; enables execution on diskless or small container nodes.                                                                                            | Requires network upload speed to keep pace with database dump speed; uses Node.js backpressure buffers (~65 MiB in-flight buffers). |
+| **Framed AEAD (`aes-256-gcm-chunked`)**         | Standard AES-GCM requires the authentication tag at the end, forcing tools to buffer the whole file before decrypting. Chunked framing authenticates data in 64 KiB increments. | Adds 33 bytes of framing overhead per 64 KiB chunk; requires MongoVault (or compatible decryptor) to unpack.                        |
+| **Envelope Encryption (DEK + Master Key)**      | Enables master key rotation without re-encrypting large historical backup archives.                                                                                             | Requires secure storage of master keys; wrapped keys are stored in manifests.                                                       |
+| **S3 Conditional PUT for Distributed Locking**  | Guarantees atomic distributed mutual exclusion without requiring external coordination clusters like Redis, Consul, or ZooKeeper.                                               | Requires S3-compatible storage supporting ETag conditional headers (`If-Match`, `If-None-Match`).                                   |
+| **Process Table Protection via Config Files**   | Passing connection URIs with passwords via CLI flags exposes credentials in `/proc/<pid>/cmdline` and `ps`. MongoVault writes temporary `0o600` YAML configs.                   | Creates ephemeral config files in `WORK_DIR` which are deleted on process exit or signal.                                           |
+| **Pre-Verification Before Destructive Restore** | If `--drop` is specified, corrupt archives would wipe production tables before failing. MongoVault tests the stream first.                                                      | Doubles restore read time when `--drop` is active, but prevents unrecoverable data loss.                                            |
 
 ---
 
@@ -203,8 +203,7 @@ flowchart TD
     end
 
     subgraph DataPlane["Streaming Data Plane"]
-        Dump["mongodump / $backupCursor\n(Process stdout)"]
-        Gzip["Gzip Compression\n(zlib transform)"]
+        Dump["mongodump (--archive/--gzip) / $backupCursor\n(Compressed Process Stream)"]
         Crypto["AES-256-GCM Chunked\n(64 KiB AEAD Frames)"]
         Digest["DigestStream\n(SHA-256 inline)"]
         PassThrough["PassThrough Buffer\n(1 MiB highWaterMark)"]
@@ -226,7 +225,7 @@ flowchart TD
 
     Engines --> Dump
     MongoDB -.->|Stream BSON| Dump
-    Dump --> Gzip --> Crypto --> Digest --> PassThrough
+    Dump --> Crypto --> Digest --> PassThrough
     PassThrough -->|Multipart Upload| Storage
 
     Crypto -.->|"HMAC Manifest"| Storage
@@ -720,11 +719,14 @@ The `snapshot` engine coordinates point-in-time cloud storage block-volume snaps
 
 ---
 
-### 4. Sharded Cluster Engine (`sharded`)
+### 4. Sharded Cluster Engine (`sharded` — Experimental)
 
 #### What it is
 
-The `sharded` engine acts as a stateless coordinator across a MongoDB Sharded Cluster (`mongos`, Config Servers, and Shard Replica Sets).
+The `sharded` engine acts as a coordinator across a MongoDB Sharded Cluster (`mongos`, Config Servers, and Shard Replica Sets). It is currently classified as **Experimental** pending a dedicated cross-shard atomic freeze protocol and integration test harness.
+
+> [!IMPORTANT]
+> **Consistency Boundary:** Stopping chunk balancing prevents chunk migration anomalies, and capturing `$clusterTime` anchors oplog replay limits on restore. However, obtaining `$clusterTime` from a ping does **not** stop client application writes or freeze multi-shard distributed transactions. For strict zero-skew cross-shard ACID consistency on production clusters with active writes, application writes should be quiesced during the backup window or cloud volume snapshots should be used.
 
 #### How it works internally
 
@@ -791,7 +793,7 @@ sequenceDiagram
 
 ### Engine Comparison Matrix
 
-| Feature / Dimension      | `logical`                      | `physical`                     | `snapshot`                      | `sharded`                               |
+| Feature / Dimension      | `logical`                      | `physical`                     | `snapshot`                      | `sharded` (Experimental)                |
 | :----------------------- | :----------------------------- | :----------------------------- | :------------------------------ | :-------------------------------------- |
 | **Backup Mechanism**     | `mongodump` BSON stream        | WiredTiger `$backupCursor` Tar | Cloud Volume Snapshot           | `mongos` multi-node coordinator         |
 | **Data Format**          | `.archive.gz[.enc]`            | `.physical.tar.gz[.enc]`       | Cloud Provider Volume           | Multi-prefix archives + `.cluster`      |
@@ -813,29 +815,30 @@ Node.js streams process data in discrete chunks. Without backpressure regulation
 MongoVault guarantees memory safety by using standard Node.js stream backpressure:
 
 - A `PassThrough` stream with `highWaterMark: 1048576` (1 MiB) connects the transformation stages to storage.
-- If S3 multipart upload workers are saturated, `write()` returns `false`, causing `DigestStream`, `ChunkedAeadEncryptStream`, `zlib.createGzip()`, and `mongodump` stdout pipes to pause execution until downstream buffers drain.
-- **Fail-Safe Abortion (`src/abort.ts`):** Operations wrap an internal `LinkedAbortController`. Using `settleAll()`, if any stage rejects (e.g., S3 returns HTTP 500, or `mongodump` exits with a syntax error), the controller immediately aborts all peer streams, destroys running subprocesses via `SIGTERM` (followed by `SIGKILL` after a 10s grace period), and unlinks incomplete uploads from storage.
+- If S3 multipart upload workers are saturated, `write()` returns `false`, causing `DigestStream`, `ChunkedAeadEncryptStream`, and upstream process stdout pipes to pause execution until downstream buffers drain.
+- **Fail-Safe Abortion (`src/abort.ts`):** Operations wrap an internal `LinkedAbortController`. Using `settleAll()`, if any stage rejects (e.g., S3 returns HTTP 500, or `mongodump` exits with an error), the controller immediately aborts all peer streams, destroys running subprocesses via `SIGTERM` (followed by `SIGKILL` after a 10s grace period), and unlinks incomplete uploads from storage.
 
 ```mermaid
 flowchart LR
-    A["mongodump stdout<br/>(Fast Producer)"] -->|pipe| B["Gzip Transform<br/>(zlib)"]
-    B -->|pipe| C["ChunkedAeadEncryptStream<br/>(64 KiB framing)"]
-    C -->|pipe| D["DigestStream<br/>(SHA-256)"]
-    D -->|"pipe<br/>highWaterMark: 1 MiB"| E["PassThrough Buffer"]
-    E -->|"write() == false<br/>Backpressure Pause"| F["S3 Multipart Upload<br/>(Slow Consumer)"]
+    A["mongodump stdout<br/>(--archive --gzip)"] -->|pipe| B["ChunkedAeadEncryptStream<br/>(64 KiB framing)"]
+    B -->|pipe| C["DigestStream<br/>(SHA-256)"]
+    C -->|"pipe<br/>highWaterMark: 1 MiB"| D["PassThrough Buffer"]
+    D -->|"write() == false<br/>Backpressure Pause"| E["S3 Multipart Upload<br/>(Slow Consumer)"]
 
-    F -.->|"drain event<br/>Resume Flow"| E
-    E -.->|unpause| D -.->|unpause| C -.->|unpause| B -.->|unpause| A
+    E -.->|"drain event<br/>Resume Flow"| D
+    D -.->|unpause| C -.->|unpause| B -.->|unpause| A
 ```
 
 ---
 
-### 5.2 Compression Pipeline
+### 5.2 Compression Architecture
 
-Compression is handled by Node.js native `zlib`:
+Compression is implemented according to each engine's streaming profile:
 
-- **Logical Archives:** Compressed using `createGzip()` with standard DEFLATE compression. When `--archive` is passed directly from `mongodump`, `mongodump`'s internal compression can be utilized or wrapped.
-- **Decompression:** Verified during restores using `createGunzip()`. Incomplete gzip footers or corrupted crc32 trailers immediately reject the stream with an `IntegrityError`.
+- **Logical Backups:** `mongodump` is executed with `--archive --gzip`. The mongodump binary compresses the BSON stream directly in native code before piping to stdout, eliminating redundant double-compression overhead in Node.js while maintaining a zero-disk footprint.
+- **Continuous PITR Slices:** Batched BSON document arrays are compressed directly using Node.js native `zlib.createGzip()`.
+- **Physical Tar Backups:** Database file streams generated via WiredTiger checkpoint cursor are packed into a POSIX UStar tar stream and piped through `zlib.createGzip()`.
+- **Decompression & Integrity Validation:** Verified during pre-verification and restores using `zlib.createGunzip()`. Incomplete gzip footers, invalid headers, or corrupted CRC32 trailers immediately reject the stream with an `IntegrityError`.
 
 ---
 
@@ -951,6 +954,24 @@ Every backup generates an authenticated manifest file (`<archive>.manifest.json`
 
 - **Manifest HMAC Verification:** Manifests are serialized to canonical JSON (excluding signatures) and signed with HMAC-SHA256 using the configured key ring (`manifest.signature`). Manifest authentication operates **independently of archive payload encryption**—even unencrypted plain gzip backups receive cryptographic HMAC signatures if an encryption key or key ring is configured. When reading the manifest before restore, MongoVault recalculates the HMAC and verifies it using `crypto.timingSafeEqual()`. If an attacker tampers with document counts, collection names, or SHA-256 archive hashes in the manifest, the restore fails immediately.
 - **Upload Size & Checksum Integrity:** Upon upload completion, MongoVault calls `storage.head()` to confirm the uploaded size matches the exact bytes emitted by the stream. During restores, `DigestStream` recalculates the SHA-256 hash over the downloaded ciphertext, asserting equality with `manifest.sha256`.
+
+#### The Three Levels of Restore Integrity Guarantees
+
+MongoVault distinguishes three distinct layers of data integrity protection:
+
+1. **Per-Frame AEAD Authentication (Inline Streaming Protection):**
+   - In encrypted mode (`aes-256-gcm-chunked`), data is divided into isolated 64 KiB frames.
+   - Each frame includes a 16-byte Poly1305/GCM authentication tag and binds the 5-byte frame index + `isFinal` flag as Additional Authenticated Data (AAD).
+   - The decryptor validates the authentication tag of every frame **before** emitting any plaintext bytes to `mongorestore`. If a frame has been tampered with or truncated, the stream halts immediately and throws an authentication error.
+
+2. **Whole-Archive Checksum Verification (Upfront vs. Streaming):**
+   - The overall archive SHA-256 hash is recorded in `manifest.sha256`.
+   - **Upfront Pre-Verification (`--pre-verify` or `--drop`):** When `--pre-verify` is specified (or automatically when `--drop` is used), MongoVault downloads and verifies the complete archive checksum and gzip integrity before any collection is touched or dropped.
+   - **Streaming Verification:** Without `--pre-verify`, `DigestStream` recalculates the SHA-256 hash as the stream flows, asserting equality when the stream concludes. If corruption occurs in later frames of an unencrypted stream (or if the stream is truncated), the checksum mismatch is raised upon stream conclusion.
+
+3. **Database Restoration Atomicity:**
+   - Standard `mongorestore` operations insert documents sequentially collection-by-collection. An unexpected network cut or node failure mid-restore can leave the target database in a partially restored state.
+   - For disaster recovery where partial data must never be exposed to applications, always use **Runbook 3 (Staging & Atomic Cutover)**: restore to an isolated staging database without `--drop`, validate the data, and swap collections atomically using `renameCollection`.
 
 ---
 
@@ -1749,23 +1770,26 @@ Configuration settings are validated at startup via Zod (`src/config.ts`).
 
 ### Memory Footprint and S3 Multipart Sizing
 
-MongoVault does not buffer dumps to disk. The streaming memory footprint is determined by:
-$$\text{Memory Footprint} \approx (\text{Part Size} \times \text{Queue Size}) + \text{Stream Buffers}$$
+MongoVault does not buffer dumps to disk. In-flight streaming memory buffers are bounded by:
+$$\text{Buffer Memory} \approx (\text{Part Size} \times \text{Queue Size}) + \text{Stream HighWaterMark}$$
 
-With defaults (`S3_PART_SIZE_MB=32`, `S3_QUEUE_SIZE=2`):
-$$\text{Memory} \approx (32\text{ MiB} \times 2) + 1\text{ MiB} \approx 65\text{--}75\text{ MiB}$$
+With default settings (`S3_PART_SIZE_MB=32`, `S3_QUEUE_SIZE=2`, `highWaterMark=1 MiB`):
+$$\text{Buffer Memory} \approx (32\text{ MiB} \times 2) + 1\text{ MiB} \approx 65\text{ MiB}$$
+
+> [!NOTE]
+> **Total Process RSS:** In containerized environments, the total resident set size (RSS) includes the Node.js V8 runtime baseline (~35–50 MiB), loaded modules, BSON serialization allocations, and V8 garbage collection headroom. Total container RSS is typically **120–180 MiB** under default settings. Configure container memory limits to at least 256 MiB (or 512 MiB when using larger `S3_PART_SIZE_MB`).
 
 #### S3 Part Sizing vs Maximum Archive Size
 
 AWS S3 enforces a hard limit of **10,000 parts** per multipart upload:
 
-| `S3_PART_SIZE_MB`  | Active Upload Memory Buffer | Maximum Single Archive Size Limit | Recommended Database Size |
-| :----------------: | :-------------------------: | :-------------------------------: | :-----------------------: |
-|    `5` (S3 Min)    |           ~15 MiB           |               50 GB               |          < 40 GB          |
-| **`32` (Default)** |       **~65–75 MiB**        |            **320 GB**             |     **Up to 250 GB**      |
-|        `64`        |        ~130–150 MiB         |              640 GB               |       Up to 500 GB        |
-|       `128`        |        ~260–300 MiB         |              1.28 TB              |        Up to 1 TB         |
-|       `512`        |        ~1.0–1.2 GiB         |     5.0 TB (S3 Object Limit)      |      Multi-Terabyte       |
+| `S3_PART_SIZE_MB`  | In-Flight Upload Buffer | Maximum Single Archive Size Limit | Recommended Database Size |
+| :----------------: | :---------------------: | :-------------------------------: | :-----------------------: |
+|    `5` (S3 Min)    |         ~11 MiB         |               50 GB               |          < 40 GB          |
+| **`32` (Default)** |       **~65 MiB**       |            **320 GB**             |     **Up to 250 GB**      |
+|        `64`        |        ~129 MiB         |              640 GB               |       Up to 500 GB        |
+|       `128`        |        ~257 MiB         |              1.28 TB              |        Up to 1 TB         |
+|       `512`        |        ~1.0 GiB         |     5.0 TB (S3 Object Limit)      |      Multi-Terabyte       |
 
 ---
 

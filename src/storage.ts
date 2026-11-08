@@ -193,27 +193,82 @@ export class FilesystemStorageClient implements StorageClient {
     key: string,
     { holder, ttlMs }: { holder?: string; ttlMs: number },
   ): Promise<string | null> {
+    const dest = path.resolve(this.resolvedBase, key);
+    await fs.mkdir(path.dirname(dest), { recursive: true });
+    const { token, record } = createLockRecord(holder, ttlMs);
+    const content = JSON.stringify(record, null, 2);
+
+    // 1. Try atomic exclusive creation
+    try {
+      await fs.writeFile(dest, content, { flag: "wx" });
+      return token;
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+
+    // 2. Lock file exists; inspect if currently active
     const now = Date.now();
     const current = await this.getJson<LockRecord>(key);
     if (isLockActive(current?.data, now)) {
       return null;
     }
-    const { token, record } = createLockRecord(holder, ttlMs);
-    await this.putJson(key, record);
-    return token;
+
+    // 3. Stale/expired lock takeover using atomic rename to eliminate TOCTOU race
+    const tombstone = `${dest}.stale.${randomUUID()}`;
+    try {
+      await fs.rename(dest, tombstone);
+      await fs.rm(tombstone, { force: true });
+    } catch {
+      // Another concurrent process won the race to claim or remove the stale lock
+      return null;
+    }
+
+    // 4. Safely re-attempt atomic exclusive acquisition
+    try {
+      await fs.writeFile(dest, content, { flag: "wx" });
+      return token;
+    } catch {
+      return null;
+    }
   }
 
   async refreshLock(key: string, token: string, ttlMs: number): Promise<boolean> {
+    const dest = path.resolve(this.resolvedBase, key);
     const current = await this.getJson<LockRecord>(key);
     if (!current?.data || current.data.token !== token) return false;
-    await this.putJson(key, { ...current.data, expiresAt: Date.now() + ttlMs });
-    return true;
+
+    const updated: LockRecord = {
+      ...current.data,
+      expiresAt: Date.now() + ttlMs,
+    };
+
+    const tmp = `${dest}.refresh.${randomUUID()}`;
+    try {
+      await fs.writeFile(tmp, JSON.stringify(updated, null, 2), "utf8");
+      const verifyCurrent = await this.getJson<LockRecord>(key);
+      if (!verifyCurrent?.data || verifyCurrent.data.token !== token) {
+        await fs.rm(tmp, { force: true });
+        return false;
+      }
+      await fs.rename(tmp, dest);
+      return true;
+    } catch {
+      await fs.rm(tmp, { force: true }).catch(() => {});
+      return false;
+    }
   }
 
   async releaseLock(key: string, token: string): Promise<void> {
+    const dest = path.resolve(this.resolvedBase, key);
     const current = await this.getJson<LockRecord>(key);
     if (current?.data?.token === token) {
-      await this.remove(key);
+      const tombstone = `${dest}.release.${randomUUID()}`;
+      try {
+        await fs.rename(dest, tombstone);
+        await fs.rm(tombstone, { force: true });
+      } catch {
+        // Ignored if already removed
+      }
     }
   }
 }

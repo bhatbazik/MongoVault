@@ -133,6 +133,30 @@ describe("Continuous Oplog Archiver and PITR Restore Coordinator", () => {
             },
           };
         }
+        if (name === "config") {
+          return {
+            collection(colName) {
+              if (colName === "transactions") {
+                return {
+                  find() {
+                    return {
+                      sort() {
+                        return this;
+                      },
+                      limit() {
+                        return this;
+                      },
+                      async next() {
+                        return null;
+                      },
+                    };
+                  },
+                };
+              }
+              return {};
+            },
+          };
+        }
         return {
           collection() {
             return {
@@ -699,5 +723,73 @@ describe("Continuous Oplog Archiver and PITR Restore Coordinator", () => {
     // The slice should only capture up to 1010:1 (the start of the transaction), NOT 1020:1
     expect(manifest.oplogWindow.endTs).toBe("1010:1");
     expect(manifest.oplogWindow.entries).toBe(2);
+  });
+
+  it("fails closed if config.transactions query throws an unexpected error", async () => {
+    const encKey = parseKey(generateKey());
+    const config = createConfig(encKey);
+
+    const clientFactory = () => ({
+      async connect() {},
+      async close() {},
+      db(name) {
+        if (name === "admin") {
+          return {
+            async command(cmd) {
+              if (cmd?.replSetGetStatus) {
+                return {
+                  optimes: {
+                    lastCommittedOpTime: { ts: toBsonTimestamp({ t: 1020, i: 1 }) },
+                  },
+                };
+              }
+              return {};
+            },
+          };
+        }
+        if (name === "config") {
+          return {
+            collection(colName) {
+              if (colName === "transactions") {
+                return {
+                  find() {
+                    throw new Error("Disk read failure on config database");
+                  },
+                };
+              }
+              return {};
+            },
+          };
+        }
+        return {
+          collection() {
+            return {
+              find() {
+                return {
+                  sort() {
+                    return this;
+                  },
+                  limit() {
+                    return this;
+                  },
+                  async next() {
+                    return { ts: toBsonTimestamp({ t: 1000, i: 1 }) };
+                  },
+                };
+              },
+            };
+          },
+        };
+      },
+    });
+
+    await expect(
+      captureOplogSlice({
+        config,
+        storage: mockStorage,
+        logger,
+        createMongoClient: clientFactory,
+      }),
+    ).rejects.toThrow(/Failed to verify transaction boundaries in config.transactions/i);
   });
 });

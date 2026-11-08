@@ -96,4 +96,54 @@ describe("selective restore (namespace filtering)", () => {
       ),
     ).rejects.toThrow("Cannot use --oplog-replay");
   });
+
+  it("performs upfront pre-verification when preVerify: true is specified without drop", async () => {
+    let mongorestoreCalled = false;
+    const mockTools = {
+      async mongorestore() {
+        mongorestoreCalled = true;
+        return {
+          stdin: new PassThrough(),
+          done: Promise.resolve({ restored: 10, failed: 0 }),
+        };
+      },
+    };
+
+    const mockStorage = {
+      async head() {
+        return { size: 100, lastModified: new Date() };
+      },
+      async getJson() {
+        return {
+          data: {
+            key: "mongodb/cluster/2026-03-10/corrupt.archive.gz",
+            database: "*",
+            size: 100,
+            sha256: "expected-sha256",
+          },
+        };
+      },
+      async download() {
+        // Return corrupt content that fails gzip / checksum
+        return Readable.from([Buffer.from("invalid-corrupted-bytes")]);
+      },
+    };
+
+    const logger = pino({ level: "silent" });
+
+    // With preVerify: true, it should reject during upfront verification before mongorestore is ever invoked
+    await expect(
+      restoreBackup(
+        { config, storage: mockStorage, logger, tools: mockTools },
+        {
+          ref: "mongodb/cluster/2026-03-10/corrupt.archive.gz",
+          uri: "mongodb://localhost:27017",
+          drop: false,
+          preVerify: true,
+        },
+      ),
+    ).rejects.toThrow(/could not be read back|Checksum mismatch/i);
+
+    expect(mongorestoreCalled).toBe(false);
+  });
 });
