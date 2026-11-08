@@ -283,4 +283,41 @@ describe("crypto", () => {
 
     expect(() => verifyManifest(masterKey, manifest)).toThrow("Manifest HMAC verification failed");
   });
+
+  it("authenticates unencrypted manifests independently of archive encryption", async () => {
+    const masterKey = parseKey(generateKey());
+    const manifest = {
+      version: 2,
+      key: "mongodb/prod/2026-03-10/unencrypted.archive.gz",
+      database: "prod",
+      createdAt: "2026-03-10T02:00:00.000Z",
+      completedAt: "2026-03-10T02:01:00.000Z",
+      size: 2048,
+      sha256: "unencryptedsha256val",
+      compression: "gzip",
+      encryption: null,
+      oplog: false,
+      excludedCollections: [],
+      collections: { users: 100 },
+    };
+
+    const signature = signManifest(masterKey, manifest);
+    manifest.signature = {
+      algorithm: "HMAC-SHA256",
+      keyId: keyId(masterKey),
+      hmac: signature,
+    };
+
+    // Valid signature passes verification
+    expect(verifyManifest(masterKey, manifest)).toBe(true);
+
+    // Tampering with manifest metadata (e.g. replacing archive checksum) fails verification
+    const tamperedManifest = {
+      ...manifest,
+      sha256: "attacker-replacement-sha256",
+    };
+    expect(() => verifyManifest(masterKey, tamperedManifest)).toThrow(
+      /Manifest HMAC verification failed/,
+    );
+  });
 });

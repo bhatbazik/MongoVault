@@ -159,4 +159,116 @@ describe("lock", () => {
 
     expect(await readLock(lockFile)).toBeNull();
   });
+
+  it("does not steal lock while owning process is alive and active even after staleAfterMs elapsed", async () => {
+    // Acquire lock with short staleAfterMs and rapid heartbeat
+    const release = await acquireLock(lockFile, {
+      staleAfterMs: 50,
+      heartbeatIntervalMs: 15,
+    });
+    expect(release).toBeTypeOf("function");
+
+    // Wait past staleAfterMs while heartbeat keeps updating mtime
+    await new Promise((r) => setTimeout(r, 80));
+
+    // Another process attempting to acquire must NOT be able to steal the lock
+    const secondAcquisition = await acquireLock(lockFile, { staleAfterMs: 50 });
+    expect(secondAcquisition).toBeNull();
+
+    await release();
+    expect(await readLock(lockFile)).toBeNull();
+  });
+
+  it("triggers onLost callback when distributed lease renewal returns false", async () => {
+    let leaseRenewalsAllowed = true;
+    let lostError = null;
+
+    const mockStorage = {
+      async acquireLock() {
+        return "token-xyz";
+      },
+      async refreshLock() {
+        return leaseRenewalsAllowed;
+      },
+      async releaseLock() {},
+    };
+
+    const release = await acquireDistributedLock(mockStorage, "test/lock.json", {
+      ttlMs: 200,
+      heartbeatIntervalMs: 20,
+      onLost: (err) => {
+        lostError = err;
+      },
+    });
+
+    expect(release).toBeTypeOf("function");
+
+    // Simulate another node stealing the lock so refresh returns false
+    leaseRenewalsAllowed = false;
+
+    // Wait for heartbeat tick
+    await new Promise((r) => setTimeout(r, 60));
+
+    expect(lostError).not.toBeNull();
+    expect(lostError.message).toMatch(/lease renewal was rejected/i);
+
+    await release();
+  });
+
+  it("triggers onLost callback when distributed lease renewals throw past ttlMs", async () => {
+    let lostError = null;
+
+    const mockStorage = {
+      async acquireLock() {
+        return "token-abc";
+      },
+      async refreshLock() {
+        throw new Error("S3 503 SlowDown");
+      },
+      async releaseLock() {},
+    };
+
+    const release = await acquireDistributedLock(mockStorage, "test/lock.json", {
+      ttlMs: 50,
+      heartbeatIntervalMs: 15,
+      onLost: (err) => {
+        lostError = err;
+      },
+    });
+
+    expect(release).toBeTypeOf("function");
+
+    // Wait until TTL expires without successful heartbeat
+    await new Promise((r) => setTimeout(r, 90));
+
+    expect(lostError).not.toBeNull();
+    expect(lostError.message).toMatch(/lease expired/i);
+
+    await release();
+  });
+
+  it("triggers onLost callback when local lock file is modified or removed", async () => {
+    let lostError = null;
+
+    const release = await acquireLock(lockFile, {
+      staleAfterMs: 60_000,
+      heartbeatIntervalMs: 20,
+      onLost: (err) => {
+        lostError = err;
+      },
+    });
+
+    expect(release).toBeTypeOf("function");
+
+    // Delete the lock file behind the owner's back
+    await fs.rm(lockFile, { force: true });
+
+    // Wait for local heartbeat tick
+    await new Promise((r) => setTimeout(r, 60));
+
+    expect(lostError).not.toBeNull();
+    expect(lostError.message).toMatch(/lock file was modified or removed/i);
+
+    await release();
+  });
 });

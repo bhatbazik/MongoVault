@@ -118,7 +118,17 @@ describe("Continuous Oplog Archiver and PITR Restore Coordinator", () => {
       db(name) {
         if (name === "admin") {
           return {
-            async command() {
+            async command(cmd) {
+              if (cmd && cmd.replSetGetStatus) {
+                const newest = oplogDocs[oplogDocs.length - 1];
+                return {
+                  optimes: {
+                    lastCommittedOpTime: {
+                      ts: newest ? newest.ts : toBsonTimestamp({ t: 9999999, i: 1 }),
+                    },
+                  },
+                };
+              }
               return {};
             },
           };
@@ -532,5 +542,162 @@ describe("Continuous Oplog Archiver and PITR Restore Coordinator", () => {
 
     const remainingSlices = await listOplogSlices(mockStorage, scopeOf(config));
     expect(remainingSlices.map((s) => s.key)).toEqual([recentSlice.key]);
+  });
+
+  it("fails closed when replSetGetStatus fails or lacks majority optimes", async () => {
+    const encKey = parseKey(generateKey());
+    const config = createConfig(encKey);
+
+    const clientFactory = () => ({
+      async connect() {},
+      async close() {},
+      db(name) {
+        if (name === "admin") {
+          return {
+            async command() {
+              throw new Error("command replSetGetStatus requires authentication");
+            },
+          };
+        }
+        return {
+          collection() {
+            return {
+              find() {
+                return {
+                  sort() {
+                    return this;
+                  },
+                  limit() {
+                    return this;
+                  },
+                  async next() {
+                    return { ts: toBsonTimestamp({ t: 1000, i: 1 }) };
+                  },
+                };
+              },
+            };
+          },
+        };
+      },
+    });
+
+    await expect(
+      captureOplogSlice({
+        config,
+        storage: mockStorage,
+        logger,
+        createMongoClient: clientFactory,
+      }),
+    ).rejects.toThrow(/Unable to determine majority-committed oplog timestamp/i);
+  });
+
+  it("caps oplog slice upper boundary at transaction startOpTime when in-progress transactions exist", async () => {
+    const encKey = parseKey(generateKey());
+    const config = createConfig(encKey);
+
+    const oplogDocs = [
+      { ts: toBsonTimestamp({ t: 1000, i: 1 }), op: "i", ns: "app.users", o: { _id: 1 } },
+      { ts: toBsonTimestamp({ t: 1010, i: 1 }), op: "i", ns: "app.users", o: { _id: 2 } },
+      { ts: toBsonTimestamp({ t: 1020, i: 1 }), op: "i", ns: "app.users", o: { _id: 3 } },
+    ];
+
+    // Majority point is 1020:1, but there is an active transaction that began at 1010:1
+    const clientFactory = () => ({
+      async connect() {},
+      async close() {},
+      db(name) {
+        if (name === "admin") {
+          return {
+            async command(cmd) {
+              if (cmd?.replSetGetStatus) {
+                return {
+                  optimes: {
+                    lastCommittedOpTime: { ts: toBsonTimestamp({ t: 1020, i: 1 }) },
+                  },
+                };
+              }
+              return {};
+            },
+          };
+        }
+        if (name === "config") {
+          return {
+            collection(colName) {
+              if (colName === "transactions") {
+                return {
+                  find() {
+                    return {
+                      sort() {
+                        return this;
+                      },
+                      limit() {
+                        return this;
+                      },
+                      async next() {
+                        return {
+                          state: "inProgress",
+                          startOpTime: { ts: toBsonTimestamp({ t: 1010, i: 1 }) },
+                        };
+                      },
+                    };
+                  },
+                };
+              }
+              return {};
+            },
+          };
+        }
+        return {
+          collection() {
+            return {
+              find(filter = {}) {
+                let filtered = [...oplogDocs];
+                if (filter.ts?.$gt) {
+                  const gt = fromBsonTimestamp(filter.ts.$gt);
+                  filtered = filtered.filter(
+                    (doc) => compareTimestamps(fromBsonTimestamp(doc.ts), gt) > 0,
+                  );
+                }
+                if (filter.ts?.$lte) {
+                  const lte = fromBsonTimestamp(filter.ts.$lte);
+                  filtered = filtered.filter(
+                    (doc) => compareTimestamps(fromBsonTimestamp(doc.ts), lte) <= 0,
+                  );
+                }
+                return {
+                  sort() {
+                    return this;
+                  },
+                  limit(n) {
+                    filtered = filtered.slice(0, n);
+                    return this;
+                  },
+                  async next() {
+                    return filtered[0] || null;
+                  },
+                  async *[Symbol.asyncIterator]() {
+                    for (const doc of filtered) {
+                      yield doc;
+                    }
+                  },
+                };
+              },
+            };
+          },
+        };
+      },
+    });
+
+    const manifest = await captureOplogSlice({
+      config,
+      storage: mockStorage,
+      logger,
+      createMongoClient: clientFactory,
+    });
+
+    expect(manifest).not.toBeNull();
+    // The slice should only capture up to 1010:1 (the start of the transaction), NOT 1020:1
+    expect(manifest.oplogWindow.endTs).toBe("1010:1");
+    expect(manifest.oplogWindow.entries).toBe(2);
   });
 });

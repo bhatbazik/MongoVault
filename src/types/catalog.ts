@@ -69,6 +69,12 @@ export interface ShardedClusterMeta {
   shards: Record<string, ShardedClusterShardBackup>;
 }
 
+export interface ManifestSignature {
+  algorithm: "HMAC-SHA256";
+  keyId: string;
+  hmac: string;
+}
+
 export interface BackupManifest {
   version: number;
   type?: string;
@@ -82,6 +88,7 @@ export interface BackupManifest {
   sha256: string;
   compression: string;
   encryption: EncryptionEnvelope | null;
+  signature?: ManifestSignature | null;
   oplog: boolean;
   oplogWindow?: ManifestOplogWindow | null;
   excludedCollections: string[];

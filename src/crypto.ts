@@ -322,16 +322,33 @@ export function verifyManifest(
   manifest: BackupManifest | Record<string, unknown>,
 ): boolean {
   const enc = (manifest as Partial<BackupManifest>).encryption;
-  if (!enc?.manifestHmac) return true;
+  const sig = (manifest as Partial<BackupManifest>).signature;
+  const hmacHex = sig?.hmac || enc?.manifestHmac;
+  const targetKeyId = sig?.keyId || enc?.keyId;
+
+  if (!hmacHex) return true;
+
   const keys = Array.isArray(masterKeys) ? masterKeys : [masterKeys];
-  const matchedKey = keys.find((k) => keyId(k) === enc.keyId);
+  const matchedKey = targetKeyId
+    ? keys.find((k) => keyId(k) === targetKeyId)
+    : keys.find((k) => {
+        try {
+          const expected = Buffer.from(signManifest(k, manifest), "hex");
+          const actual = Buffer.from(String(hmacHex), "hex");
+          return expected.length === actual.length && timingSafeEqual(expected, actual);
+        } catch {
+          return false;
+        }
+      });
+
   if (!matchedKey) {
     const configuredIds = keys.map((k) => keyId(k)).join(", ");
     throw new Error(
-      `Backup was encrypted with key ${enc.keyId}, but configured key ring has: [${configuredIds}]`,
+      `Backup manifest was signed with key ${targetKeyId || "unknown"}, but configured key ring has: [${configuredIds}]`,
     );
   }
-  const actual = Buffer.from(String(enc.manifestHmac), "hex");
+
+  const actual = Buffer.from(String(hmacHex), "hex");
   const expectedHkdf = Buffer.from(signManifest(matchedKey, manifest), "hex");
   if (expectedHkdf.length === actual.length && timingSafeEqual(expectedHkdf, actual)) {
     return true;

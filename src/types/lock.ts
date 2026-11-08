@@ -7,10 +7,14 @@ export interface LockPayload {
   pid: number;
   token: string;
   acquiredAt: string;
+  lastHeartbeatAt?: string;
 }
 
 export interface AcquireLockOptions {
   staleAfterMs: number;
+  heartbeatIntervalMs?: number;
+  logger?: Logger;
+  onLost?: (err: Error) => void;
 }
 
 export interface AcquireDistributedLockOptions {
@@ -18,6 +22,7 @@ export interface AcquireDistributedLockOptions {
   ttlMs?: number;
   heartbeatIntervalMs?: number;
   logger?: Logger;
+  onLost?: (err: Error) => void;
 }
 
 export interface AcquireHybridLockOptions {
@@ -29,4 +34,5 @@ export interface AcquireHybridLockOptions {
   heartbeatIntervalMs?: number;
   holder?: string;
   logger?: Logger;
+  onLost?: (err: Error) => void;
 }

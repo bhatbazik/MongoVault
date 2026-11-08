@@ -275,5 +275,61 @@ describe("multi-shard cluster coordinator", () => {
     expect(restoreRes.configsvrRestored).toBe(true);
     expect(restoreRes.restoredShards).toEqual(["shard01", "shard02"]);
     expect(restoredTargets.length).toBe(3);
+    // Config Server restore
+    expect(restoredTargets[0].database).toBe("config");
+    // Shard restores are anchored to clusterTime with oplogReplay
+    expect(restoredTargets[1].database).toBe("*");
+    expect(restoredTargets[1].oplogReplay).toBe(true);
+    expect(restoredTargets[1].oplogLimit).toBe("1774092000:5");
+    expect(restoredTargets[2].database).toBe("*");
+    expect(restoredTargets[2].oplogReplay).toBe(true);
+    expect(restoredTargets[2].oplogLimit).toBe("1774092000:5");
+  });
+
+  it("fails closed in stopAndDrain if balancer mode remains enabled even if not in a round", async () => {
+    const mockClient = {
+      db(name) {
+        if (name === "admin") {
+          return {
+            async command(cmd) {
+              if (cmd.balancerStop) return { ok: 1 };
+              // Balancer is not currently in a balancing round, but mode is still "full" (enabled)
+              if (cmd.balancerStatus) {
+                return { mode: "full", inBalancerRound: false };
+              }
+              return { ok: 1 };
+            },
+          };
+        }
+        return {};
+      },
+    };
+
+    const { BalancerController, ActiveChunkMigrationError } = await import("../src/sharding.js");
+    const balancer = new BalancerController(mockClient);
+    await expect(balancer.stopAndDrain(100)).rejects.toThrow(ActiveChunkMigrationError);
+  });
+
+  it("fails closed in stopAndDrain if balancerStatus throws an error", async () => {
+    const mockClient = {
+      db(name) {
+        if (name === "admin") {
+          return {
+            async command(cmd) {
+              if (cmd.balancerStop) return { ok: 1 };
+              if (cmd.balancerStatus) {
+                throw new Error("Cluster unreachable");
+              }
+              return { ok: 1 };
+            },
+          };
+        }
+        return {};
+      },
+    };
+
+    const { BalancerController, ActiveChunkMigrationError } = await import("../src/sharding.js");
+    const balancer = new BalancerController(mockClient);
+    await expect(balancer.stopAndDrain(100)).rejects.toThrow(ActiveChunkMigrationError);
   });
 });

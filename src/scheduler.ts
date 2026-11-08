@@ -44,6 +44,13 @@ export function createScheduler({
         lockKey: distLockKey,
         staleAfterMs: config.timeoutMs + 60_000,
         logger,
+        onLost: (err) => {
+          logger.error(
+            { err },
+            "Lock lease lost during backup execution; aborting active backup pipeline",
+          );
+          activeAbortController?.abort(err);
+        },
       });
     } catch (lockError) {
       const err = lockError instanceof Error ? lockError : new Error(String(lockError));

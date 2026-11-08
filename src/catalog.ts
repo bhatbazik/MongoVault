@@ -1,4 +1,4 @@
-import { signManifest } from "./crypto.js";
+import { keyId, signManifest } from "./crypto.js";
 import type {
   ArchiveKeyOptions,
   BackupManifest,
@@ -110,8 +110,16 @@ export async function writeManifest(
   manifest: BackupManifest,
   encryptionKey?: Buffer | null,
 ): Promise<void> {
-  if (manifest.encryption && encryptionKey) {
-    manifest.encryption.manifestHmac = signManifest(encryptionKey, manifest);
+  if (encryptionKey) {
+    const hmac = signManifest(encryptionKey, manifest);
+    manifest.signature = {
+      algorithm: "HMAC-SHA256",
+      keyId: keyId(encryptionKey),
+      hmac,
+    };
+    if (manifest.encryption) {
+      manifest.encryption.manifestHmac = hmac;
+    }
   }
   await storage.putJson(manifestKey(manifest.key), manifest);
 }

@@ -45,14 +45,22 @@ export async function describeBackup(
   const checksum = manifest?.sha256 ?? object?.metadata?.sha256 ?? null;
 
   const keyRing = resolveKeyRing(config);
-  if (manifest?.encryption) {
+  const isSigned = Boolean(manifest?.signature?.hmac || manifest?.encryption?.manifestHmac);
+
+  if (isSigned && manifest) {
     if (keyRing.length === 0) {
-      throw new Error(`${key} is encrypted, but ENCRYPTION_KEY is not set`);
+      throw new Error(
+        `Backup manifest for ${key} is signed with HMAC, but ENCRYPTION_KEY / key ring is not configured`,
+      );
     }
     try {
       verifyManifest(keyRing, manifest);
     } catch (error) {
       throw new IntegrityError((error as Error).message);
+    }
+  } else if (manifest?.encryption) {
+    if (keyRing.length === 0) {
+      throw new Error(`${key} is encrypted, but ENCRYPTION_KEY is not set`);
     }
   }
   return { key, manifest, checksum };

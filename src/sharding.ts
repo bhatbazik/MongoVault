@@ -85,9 +85,9 @@ export class BalancerController {
     }
 
     const bStatus = await waitForBalancerDisabled(this.client, timeoutMs);
-    if (bStatus.inBalancerRound) {
+    if (bStatus.inBalancerRound || bStatus.mode !== "off") {
       throw new ActiveChunkMigrationError(
-        `Active chunk migration round did not conclude within ${Math.round(timeoutMs / 1000)}s. Aborting backup to prevent cross-shard data loss or duplicate documents.`,
+        `Balancer failed to disable or active chunk migration round did not conclude within ${Math.round(timeoutMs / 1000)}s (mode: "${bStatus.mode}", inBalancerRound: ${bStatus.inBalancerRound}). Aborting backup to prevent cross-shard data loss or duplicate documents.`,
       );
     }
 
@@ -129,8 +129,11 @@ export async function waitForBalancerDisabled(
       if (!status.inBalancerRound && status.mode === "off") {
         return status;
       }
-    } catch {
-      return status;
+    } catch (err) {
+      status = {
+        inBalancerRound: true,
+        mode: `error: ${err instanceof Error ? err.message : String(err)}`,
+      };
     }
     await new Promise((r) => setTimeout(r, pollIntervalMs));
   }
@@ -463,6 +466,8 @@ export async function restoreShardedCluster({
           uri: targetShardUri,
           database: "*",
           drop,
+          oplogReplay: true,
+          oplogLimit: clusterMeta.clusterTime,
         },
       );
       restoredShards.push(shardId);

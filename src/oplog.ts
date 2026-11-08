@@ -395,7 +395,10 @@ export async function captureOplogSlice({
     const adminDb = typeof client.db === "function" ? client.db("admin") : null;
     const replStatus =
       adminDb && typeof adminDb.command === "function"
-        ? await adminDb.command({ replSetGetStatus: 1 }).catch(() => null)
+        ? await adminDb.command({ replSetGetStatus: 1 }).catch((err) => {
+            logger.warn({ err }, "replSetGetStatus command failed");
+            return null;
+          })
         : null;
     const majorityTs = replStatus?.optimes?.lastCommittedOpTime?.ts
       ? fromBsonTimestamp(replStatus.optimes.lastCommittedOpTime.ts)
@@ -403,24 +406,61 @@ export async function captureOplogSlice({
         ? fromBsonTimestamp(replStatus.optimes.readConcernMajorityOpTime.ts)
         : null;
 
-    if (majorityTs && cursorStartTs && compareTimestamps(cursorStartTs, majorityTs) >= 0) {
+    if (!majorityTs) {
+      throw new Error(
+        "Unable to determine majority-committed oplog timestamp: replSetGetStatus failed or did not return optimes. Aborting oplog slice capture to prevent archiving uncommitted writes.",
+      );
+    }
+
+    // Inspect config.transactions for active or prepared distributed transactions.
+    // The slice upper boundary must not advance past the start of an in-progress transaction,
+    // ensuring multi-document transactions are not torn across slices before commitment.
+    let effectiveUpperTs = majorityTs;
+    try {
+      const configDb = typeof client.db === "function" ? client.db("config") : null;
+      const txCol =
+        configDb && typeof configDb.collection === "function"
+          ? configDb.collection("transactions")
+          : null;
+      if (txCol && typeof txCol.find === "function") {
+        const activeTx = await txCol
+          .find({ state: { $in: ["prepared", "inProgress"] } })
+          .sort({ startOpTime: 1 })
+          .limit(1)
+          .next();
+        const txTs = fromBsonTimestamp(activeTx?.startOpTime?.ts);
+        if (txTs && compareTimestamps(txTs, effectiveUpperTs) < 0) {
+          logger.info(
+            {
+              activeTxStartTs: formatOplogTimestamp(txTs),
+              majorityTs: formatOplogTimestamp(majorityTs),
+            },
+            "Active transaction in progress; capping oplog slice upper boundary at transaction startOpTime",
+          );
+          effectiveUpperTs = txTs;
+        }
+      }
+    } catch {
+      // Inaccessible config.transactions (e.g. standalone/mock)
+    }
+
+    if (cursorStartTs && compareTimestamps(cursorStartTs, effectiveUpperTs) >= 0) {
       logger.debug(
         {
           cursorStartTs: formatOplogTimestamp(cursorStartTs),
-          majorityTs: formatOplogTimestamp(majorityTs),
+          effectiveUpperTs: formatOplogTimestamp(effectiveUpperTs),
         },
-        "No new majority-committed oplog entries",
+        "No new majority-committed, transaction-consistent oplog entries",
       );
       return null;
     }
 
-    const query: Record<string, unknown> = {};
-    if (cursorStartTs || majorityTs) {
-      query.ts = {
+    const query: Record<string, unknown> = {
+      ts: {
         ...(cursorStartTs ? { $gt: toBsonTimestamp(cursorStartTs) } : {}),
-        ...(majorityTs ? { $lte: toBsonTimestamp(majorityTs) } : {}),
-      };
-    }
+        $lte: toBsonTimestamp(effectiveUpperTs),
+      },
+    };
 
     const maxBytes = (config.pitr?.maxSliceMb ?? 16) * 1024 * 1024;
     // promoteValues: false preserves exact BSON types (Double, Long, Int32) upon serialization

@@ -780,12 +780,12 @@ sequenceDiagram
 ```
 
 > [!WARNING]
-> **Cross-Shard Consistency & Balancer Timeout Analysis:**
-> During sharded backups, MongoVault invokes `balancerStop` and polls for active migrations to finish for up to 30 seconds.
+> **Cross-Shard Consistency & Balancer Safety Enforcement:**
+> During sharded backups, MongoVault invokes `balancerStop` and verifies that active migrations finish (`mode: "off"` and `inBalancerRound: false`).
 >
-> - **In-Flight Migrations:** If a chunk migration is still active when the 30-second timeout expires, proceeding with the backup risks **cross-shard inconsistency**: documents migrating between shards can either appear on both shards (duplicate documents) or be absent from both shards (data loss) depending on whether the source or donor shard is dumped first.
-> - **Cross-Shard Transactions:** MongoDB distributed transactions (spanning multiple shards) commit across shards via two-phase commit. Sequential shard dumping means Shard $N$ reflects write operations that occurred after Shard 1 finished dumping.
-> - **Production Recommendation:** For strict zero-loss consistency across large sharded clusters with frequent chunk balancing, enforce dedicated backup balancing windows where the balancer is turned off ahead of time, or halt the backup if migrations fail to drain rather than proceeding after timeout.
+> - **Fail-Closed Migration Drain:** If chunk migrations are active when the timeout expires or if balancer status fails to confirm `mode: "off"`, MongoVault **fails closed** and throws `ActiveChunkMigrationError`. It does not proceed with sequential shard dumping under unverified balancer states.
+> - **Timestamp Anchoring on Restore:** During restore (`restoreShardedCluster`), all shard restores replay oplog operations up to the unified `$clusterTime` captured in the cluster manifest (`oplogReplay: true`, `oplogLimit: clusterMeta.clusterTime`).
+> - **Cross-Shard Application Writes:** While stopping the balancer halts chunk moves, ongoing application writes can still occur between sequential shard dumps. For zero-skew guarantees on clusters with high-volume cross-shard distributed transactions, schedule backups during quiet windows or consider volume snapshots.
 
 ---
 
@@ -949,7 +949,7 @@ Every backup generates an authenticated manifest file (`<archive>.manifest.json`
 }
 ```
 
-- **Manifest HMAC Verification:** Manifests are serialized to canonical JSON (excluding `manifestHmac`) and signed with HMAC-SHA256 using the master key. When reading the manifest, MongoVault recalculates the HMAC and verifies it using `crypto.timingSafeEqual()`. If an attacker tampers with document counts or SHA-256 hashes in the manifest, it is rejected.
+- **Manifest HMAC Verification:** Manifests are serialized to canonical JSON (excluding signatures) and signed with HMAC-SHA256 using the configured key ring (`manifest.signature`). Manifest authentication operates **independently of archive payload encryption**—even unencrypted plain gzip backups receive cryptographic HMAC signatures if an encryption key or key ring is configured. When reading the manifest before restore, MongoVault recalculates the HMAC and verifies it using `crypto.timingSafeEqual()`. If an attacker tampers with document counts, collection names, or SHA-256 archive hashes in the manifest, the restore fails immediately.
 - **Upload Size & Checksum Integrity:** Upon upload completion, MongoVault calls `storage.head()` to confirm the uploaded size matches the exact bytes emitted by the stream. During restores, `DigestStream` recalculates the SHA-256 hash over the downloaded ciphertext, asserting equality with `manifest.sha256`.
 
 ---
@@ -1041,12 +1041,19 @@ stateDiagram-v2
     ReleaseAll --> [*]
 ```
 
-1. **Local Tier:** An atomic lockfile (`.backup.lock`) is written to `WORK_DIR` using `O_CREAT | O_EXCL` (`flag: "wx"`). If an existing lockfile is present, MongoVault inspects the stored PID. If the process is dead (checked via `process.kill(pid, 0)`) and the lock age exceeds `staleAfterMs`, it steals the lock using an **atomic rename tombstone** (`fs.rename(file, file.stale.<uuid>)`) to eliminate Time-Of-Check-To-Time-Of-Use (TOCTOU) races.
+1. **Local Tier:** An atomic lockfile (`.backup.lock`) is written to `WORK_DIR` using `O_CREAT | O_EXCL` (`flag: "wx"`).
+   - **Active Heartbeat:** An unref'd heartbeat timer periodically touches the lock file (`fs.utimes`), refreshing its modification timestamp every `heartbeatIntervalMs`. This ensures long-running backups (e.g. 10+ minutes) cannot lose their local lock while the process is alive.
+   - **Liveness-First Staleness Check:** When another process checks for lock staleness, it reads the owner payload and checks process liveness (`process.kill(pid, 0)`). If the owning PID is alive and actively heartbeating, the lock is never considered stale. If the owning PID is dead, the lock is immediately declared stale. If the PID is alive but the heartbeat has stopped for longer than `staleAfterMs` (e.g. process hung or PID recycled), it is reclaimed.
+   - **Atomic Takeover:** Stale locks are claimed via an **atomic rename tombstone** (`fs.rename(file, file.stale.<uuid>)`) to eliminate Time-Of-Check-To-Time-Of-Use (TOCTOU) races.
 2. **Distributed Tier:** If storage locking is available, it acquires an S3 lease at `<prefix>/.locks/backup.lock.json`. It performs an atomic conditional write:
    - On new lock: `IfNoneMatch: "*"`.
    - On refresh: Checks expiration timestamp and writes with `IfMatch: etag`.
    - A background timer renews the lease every 30 seconds (`heartbeatIntervalMs`).
-3. If distributed acquisition fails (HTTP 412 Precondition Failed), the local lock is immediately released and execution halts.
+3. **Distributed Lease-Loss Handling & Fencing:**
+   - If a lease renewal call returns `false` (lease was stolen or acquired by another node) or if renewals fail past `ttlMs`, the lock manager transitions into a **lost-lease** state.
+   - It fires an `onLost` callback that immediately aborts the active `AbortController`.
+   - The backup pipeline terminates: subprocesses (`mongodump`) receive `SIGTERM`/`SIGKILL`, active stream pipelines are terminated, in-flight multipart uploads are aborted, and manifest finalization is strictly prevented.
+4. If distributed acquisition fails initially (HTTP 412 Precondition Failed), the local lock is immediately released and execution halts.
 
 ---
 
@@ -1135,8 +1142,8 @@ Timestamp(1773153000, 14)  ==>  Second: 1773153000, Ordinal: 14
 When `PITR_ENABLED=true`, MongoVault runs a continuous archiver (`src/oplog.ts`):
 
 1. **High-Water Mark Tracking:** Reads `<prefix>/_pitr/state.json` to find the last archived timestamp (`lastTs`). If absent, it queries the newest completed base backup manifest.
-2. **Majority Commit Filtering:** MongoVault queries `admin.command({ replSetGetStatus: 1 })` to identify `lastCommittedOpTime`. Only operations committed by a majority of replica set nodes are archived, preventing rolled-back operations from being archived.
-3. **In-Flight Transaction Inspection:** It inspects `config.transactions` for active distributed transactions in state `prepared` or `inProgress`. If a transaction started prior to the current oplog slice, the slice boundary is adjusted so operations are not missed.
+2. **Fail-Closed Majority Commit Filtering:** MongoVault queries `admin.command({ replSetGetStatus: 1 })` to identify `lastCommittedOpTime` (or `readConcernMajorityOpTime`). If the query fails or optimes cannot be determined, slice capture **fails closed** and throws an error rather than continuing with an open upper boundary, ensuring operations that may roll back during failover are never archived.
+3. **Transaction-Boundary Protection:** MongoVault inspects `config.transactions` for active distributed transactions in state `prepared` or `inProgress`. If an active transaction began prior to the majority commit point (`startOpTime < majorityTs`), the slice upper boundary is capped at `startOpTime`, and slice advancement pauses until the transaction finishes. This guarantees that multi-document transactions are never split or torn across slices prior to commitment.
 4. **BSON Type Preservation:** Queries `local.oplog.rs` with `{ promoteValues: false }`, ensuring BSON `Long`, `Double`, and `Int32` types are preserved identically without lossy conversion to JavaScript numbers.
 5. **Batch Slicing & Upload:** Batches entries up to `PITR_MAX_SLICE_MB` (default: 16 MiB). Compresses with gzip, encrypts with AEAD, computes SHA-256, and uploads to:
    `<prefix>/_pitr/<YYYY-MM-DD>/<startTs.t>_<startTs.i>__<endTs.t>_<endTs.i>.oplog.bson.gz[.enc]`
@@ -1271,11 +1278,12 @@ Every frame binds the following 5-byte AAD into the GCM cipher:
 
 ### Manifest Tampering Protection
 
-Manifests contain metadata that directs restore behavior (e.g. `oplogWindow`, collection counts, DEK envelopes).
+Manifests contain metadata that directs restore behavior (e.g. `oplogWindow`, collection counts, DEK envelopes, SHA-256 archive digests).
 
+- **Independent Authentication:** Manifest signing is decoupled from archive payload encryption. Whether archive files are encrypted (`aes-256-gcm-chunked`) or standard compressed gzip, the manifest is signed with HMAC-SHA256 whenever a key is configured.
 - To prevent tampering, MongoVault produces a canonical JSON string of the manifest and signs it with HMAC-SHA256 using the dedicated HKDF-derived manifest key (`deriveHmacKey(masterKey)`).
-- The resulting signature is stored in `encryption.manifestHmac`.
-- Verification uses `crypto.timingSafeEqual` to prevent side-channel timing attacks.
+- The resulting signature is stored in `signature.hmac` (and `encryption.manifestHmac` when encrypted for backwards compatibility).
+- Verification enforces key matching and uses `crypto.timingSafeEqual` to prevent side-channel timing attacks. Restores reject any manifest with an invalid or tampered signature.
 
 ---
 
