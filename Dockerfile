@@ -21,7 +21,7 @@ RUN groupadd -g 10001 app \
   && chown -R app:app /tmp/mongodb-backup /app
 
 COPY package*.json ./
-RUN npm ci
+RUN npm ci --ignore-scripts
 
 COPY tsconfig.json ./
 COPY src ./src
