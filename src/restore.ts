@@ -253,9 +253,29 @@ export async function restorePointInTime(
 ): Promise<RestoreResult> {
   const { config, storage, logger, signal, tools } = ctx;
   const effectiveReplay = tools?.replayOplogFile ?? replayOplogFile;
-  const plan = await resolvePitrPlan(storage, scopeOf(config), pitr!, { engine: "logical" });
+  const hasNamespaceFilter = Boolean(database || nsInclude || nsExclude);
+  const plan = await resolvePitrPlan(storage, scopeOf(config), pitr!, {
+    engine: "logical",
+    includeBaseWindow: hasNamespaceFilter,
+  });
   const targetLimit = formatOplogTimestamp(plan.targetTs);
   const exclusiveLimit = formatOplogTimestamp(incrementOplogTimestamp(plan.targetTs));
+
+  if (
+    hasNamespaceFilter &&
+    plan.baseManifest?.oplog &&
+    plan.baseManifest.oplogWindow?.startTs &&
+    plan.slices.length === 0
+  ) {
+    logger.warn(
+      {
+        baseKey: plan.baseBackup.key,
+        baseStartTs: plan.baseManifest.oplogWindow.startTs,
+        baseEndTs: formatOplogTimestamp(plan.baseEndTs),
+      },
+      "Namespace-filtered PITR disables --oplogReplay on base archive and no external oplog slices cover the base dump window",
+    );
+  }
 
   logger.info(
     {
@@ -276,9 +296,9 @@ export async function restorePointInTime(
     nsExclude,
     drop,
     preVerify,
-    oplogReplay: Boolean(plan.baseManifest?.oplog) && !database && !nsInclude && !nsExclude,
+    oplogReplay: Boolean(plan.baseManifest?.oplog) && !hasNamespaceFilter,
     oplogLimit:
-      plan.slices.length === 0 && plan.baseManifest?.oplog && !database && !nsInclude && !nsExclude
+      plan.slices.length === 0 && plan.baseManifest?.oplog && !hasNamespaceFilter
         ? exclusiveLimit
         : undefined,
     parallelCollections,

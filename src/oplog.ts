@@ -144,6 +144,35 @@ function isNsIncluded(
   return true;
 }
 
+function isCmdTargetIncluded(
+  ns: string,
+  o: Record<string, unknown> | undefined,
+  options: { database?: string; nsInclude?: string; nsExclude?: string },
+): boolean {
+  if (ns === "admin.$cmd" && o && typeof o.renameCollection === "string") {
+    const fromNs = o.renameCollection;
+    const toNs = typeof o.to === "string" ? o.to : "";
+    return isNsIncluded(fromNs, options) && (!toNs || isNsIncluded(toNs, options));
+  }
+
+  if (ns.endsWith(".$cmd") && o) {
+    const dbName = ns.slice(0, -".$cmd".length);
+    const targetColl =
+      o.create ??
+      o.drop ??
+      o.createIndexes ??
+      o.commitIndexBuild ??
+      o.collMod ??
+      o.deleteIndexes ??
+      o.dropIndexes;
+    if (typeof targetColl === "string" && targetColl.length > 0) {
+      return isNsIncluded(`${dbName}.${targetColl}`, options);
+    }
+  }
+
+  return isNsIncluded(ns, options);
+}
+
 /**
  * Filters a raw BSON oplog file to remove system/no-op entries, enforce namespace filters,
  * and cap entries at `targetTs` (inclusive). Returns the number of kept entries.
@@ -175,10 +204,19 @@ export async function filterOplogSliceFile(
       ts?: unknown;
       op?: string;
       ns?: string;
-      o?: { applyOps?: Array<{ ns?: string; [k: string]: unknown }>; [k: string]: unknown };
+      o?: {
+        applyOps?: Array<{ op?: string; ns?: string; [k: string]: unknown }>;
+        [k: string]: unknown;
+      };
     };
 
     if (doc.op === "n") continue;
+    if (
+      doc.op === "c" &&
+      (doc.o?.startIndexBuild !== undefined || doc.o?.abortIndexBuild !== undefined)
+    ) {
+      continue;
+    }
 
     const docTs = fromBsonTimestamp(doc.ts);
     if (options.targetTs && docTs && compareTimestamps(docTs, options.targetTs) > 0) {
@@ -186,8 +224,14 @@ export async function filterOplogSliceFile(
     }
 
     if (doc.op === "c" && Array.isArray(doc.o?.applyOps)) {
-      const filteredOps = doc.o.applyOps.filter((inner) =>
-        isNsIncluded(String(inner.ns || ""), options),
+      const filteredOps = doc.o.applyOps.filter(
+        (inner) =>
+          inner.op !== "n" &&
+          isCmdTargetIncluded(
+            String(inner.ns || ""),
+            inner.o as Record<string, unknown> | undefined,
+            options,
+          ),
       );
       if (filteredOps.length === 0) continue;
       if (filteredOps.length !== doc.o.applyOps.length) {
@@ -196,7 +240,7 @@ export async function filterOplogSliceFile(
         keptEntries++;
         continue;
       }
-    } else if (!isNsIncluded(String(doc.ns || ""), options)) {
+    } else if (!isCmdTargetIncluded(String(doc.ns || ""), doc.o, options)) {
       continue;
     }
 
@@ -558,7 +602,7 @@ export async function captureOplogSlice({
           : null;
       if (txCol && typeof txCol.find === "function") {
         const activeTx = await txCol
-          .find({ state: { $in: ["prepared", "inProgress"] } })
+          .find({ state: { $in: ["prepared", "inProgress"] } }, { readConcern: { level: "local" } })
           .sort({ startOpTime: 1 })
           .limit(1)
           .next();
@@ -717,9 +761,10 @@ export async function resolvePitrPlan(
   storage: StorageClient,
   scope: BackupScope,
   targetInput: string | OplogTimestamp,
-  options: { engine?: "logical" | "physical" } = {},
+  options: { engine?: "logical" | "physical"; includeBaseWindow?: boolean } = {},
 ): Promise<PitrPlan> {
   const targetEngine = options.engine ?? "logical";
+  const includeBaseWindow = Boolean(options.includeBaseWindow);
   const targetTs = parsePitrTarget(targetInput);
   const backups = (await listBackups(storage, scope)).filter((b) => {
     if (!b.complete) return false;
@@ -771,15 +816,20 @@ export async function resolvePitrPlan(
     );
   }
 
+  const baseAnchorTs =
+    includeBaseWindow && selectedManifest?.oplogWindow?.startTs
+      ? (parseOplogTimestamp(selectedManifest.oplogWindow.startTs) ?? baseEndTs)
+      : baseEndTs;
+
   const allSlices = (await listOplogSlices(storage, scope)).filter((s) => s.complete);
   const candidateSlices = allSlices.filter(
     (s) =>
-      compareTimestamps(s.endTs, baseEndTs!) >= 0 && compareTimestamps(s.startTs, targetTs) <= 0,
+      compareTimestamps(s.endTs, baseAnchorTs) >= 0 && compareTimestamps(s.startTs, targetTs) <= 0,
   );
 
   // Read manifests and verify contiguity of the oplog chain
   const verifiedSlices: OplogSlice[] = [];
-  let expectedPrevEndTs = baseEndTs;
+  let expectedPrevEndTs = baseAnchorTs;
 
   for (const slice of candidateSlices) {
     const sliceManifest = await readManifest(storage, slice.key);
@@ -921,14 +971,19 @@ export function startOplogArchiver({
         return;
       }
 
-      activePromise = captureOplogSlice({
-        config,
-        storage,
-        logger,
-        signal,
-        createMongoClient,
-      });
-      await activePromise;
+      // Drain all pending oplog slices up to the current majority commit point so
+      // high write throughput (> maxSliceMb per flushIntervalSeconds) never falls behind.
+      while (!stopped && !signal?.aborted) {
+        activePromise = captureOplogSlice({
+          config,
+          storage,
+          logger,
+          signal,
+          createMongoClient,
+        });
+        const captured = await activePromise;
+        if (!captured) break;
+      }
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
       logger.error({ err }, "Continuous PITR oplog slice capture failed");

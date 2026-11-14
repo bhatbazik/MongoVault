@@ -395,23 +395,16 @@ export async function runShardedClusterBackup({
         const shardCfg = shardConfigs[shard.id];
         const endTs = endStr ? parseOplogTimestamp(endStr) : null;
         if (endTs && shardCfg && compareTimestamps(endTs, clusterTimeTs) < 0) {
-          try {
-            const sliceManifest = await captureOplogSlice({
-              config: shardCfg,
-              storage,
-              logger: log.child({ shardId: shard.id, phase: "bridge-oplog" }),
-              signal: controller.signal,
-              sinceTs: endTs,
-              createMongoClient,
-            });
-            if (sliceManifest) {
-              shardBackups[shard.id]!.bridgingSliceKey = sliceManifest.key;
-            }
-          } catch (bridgeErr) {
-            log.warn(
-              { shardId: shard.id, err: bridgeErr },
-              "Could not capture bridging oplog slice up to clusterTime",
-            );
+          const sliceManifest = await captureOplogSlice({
+            config: shardCfg,
+            storage,
+            logger: log.child({ shardId: shard.id, phase: "bridge-oplog" }),
+            signal: controller.signal,
+            sinceTs: endTs,
+            createMongoClient,
+          });
+          if (sliceManifest) {
+            shardBackups[shard.id]!.bridgingSliceKey = sliceManifest.key;
           }
         }
       }),
@@ -522,16 +515,21 @@ export async function restoreShardedCluster({
 
   const client = createMongoClient(config.mongo.uri);
   const balancer = new BalancerController(client, log);
+  let balancerStopped = false;
 
   try {
     await client.connect();
 
-    // 1. Quiesce balancer and discover target cluster topology
-    try {
-      await client.db("admin").command({ balancerStop: 1 });
-    } catch {}
-
+    // 1. Discover target cluster topology and quiesce balancer if enabled
     const targetTopology = await discoverClusterTopology(client).catch(() => null);
+    if (targetTopology?.balancerEnabled) {
+      balancerStopped = await balancer.stopAndDrain(30_000);
+    } else if (!targetTopology) {
+      try {
+        await client.db("admin").command({ balancerStop: 1 });
+        balancerStopped = true;
+      } catch {}
+    }
     const targetShardMap = new Map((targetTopology?.shards ?? []).map((s) => [s.id, s.host]));
     const targetConfigsvrUri = targetTopology?.configsvr?.host
       ? buildShardUri(config.mongo.uri, targetTopology.configsvr.host)
@@ -634,7 +632,10 @@ export async function restoreShardedCluster({
       .db("admin")
       .command({ flushRouterConfig: 1 })
       .catch(() => {});
-    await balancer.start();
+    if (balancerStopped) {
+      await balancer.start();
+      balancerStopped = false;
+    }
 
     log.info(
       {
@@ -651,6 +652,9 @@ export async function restoreShardedCluster({
       configsvrRestored: true,
     };
   } finally {
+    if (balancerStopped) {
+      await balancer.start();
+    }
     await client.close().catch(() => {});
   }
 }

@@ -332,4 +332,129 @@ describe("multi-shard cluster coordinator", () => {
     const balancer = new BalancerController(mockClient);
     await expect(balancer.stopAndDrain(100)).rejects.toThrow(ActiveChunkMigrationError);
   });
+
+  it("rejects --pitr on ShardedBackupEngine.restore() instead of silently ignoring it", async () => {
+    const { ShardedBackupEngine } = await import("../src/engines.js");
+    const engine = new ShardedBackupEngine();
+    await expect(
+      engine.restore({
+        config: {
+          mongo: { uri: "mongodb://localhost:27017", database: "*" },
+          storage: { prefix: "p" },
+        },
+        storage: {},
+        logger: {
+          child: () => ({}),
+          info: () => {},
+          warn: () => {},
+          error: () => {},
+          debug: () => {},
+        },
+        pitr: "2026-03-10T12:00:00Z",
+      }),
+    ).rejects.toThrow("not supported for sharded cluster restores");
+  });
+
+  it("restarts cluster balancer in finally when restoreShardedCluster fails mid-restore", async () => {
+    const { restoreShardedCluster } = await import("../src/sharding.js");
+    let balancerStarted = false;
+    let balancerMode = "full";
+
+    const mockClient = {
+      async connect() {},
+      async close() {},
+      db(name) {
+        if (name === "admin") {
+          return {
+            async command(cmd) {
+              if (cmd.hello || cmd.isMaster) return { msg: "isdbgrid", me: "mongos:27017" };
+              if (cmd.balancerStop) {
+                balancerMode = "off";
+                return { ok: 1 };
+              }
+              if (cmd.balancerStart) {
+                balancerStarted = true;
+                balancerMode = "full";
+                return { ok: 1 };
+              }
+              if (cmd.balancerStatus) return { mode: balancerMode, inBalancerRound: false };
+              return { ok: 1 };
+            },
+          };
+        }
+        if (name === "config") {
+          return {
+            collection() {
+              return {
+                find() {
+                  return this;
+                },
+                async toArray() {
+                  return [{ _id: "shard01", host: "shard01/s1:27018" }];
+                },
+              };
+            },
+          };
+        }
+        return {};
+      },
+    };
+
+    const manifest = {
+      version: 2,
+      type: "sharded-cluster-backup",
+      engine: "logical",
+      key: "prod/2026-03-10/20260310T120000Z.cluster",
+      database: "*",
+      sharding: {
+        clusterTime: "1774092000:5",
+        configsvr: {
+          backupKey: "cfg-key",
+          manifestKey: "cfg-key.manifest.json",
+          host: "cfg/c1:27019",
+        },
+        shards: {
+          shard01: {
+            shardId: "shard01",
+            host: "shard01/s1:27018",
+            backupKey: "s1-key",
+            status: "success",
+          },
+        },
+      },
+    };
+
+    const mockStorage = {
+      async getJson() {
+        return { data: manifest };
+      },
+    };
+    const mockLogger = {
+      child() {
+        return this;
+      },
+      info() {},
+      warn() {},
+      error() {},
+      debug() {},
+    };
+
+    await expect(
+      restoreShardedCluster({
+        config: {
+          mongo: { uri: "mongodb://mongos:27017", database: "*" },
+          storage: { prefix: "prod" },
+        },
+        storage: mockStorage,
+        logger: mockLogger,
+        ref: manifest.key,
+        createMongoClient: () => mockClient,
+        restoreRunner: async () => {
+          throw new Error("Simulated shard restore failure");
+        },
+      }),
+    ).rejects.toThrow("Simulated shard restore failure");
+
+    expect(balancerStarted).toBe(true);
+  });
 });

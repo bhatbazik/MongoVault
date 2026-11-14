@@ -948,4 +948,77 @@ describe("Continuous Oplog Archiver and PITR Restore Coordinator", () => {
     const plan = await resolvePitrPlan(mockStorage, { prefix: "backups", database: "*" }, "1000:2");
     expect(plan.baseBackup.key).toBe(logicalKey);
   });
+
+  it("includes slices overlapping baseStartTs..baseEndTs when includeBaseWindow is true", async () => {
+    const config = createConfig();
+    const scope = scopeOf(config);
+    const { writeManifest } = await import("../src/catalog.js");
+    const baseKey = archiveKey(scope, new Date("2026-03-10T10:00:00.000Z"), { encrypted: false });
+
+    await mockStorage.upload(baseKey, Readable.from([Buffer.from("base")]));
+    await writeManifest(mockStorage, {
+      version: 2,
+      engine: "logical",
+      key: baseKey,
+      database: "*",
+      createdAt: "2026-03-10T10:00:00.000Z",
+      completedAt: "2026-03-10T10:05:00.000Z",
+      durationMs: 300000,
+      size: 4,
+      sha256: "abc",
+      compression: "gzip",
+      encryption: null,
+      oplog: true,
+      oplogWindow: { startTs: "1000:1", endTs: "1020:1" },
+      excludedCollections: [],
+      collections: {},
+    });
+
+    await uploadOplogSlice({
+      config,
+      storage: mockStorage,
+      logger,
+      rawDocs: [
+        Buffer.from(
+          BSON.serialize({
+            ts: toBsonTimestamp({ t: 1010, i: 1 }),
+            op: "i",
+            ns: "app.users",
+            o: { _id: 1 },
+          }),
+        ),
+      ],
+      startTs: { t: 1000, i: 2 },
+      endTs: { t: 1015, i: 1 },
+      previousEndTs: { t: 1000, i: 1 },
+    });
+
+    await uploadOplogSlice({
+      config,
+      storage: mockStorage,
+      logger,
+      rawDocs: [
+        Buffer.from(
+          BSON.serialize({
+            ts: toBsonTimestamp({ t: 1025, i: 1 }),
+            op: "i",
+            ns: "app.users",
+            o: { _id: 2 },
+          }),
+        ),
+      ],
+      startTs: { t: 1015, i: 2 },
+      endTs: { t: 1030, i: 1 },
+      previousEndTs: { t: 1015, i: 1 },
+    });
+
+    const defaultPlan = await resolvePitrPlan(mockStorage, scope, "1030:1");
+    expect(defaultPlan.slices.length).toBe(1);
+
+    const filteredPlan = await resolvePitrPlan(mockStorage, scope, "1030:1", {
+      engine: "logical",
+      includeBaseWindow: true,
+    });
+    expect(filteredPlan.slices.length).toBe(2);
+  });
 });

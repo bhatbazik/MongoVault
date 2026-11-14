@@ -67,16 +67,28 @@ export function trimDbPathPrefix(filename: string, dbPath: string): string {
 
 /**
  * Creates $backupCursor with retries on WiredTiger checkpoint conflict.
+ * Triggers the initial cursor batch inside the retry loop because the MongoDB
+ * Node.js driver only sends the aggregate command when the cursor is first read.
  */
 export async function createBackupCursorWithRetries(
   admin: ReturnType<MongoClient["db"]>,
   retries = CURSOR_CREATE_RETRIES,
 ): Promise<ReturnType<ReturnType<MongoClient["db"]>["aggregate"]>> {
   for (let i = 0; i < retries; i++) {
+    let cursor: ReturnType<ReturnType<MongoClient["db"]>["aggregate"]> | null = null;
     try {
-      const cursor = admin.aggregate([{ $backupCursor: {} }]);
+      cursor = admin.aggregate([{ $backupCursor: {} }]);
+      const c = cursor as unknown as { next?: () => Promise<Record<string, unknown> | null> };
+      if (typeof c.next === "function") {
+        const firstDoc = await c.next();
+        (cursor as unknown as { __firstDoc?: Record<string, unknown> | null }).__firstDoc =
+          firstDoc;
+      }
       return cursor;
     } catch (err: unknown) {
+      if (cursor) {
+        await cursor.close().catch(() => {});
+      }
       const error = err as { code?: number; message?: string };
       const code = error?.code;
       const isRetriable =
@@ -179,11 +191,21 @@ async function drainCursorDocs(cursor: unknown): Promise<Record<string, unknown>
   const docs: Record<string, unknown>[] = [];
   if (!cursor || typeof cursor !== "object") return docs;
   const c = cursor as {
+    __firstDoc?: Record<string, unknown> | null;
     tryNext?: () => Promise<Record<string, unknown> | null>;
     hasNext?: () => Promise<boolean>;
     next?: () => Promise<Record<string, unknown> | null>;
     [Symbol.asyncIterator]?: () => AsyncIterator<Record<string, unknown>>;
   };
+
+  if (c.__firstDoc !== undefined) {
+    if (c.__firstDoc) {
+      docs.push(c.__firstDoc);
+    }
+    delete c.__firstDoc;
+    // If firstDoc was null, the cursor is already exhausted.
+    if (docs.length === 0) return docs;
+  }
 
   if (typeof c.tryNext === "function") {
     while (true) {
@@ -411,6 +433,7 @@ export async function runPhysicalBackup({
 
     // Helper to collect extended journal files AFTER all .wt data files have been copied
     // (Percona PBM pattern: data files first, then $backupCursorExtend & journal files last).
+    let extendedToOplogEnd = false;
     const collectJournalFilesAfterDataCopy = async () => {
       if (cursorMeta) {
         const extendTargetTs = cursorMeta.oplogEnd?.ts || cursorMeta.checkpointTimestamp;
@@ -445,9 +468,15 @@ export async function runPhysicalBackup({
               }
             }
             await extCursor.close().catch(() => {});
-          } catch {
-            // $backupCursorExtend is optional if server does not support it
+            extendedToOplogEnd = true;
+          } catch (extErr) {
+            log.warn(
+              { err: extErr },
+              "$backupCursorExtend failed; anchoring physical backup oplogWindow to checkpointTimestamp instead of oplogEnd",
+            );
           }
+        } else if (!cursorMeta.oplogEnd?.ts) {
+          extendedToOplogEnd = true;
         }
 
         // Also scan journal directory for any WiredTigerLog* files created during data copy
@@ -541,7 +570,9 @@ export async function runPhysicalBackup({
     const effectiveStartTs =
       physicalMeta.oplogStart || physicalMeta.checkpointTimestamp || fsyncOplogTs;
     const effectiveEndTs =
-      physicalMeta.oplogEnd || physicalMeta.checkpointTimestamp || fsyncOplogTs;
+      (extendedToOplogEnd ? physicalMeta.oplogEnd : undefined) ||
+      physicalMeta.checkpointTimestamp ||
+      fsyncOplogTs;
 
     const manifest: BackupManifest = {
       version: MANIFEST_VERSION,
@@ -615,10 +646,27 @@ async function findFreePort(): Promise<number> {
   });
 }
 
-async function waitForMongodReady(uri: string, timeoutMs = 30_000): Promise<MongoClient> {
+async function waitForMongodReady(
+  uri: string,
+  timeoutMs = 30_000,
+  hasExited?: () => boolean,
+  logPath?: string,
+): Promise<MongoClient> {
   const deadline = Date.now() + timeoutMs;
   let lastErr: unknown = null;
   while (Date.now() < deadline) {
+    if (hasExited?.()) {
+      let logTail = "";
+      if (logPath) {
+        try {
+          const raw = await fs.readFile(logPath, "utf8");
+          logTail = raw.trim().split("\n").slice(-10).join("\n");
+        } catch {}
+      }
+      throw new Error(
+        `Temporary mongod exited unexpectedly before becoming ready${logTail ? `:\n${logTail}` : ""}`,
+      );
+    }
     const client = new MongoClient(uri, { serverSelectionTimeoutMS: 2000 });
     try {
       await client.connect();
@@ -726,9 +774,10 @@ export async function restorePhysicalBackup({
     );
   }
 
-  // Remove any stale lock files in target dbPath (mongod.lock, WiredTiger.lock, ongoingBackup.lock)
+  // Remove any stale lock/backup marker files in target dbPath
   await fs.rm(path.join(targetDbPath, "mongod.lock"), { force: true }).catch(() => {});
   await fs.rm(path.join(targetDbPath, "WiredTiger.lock"), { force: true }).catch(() => {});
+  await fs.rm(path.join(targetDbPath, "WiredTiger.backup"), { force: true }).catch(() => {});
   await fs.rm(path.join(targetDbPath, "ongoingBackup.lock"), { force: true }).catch(() => {});
 
   log.info(
@@ -764,7 +813,14 @@ export async function restorePhysicalBackup({
 
   const proc = spawn(
     "mongod",
-    [`--dbpath=${targetDbPath}`, `--port=${port}`, "--bind_ip=127.0.0.1", `--logpath=${mongodLog}`],
+    [
+      `--dbpath=${targetDbPath}`,
+      `--port=${port}`,
+      "--bind_ip=127.0.0.1",
+      `--logpath=${mongodLog}`,
+      "--setParameter=ttlMonitorEnabled=false",
+      "--setParameter=disableLogicalSessionCacheRefresh=true",
+    ],
     { stdio: "ignore" },
   );
 
@@ -777,7 +833,12 @@ export async function restorePhysicalBackup({
   let replayedEntries = 0;
 
   try {
-    tmpClient = await waitForMongodReady(ephemeralUri, 30_000);
+    tmpClient = await waitForMongodReady(
+      ephemeralUri,
+      30_000,
+      () => proc.exitCode !== null || proc.signalCode !== null,
+      mongodLog,
+    );
     // Clear replica set config on standalone recovery instance so it starts cleanly when re-added to RS
     await tmpClient
       .db("local")
