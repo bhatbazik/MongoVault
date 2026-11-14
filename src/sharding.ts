@@ -1,3 +1,6 @@
+import { randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
 import { MongoClient } from "mongodb";
 import { linkedController } from "./abort.js";
 import { runBackup } from "./backup.js";
@@ -13,8 +16,18 @@ import {
 } from "./catalog.js";
 import { verifyManifest } from "./crypto.js";
 import { formatDuration } from "./format.js";
-import { fromBsonTimestamp } from "./oplog.js";
+import {
+  captureOplogSlice,
+  compareTimestamps,
+  downloadAndExtractOplogSlice,
+  filterOplogSliceFile,
+  formatOplogTimestamp,
+  fromBsonTimestamp,
+  incrementOplogTimestamp,
+  parseOplogTimestamp,
+} from "./oplog.js";
 import { restoreBackup } from "./restore.js";
+import { replayOplogFile } from "./tools.js";
 import type {
   BackupManifest,
   ShardedClusterMeta,
@@ -181,9 +194,25 @@ export async function discoverClusterTopology(client: MongoClient): Promise<Clus
     // Some mongos versions do not support balancerStatus command
   }
 
+  let configsvrHost: string | undefined;
+  try {
+    const shardMap = await admin.command({ getShardMap: 1 }).catch(() => null);
+    if (typeof shardMap?.map?.config === "string") {
+      configsvrHost = shardMap.map.config;
+    } else {
+      const serverStatus = await admin.command({ serverStatus: 1 }).catch(() => null);
+      if (typeof serverStatus?.sharding?.configsvrConnectionString === "string") {
+        configsvrHost = serverStatus.sharding.configsvrConnectionString;
+      }
+    }
+  } catch {
+    // Ignore if configsvr connection string cannot be inspected
+  }
+
   return {
     isSharded: true,
     mongosHost: hello.me || "mongos",
+    ...(configsvrHost ? { configsvr: { host: configsvrHost } } : {}),
     shards,
     balancerEnabled,
     balancerRunning,
@@ -252,8 +281,16 @@ export async function runShardedClusterBackup({
       // Ignore
     }
 
-    // 3. Back up Config Server metadata (config database routing tables, collections, chunk maps)
-    log.info("Backing up Config Server metadata...");
+    // 3. Back up Config Server and all shards in parallel so their oplog windows overlap
+    const configsvrDirectUri = topology.configsvr?.host
+      ? buildShardUri(config.mongo.uri, topology.configsvr.host)
+      : null;
+
+    log.info(
+      { directConfigsvr: Boolean(configsvrDirectUri), shardsCount: topology.shards.length },
+      "Backing up Config Server and shard replica sets in parallel...",
+    );
+
     const configsvrConfig: AppConfig = {
       ...config,
       storage: {
@@ -262,21 +299,24 @@ export async function runShardedClusterBackup({
       },
       mongo: {
         ...config.mongo,
-        database: "config",
-        oplog: false,
+        uri: configsvrDirectUri ?? config.mongo.uri,
+        database: configsvrDirectUri ? "*" : "config",
+        oplog: Boolean(configsvrDirectUri),
       },
     };
-    const configsvrManifest = await backupRunner({
+
+    const configsvrPromise = backupRunner({
       config: configsvrConfig,
       storage,
       logger: log.child({ component: "configsvr" }),
       signal: controller.signal,
     });
 
-    // 4. Back up each shard replica set under its own isolated storage prefix
     const shardBackups: Record<string, ShardedClusterShardBackup> = {};
+    const shardEndTimestamps: Record<string, string> = {};
+    const shardConfigs: Record<string, AppConfig> = {};
 
-    for (const shard of topology.shards) {
+    const shardPromises = topology.shards.map(async (shard) => {
       log.info({ shardId: shard.id, host: shard.host }, "Backing up shard...");
       const shardUri = buildShardUri(config.mongo.uri, shard.host);
 
@@ -293,6 +333,7 @@ export async function runShardedClusterBackup({
           oplog: true,
         },
       };
+      shardConfigs[shard.id] = shardConfig;
 
       try {
         const shardManifest = await backupRunner({
@@ -310,6 +351,9 @@ export async function runShardedClusterBackup({
           status: "success",
           size: shardManifest.size,
         };
+        if (shardManifest.oplogWindow?.endTs) {
+          shardEndTimestamps[shard.id] = shardManifest.oplogWindow.endTs;
+        }
       } catch (shardError) {
         log.error({ shardId: shard.id, err: shardError }, "Shard backup failed");
         shardBackups[shard.id] = {
@@ -321,7 +365,57 @@ export async function runShardedClusterBackup({
         };
         throw shardError;
       }
+    });
+
+    const [configsvrManifest] = await Promise.all([configsvrPromise, ...shardPromises]);
+
+    // Determine common clusterTime >= all shard oplogWindow.endTs
+    let clusterTimeTs = parseOplogTimestamp(clusterTimeStr)!;
+    for (const endStr of Object.values(shardEndTimestamps)) {
+      const endTs = parseOplogTimestamp(endStr);
+      if (endTs && compareTimestamps(endTs, clusterTimeTs) > 0) {
+        clusterTimeTs = endTs;
+      }
     }
+    try {
+      const postPing = await client.db("admin").command({ ping: 1 });
+      const parsed = fromBsonTimestamp(postPing?.$clusterTime?.clusterTime);
+      if (parsed && compareTimestamps(parsed, clusterTimeTs) > 0) {
+        clusterTimeTs = parsed;
+      }
+    } catch {
+      // Ignore
+    }
+    clusterTimeStr = formatOplogTimestamp(clusterTimeTs);
+
+    // Capture bridging oplog slices for any shard whose dump ended before clusterTimeTs
+    await Promise.all(
+      topology.shards.map(async (shard) => {
+        const endStr = shardEndTimestamps[shard.id];
+        const shardCfg = shardConfigs[shard.id];
+        const endTs = endStr ? parseOplogTimestamp(endStr) : null;
+        if (endTs && shardCfg && compareTimestamps(endTs, clusterTimeTs) < 0) {
+          try {
+            const sliceManifest = await captureOplogSlice({
+              config: shardCfg,
+              storage,
+              logger: log.child({ shardId: shard.id, phase: "bridge-oplog" }),
+              signal: controller.signal,
+              sinceTs: endTs,
+              createMongoClient,
+            });
+            if (sliceManifest) {
+              shardBackups[shard.id]!.bridgingSliceKey = sliceManifest.key;
+            }
+          } catch (bridgeErr) {
+            log.warn(
+              { shardId: shard.id, err: bridgeErr },
+              "Could not capture bridging oplog slice up to clusterTime",
+            );
+          }
+        }
+      }),
+    );
 
     // 5. Restart cluster balancer if it was originally enabled
     if (balancerStopped && topology?.balancerEnabled) {
@@ -339,25 +433,12 @@ export async function runShardedClusterBackup({
       .replace(/\.\d{3}Z$/, "Z");
     const clusterKey = `${databasePrefix(scope)}${startedAt.toISOString().slice(0, 10)}/${stamp}.cluster${encrypted ? ".enc" : ""}`;
 
-    // Capture post-backup clusterTime so oplogReplay limit is at or after the shard dumps
-    try {
-      const postPing = await client.db("admin").command({ ping: 1 });
-      if (postPing?.$clusterTime?.clusterTime) {
-        const parsed = fromBsonTimestamp(postPing.$clusterTime.clusterTime);
-        if (parsed) {
-          clusterTimeStr = `${parsed.t}:${parsed.i}`;
-        }
-      }
-    } catch {
-      // Ignore
-    }
-
     const clusterMeta: ShardedClusterMeta = {
       clusterTime: clusterTimeStr,
       configsvr: {
         backupKey: configsvrManifest.key,
         manifestKey: manifestKey(configsvrManifest.key),
-        host: topology.mongosHost,
+        host: topology.configsvr?.host || topology.mongosHost,
       },
       shards: shardBackups,
     };
@@ -445,27 +526,47 @@ export async function restoreShardedCluster({
   try {
     await client.connect();
 
-    // 1. Quiesce balancer on restore target
+    // 1. Quiesce balancer and discover target cluster topology
     try {
       await client.db("admin").command({ balancerStop: 1 });
     } catch {}
 
-    // 2. Restore configsvr routing tables
+    const targetTopology = await discoverClusterTopology(client).catch(() => null);
+    const targetShardMap = new Map((targetTopology?.shards ?? []).map((s) => [s.id, s.host]));
+    const targetConfigsvrUri = targetTopology?.configsvr?.host
+      ? buildShardUri(config.mongo.uri, targetTopology.configsvr.host)
+      : config.mongo.uri;
+
+    const clusterTs = parseOplogTimestamp(clusterMeta.clusterTime);
+    const exclusiveClusterLimit = clusterTs
+      ? formatOplogTimestamp(incrementOplogTimestamp(clusterTs))
+      : clusterMeta.clusterTime;
+
+    // 2. Restore configsvr routing tables directly to configsvr (if discovered)
     log.info(
-      { configsvrKey: clusterMeta.configsvr.backupKey },
+      {
+        configsvrKey: clusterMeta.configsvr.backupKey,
+        directConfigsvr: Boolean(targetTopology?.configsvr?.host),
+      },
       "Restoring Config Server routing metadata...",
     );
     await restoreRunner(
       { config, storage, logger: log.child({ target: "configsvr" }), signal },
       {
         ref: clusterMeta.configsvr.backupKey,
-        uri: config.mongo.uri,
-        database: "config",
+        uri: targetConfigsvrUri,
+        database: targetTopology?.configsvr?.host ? "*" : "config",
+        ...(targetTopology?.configsvr?.host
+          ? {
+              nsInclude:
+                "config.databases,config.collections,config.chunks,config.tags,config.settings",
+            }
+          : {}),
         drop,
       },
     );
 
-    // 3. Restore each shard
+    // 3. Restore each shard (using target cluster shard host mapping when available)
     const restoredShards: string[] = [];
     for (const [shardId, shard] of Object.entries(clusterMeta.shards)) {
       if (shard.status !== "success" || !shard.backupKey) {
@@ -473,8 +574,9 @@ export async function restoreShardedCluster({
         continue;
       }
 
-      const targetShardUri = shard.host
-        ? buildShardUri(config.mongo.uri, shard.host)
+      const resolvedHost = targetShardMap.get(shardId) || shard.host;
+      const targetShardUri = resolvedHost
+        ? buildShardUri(config.mongo.uri, resolvedHost)
         : config.mongo.uri;
 
       log.info({ shardId, backupKey: shard.backupKey }, "Restoring shard...");
@@ -486,13 +588,52 @@ export async function restoreShardedCluster({
           database: "*",
           drop,
           oplogReplay: true,
-          oplogLimit: clusterMeta.clusterTime,
+          oplogLimit: exclusiveClusterLimit,
         },
       );
+
+      if (shard.bridgingSliceKey) {
+        const rawSlice = path.join(config.workDir, `.shard-bridge-${randomUUID()}.oplog.bson`);
+        const filteredSlice = path.join(
+          config.workDir,
+          `.shard-bridge-f-${randomUUID()}.oplog.bson`,
+        );
+        try {
+          await downloadAndExtractOplogSlice(
+            { config, storage, signal },
+            shard.bridgingSliceKey,
+            rawSlice,
+          );
+          const { keptEntries } = await filterOplogSliceFile(rawSlice, filteredSlice, {
+            ...(clusterTs ? { targetTs: clusterTs } : {}),
+          });
+          if (keptEntries > 0) {
+            await replayOplogFile({
+              uri: targetShardUri,
+              workDir: config.workDir,
+              oplogFile: filteredSlice,
+              oplogLimit: exclusiveClusterLimit,
+              timeoutMs: config.timeoutMs,
+              signal,
+              logger: log.child({ target: shardId }),
+            });
+          }
+        } finally {
+          await Promise.allSettled([
+            fs.rm(rawSlice, { force: true }),
+            fs.rm(filteredSlice, { force: true }),
+          ]);
+        }
+      }
+
       restoredShards.push(shardId);
     }
 
-    // 4. Restart balancer
+    // 4. Flush mongos router config and restart balancer
+    await client
+      .db("admin")
+      .command({ flushRouterConfig: 1 })
+      .catch(() => {});
     await balancer.start();
 
     log.info(

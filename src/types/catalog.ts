@@ -47,6 +47,7 @@ export interface ShardedClusterShardBackup {
   host: string;
   backupKey: string;
   manifestKey: string;
+  bridgingSliceKey?: string;
   status: "success" | "failed";
   size?: number;
 }

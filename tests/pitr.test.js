@@ -503,10 +503,10 @@ describe("Continuous Oplog Archiver and PITR Restore Coordinator", () => {
     expect(result.key).toBe(baseManifest.key);
     expect(result.pitrTarget).toBe("1025:1");
     expect(result.replayedSlices).toBe(2);
-    expect(result.replayedEntries).toBe(4);
+    expect(result.replayedEntries).toBe(3);
     expect(replayedFiles).toHaveLength(2);
-    expect(replayedFiles[0].oplogLimit).toBe("1025:1");
-    expect(replayedFiles[1].oplogLimit).toBe("1025:1");
+    expect(replayedFiles[0].oplogLimit).toBe("1025:2");
+    expect(replayedFiles[1].oplogLimit).toBe("1025:2");
 
     // Verify no temporary files or directories remain in workDir
     const leftover = await fs.readdir(tmpDir);
@@ -830,5 +830,122 @@ describe("Continuous Oplog Archiver and PITR Restore Coordinator", () => {
     // Even though doc 1 exceeded maxBytes, it had partialTxn: true so doc 2 (the final commit) must be included in the same slice
     expect(manifest.oplogWindow.entries).toBe(2);
     expect(manifest.oplogWindow.endTs).toBe("1000:2");
+  });
+
+  it("filters out system/no-op entries and enforces database/targetTs in filterOplogSliceFile", async () => {
+    const { BSON } = await import("mongodb");
+    const { filterOplogSliceFile } = await import("../src/oplog.js");
+
+    const docs = [
+      { ts: toBsonTimestamp({ t: 1000, i: 1 }), op: "n", ns: "", o: { msg: "periodic noop" } },
+      {
+        ts: toBsonTimestamp({ t: 1001, i: 1 }),
+        op: "i",
+        ns: "config.system.sessions",
+        o: { _id: "sess1" },
+      },
+      {
+        ts: toBsonTimestamp({ t: 1002, i: 1 }),
+        op: "i",
+        ns: "otherdb.logs",
+        o: { _id: 1 },
+      },
+      {
+        ts: toBsonTimestamp({ t: 1003, i: 1 }),
+        op: "i",
+        ns: "app.users",
+        o: { _id: 1, name: "alice" },
+      },
+      {
+        ts: toBsonTimestamp({ t: 1004, i: 1 }),
+        op: "c",
+        ns: "admin.$cmd",
+        o: {
+          applyOps: [
+            { op: "i", ns: "otherdb.logs", o: { _id: 2 } },
+            { op: "i", ns: "app.orders", o: { _id: 99 } },
+          ],
+        },
+      },
+      {
+        ts: toBsonTimestamp({ t: 1005, i: 1 }),
+        op: "d",
+        ns: "app.users",
+        o: { _id: 1 },
+      },
+    ];
+
+    const rawBuf = Buffer.concat(docs.map((d) => Buffer.from(BSON.serialize(d))));
+    const srcFile = path.join(tmpDir, "raw.oplog.bson");
+    const destFile = path.join(tmpDir, "filtered.oplog.bson");
+    await fs.writeFile(srcFile, rawBuf);
+
+    const { keptEntries } = await filterOplogSliceFile(srcFile, destFile, {
+      targetTs: { t: 1004, i: 1 },
+      database: "app",
+    });
+
+    expect(keptEntries).toBe(2);
+    const outBuf = await fs.readFile(destFile);
+    const firstLen = outBuf.readInt32LE(0);
+    const first = BSON.deserialize(outBuf.subarray(0, firstLen));
+    const secondLen = outBuf.readInt32LE(firstLen);
+    const second = BSON.deserialize(outBuf.subarray(firstLen, firstLen + secondLen));
+
+    expect(first.ns).toBe("app.users");
+    expect(second.o.applyOps).toHaveLength(1);
+    expect(second.o.applyOps[0].ns).toBe("app.orders");
+  });
+
+  it("ignores physical and sharded backups in resolvePitrPlan for logical PITR", async () => {
+    const { resolvePitrPlan } = await import("../src/oplog.js");
+    const { writeManifest } = await import("../src/catalog.js");
+
+    const { Readable } = await import("node:stream");
+
+    const logicalKey = "backups/_cluster/2026-03-10/20260310T100000Z.archive.gz";
+    const physicalKey = "backups/_cluster/2026-03-10/20260310T110000Z.physical.tar.gz";
+
+    await mockStorage.upload(logicalKey, Readable.from([Buffer.from("logical")]));
+    await writeManifest(mockStorage, {
+      version: 2,
+      engine: "logical",
+      key: logicalKey,
+      database: "*",
+      createdAt: "2026-03-10T10:00:00.000Z",
+      completedAt: "2026-03-10T10:00:10.000Z",
+      durationMs: 10000,
+      size: 7,
+      sha256: "abc",
+      compression: "gzip",
+      encryption: null,
+      oplog: true,
+      oplogWindow: { startTs: "1000:1", endTs: "1000:2" },
+      excludedCollections: [],
+      collections: {},
+    });
+
+    await mockStorage.upload(physicalKey, Readable.from([Buffer.from("physical")]));
+    await writeManifest(mockStorage, {
+      version: 2,
+      engine: "physical",
+      type: "physical-hot-backup",
+      key: physicalKey,
+      database: "*",
+      createdAt: "2026-03-10T11:00:00.000Z",
+      completedAt: "2026-03-10T11:00:10.000Z",
+      durationMs: 10000,
+      size: 8,
+      sha256: "def",
+      compression: "gzip",
+      encryption: null,
+      oplog: true,
+      oplogWindow: { startTs: "1005:1", endTs: "1005:2" },
+      excludedCollections: [],
+      collections: {},
+    });
+
+    const plan = await resolvePitrPlan(mockStorage, { prefix: "backups", database: "*" }, "1000:2");
+    expect(plan.baseBackup.key).toBe(logicalKey);
   });
 });

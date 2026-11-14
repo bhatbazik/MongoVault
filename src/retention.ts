@@ -170,14 +170,24 @@ export async function deleteBackup(
     }
   }
 
-  // Prevent deleting the active base backup that anchors PITR slices unless --force is passed
+  // Prevent deleting any base backup that anchors active PITR slices unless --force is passed
   if (!force) {
     const slices = (await listOplogSlices(storage, scope)).filter((s) => s.complete);
     if (slices.length > 0) {
       const backups = (await listBackups(storage, scope)).filter((b) => b.complete);
-      if (backups.length > 0 && backups[0]?.key === resolvedKey) {
+      const oldestSlice = slices[0]!;
+      // Find the newest backup at or before the oldest slice's startTs (or fall back to the newest backup)
+      let anchorKey: string | undefined = backups[0]?.key;
+      for (const b of backups) {
+        const bEpoch = Math.floor(new Date(b.createdAt).getTime() / 1000);
+        if (bEpoch <= oldestSlice.startTs.t) {
+          anchorKey = b.key;
+          break;
+        }
+      }
+      if (anchorKey === resolvedKey || backups.length === 1) {
         throw new Error(
-          `Cannot delete backup "${resolvedKey}": it is the active base snapshot anchoring PITR continuous oplog slices. Deleting it would invalidate point-in-time recovery. Pass --force to override.`,
+          `Cannot delete backup "${resolvedKey}": it is an active base snapshot anchoring PITR continuous oplog slices. Deleting it would invalidate point-in-time recovery. Pass --force to override.`,
         );
       }
     }

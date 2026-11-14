@@ -280,10 +280,10 @@ describe("multi-shard cluster coordinator", () => {
     // Shard restores are anchored to clusterTime with oplogReplay
     expect(restoredTargets[1].database).toBe("*");
     expect(restoredTargets[1].oplogReplay).toBe(true);
-    expect(restoredTargets[1].oplogLimit).toBe("1774092000:5");
+    expect(restoredTargets[1].oplogLimit).toBe("1774092000:6");
     expect(restoredTargets[2].database).toBe("*");
     expect(restoredTargets[2].oplogReplay).toBe(true);
-    expect(restoredTargets[2].oplogLimit).toBe("1774092000:5");
+    expect(restoredTargets[2].oplogLimit).toBe("1774092000:6");
   });
 
   it("fails closed in stopAndDrain if balancer mode remains enabled even if not in a round", async () => {

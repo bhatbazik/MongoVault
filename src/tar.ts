@@ -43,9 +43,18 @@ export function createTarHeader(name: string, size: number, mtime: number = Date
   // gid: 116..124
   buf.write("0000000\0", 116, "ascii");
 
-  // size: 124..136 (11 octal digits + null terminator)
-  const sizeOctal = size.toString(8).padStart(11, "0") + "\0";
-  buf.write(sizeOctal, 124, "ascii");
+  // size: 124..136 (11 octal digits + null terminator, or GNU base-256 for files >= 8 GiB)
+  if (size <= 0o77777777777) {
+    const sizeOctal = size.toString(8).padStart(11, "0") + "\0";
+    buf.write(sizeOctal, 124, "ascii");
+  } else {
+    buf[124] = 0x80;
+    let remaining = BigInt(size);
+    for (let i = 135; i >= 125; i--) {
+      buf[i] = Number(remaining & 0xffn);
+      remaining >>= 8n;
+    }
+  }
 
   // mtime: 136..148 (seconds since epoch in octal + null terminator)
   const mtimeOctal =
@@ -191,6 +200,20 @@ export async function extractTarStream(
         const isZero = headerBuf.every((b) => b === 0);
         if (isZero) continue;
 
+        // Verify tar header checksum (bytes 148..156 treated as ASCII spaces)
+        const rawChksum = headerBuf
+          .toString("ascii", 148, 156)
+          .replace(/[\0 ]+$/, "")
+          .trim();
+        const expectedChksum = parseInt(rawChksum, 8);
+        let computedChksum = 0;
+        for (let i = 0; i < 512; i++) {
+          computedChksum += i >= 148 && i < 156 ? 32 : headerBuf[i]!;
+        }
+        if (Number.isNaN(expectedChksum) || expectedChksum !== computedChksum) {
+          throw new Error("Corrupted tar header: checksum mismatch");
+        }
+
         const baseName = headerBuf.toString("utf8", 0, 100).replace(/\0.*$/, "").trim();
         const ustarPrefix = headerBuf.toString("utf8", 345, 500).replace(/\0.*$/, "").trim();
         const rawName = ustarPrefix ? `${ustarPrefix}/${baseName}` : baseName;
@@ -201,8 +224,18 @@ export async function extractTarStream(
           .normalize(rawName.replace(/\\/g, "/"))
           .replace(/^(\.\.\/)+/, "")
           .replace(/^\/+/, "");
-        const rawSize = headerBuf.toString("ascii", 124, 136).replace(/\0.*$/, "").trim();
-        const size = parseInt(rawSize, 8) || 0;
+        let size: number;
+        if ((headerBuf[124]! & 0x80) !== 0) {
+          // GNU base-256 encoded size
+          let bigSize = BigInt(headerBuf[124]! & 0x7f);
+          for (let i = 125; i < 136; i++) {
+            bigSize = (bigSize << 8n) | BigInt(headerBuf[i]!);
+          }
+          size = Number(bigSize);
+        } else {
+          const rawSize = headerBuf.toString("ascii", 124, 136).replace(/\0.*$/, "").trim();
+          size = parseInt(rawSize, 8) || 0;
+        }
 
         currentHeader = { name: safeName, size };
         remainingBytes = size;

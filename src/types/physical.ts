@@ -40,6 +40,7 @@ export interface PhysicalRestoreOptions {
   logger: Logger;
   targetDbPath: string;
   ref?: string;
+  pitr?: string;
   signal?: AbortSignal;
 }
 
@@ -48,4 +49,7 @@ export interface PhysicalRestoreResult {
   restoredFiles: number;
   totalBytes: number;
   targetDbPath: string;
+  pitrTarget?: string;
+  replayedSlices?: number;
+  replayedEntries?: number;
 }

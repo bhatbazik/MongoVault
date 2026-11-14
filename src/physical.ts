@@ -1,4 +1,7 @@
+import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
+import net from "node:net";
 import path from "node:path";
 import { PassThrough, Readable } from "node:stream";
 import { createGunzip, createGzip } from "node:zlib";
@@ -16,7 +19,14 @@ import {
 import { createDecryptor, createEncryptor, verifyManifest } from "./crypto.js";
 import { DigestStream } from "./digest.js";
 import { formatBytes, formatDuration } from "./format.js";
-import { formatOplogTimestamp } from "./oplog.js";
+import {
+  downloadAndExtractOplogSlice,
+  filterOplogSliceFile,
+  formatOplogTimestamp,
+  fromBsonTimestamp,
+  incrementOplogTimestamp,
+  resolvePitrPlan,
+} from "./oplog.js";
 import { runStreamPipeline } from "./stream.js";
 import {
   createTarHeader,
@@ -24,6 +34,7 @@ import {
   extractTarStream,
   generateTarStream,
 } from "./tar.js";
+import { replayOplogFile } from "./tools.js";
 import type { BackupManifest, PhysicalBackupMeta } from "./types/catalog.js";
 import type {
   BackupCursorFile,
@@ -338,6 +349,7 @@ export async function runPhysicalBackup({
     const activeDbPath = resolvedDbPath;
 
     // Fallback to fsyncLock if $backupCursor returned empty or is not supported
+    let fsyncOplogTs: string | undefined;
     if (!cursorMeta && dataFiles.length === 0) {
       if (!fsyncLockFallback) {
         throw new Error(
@@ -345,9 +357,39 @@ export async function runPhysicalBackup({
         );
       }
 
+      const hello = await admin.command({ hello: 1 }).catch(() => null);
+      if (
+        hello?.setName &&
+        hello?.isWritablePrimary &&
+        Array.isArray(hello?.hosts) &&
+        hello.hosts.length > 1
+      ) {
+        log.warn(
+          { setName: hello.setName, hosts: hello.hosts },
+          "Running fsyncLock physical backup on a multi-node replica set PRIMARY blocks all cluster writes. Configure a secondary readPreference for zero-downtime backups.",
+        );
+      }
+
       log.info("Acquiring fsyncLock on MongoDB cluster...");
       await admin.command({ fsync: 1, lock: true });
       locked = true;
+
+      // Capture exact oplog position while write-locked so fsyncLock backups support PITR
+      try {
+        const newestDoc = await client
+          .db("local")
+          .collection("oplog.rs")
+          .find({}, { projection: { ts: 1 } })
+          .sort({ $natural: -1 })
+          .limit(1)
+          .next();
+        const ts = fromBsonTimestamp(newestDoc?.ts);
+        if (ts) {
+          fsyncOplogTs = formatOplogTimestamp(ts);
+        }
+      } catch {
+        // Standalone instance without oplog.rs
+      }
 
       const scanned = await scanWiredTigerFiles(activeDbPath);
       for (const f of scanned) {
@@ -357,7 +399,10 @@ export async function runPhysicalBackup({
           dataFiles.push(f);
         }
       }
-      log.info({ filesCount: scanned.length }, "Scanned WiredTiger data files under lock");
+      log.info(
+        { filesCount: scanned.length, fsyncOplogTs },
+        "Scanned WiredTiger data files under lock",
+      );
     }
 
     if (dataFiles.length === 0 && journalFiles.length === 0) {
@@ -493,8 +538,10 @@ export async function runPhysicalBackup({
       oplogEnd: cursorMeta?.oplogEnd?.ts ? formatOplogTimestamp(cursorMeta.oplogEnd.ts) : undefined,
     };
 
-    const effectiveStartTs = physicalMeta.oplogStart || physicalMeta.checkpointTimestamp;
-    const effectiveEndTs = physicalMeta.oplogEnd || physicalMeta.checkpointTimestamp;
+    const effectiveStartTs =
+      physicalMeta.oplogStart || physicalMeta.checkpointTimestamp || fsyncOplogTs;
+    const effectiveEndTs =
+      physicalMeta.oplogEnd || physicalMeta.checkpointTimestamp || fsyncOplogTs;
 
     const manifest: BackupManifest = {
       version: MANIFEST_VERSION,
@@ -556,8 +603,41 @@ export async function runPhysicalBackup({
   }
 }
 
+async function findFreePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.listen(0, "127.0.0.1", () => {
+      const addr = srv.address();
+      const port = typeof addr === "object" && addr ? addr.port : 0;
+      srv.close((err) => (err ? reject(err) : resolve(port)));
+    });
+    srv.on("error", reject);
+  });
+}
+
+async function waitForMongodReady(uri: string, timeoutMs = 30_000): Promise<MongoClient> {
+  const deadline = Date.now() + timeoutMs;
+  let lastErr: unknown = null;
+  while (Date.now() < deadline) {
+    const client = new MongoClient(uri, { serverSelectionTimeoutMS: 2000 });
+    try {
+      await client.connect();
+      await client.db("admin").command({ ping: 1 });
+      return client;
+    } catch (err) {
+      lastErr = err;
+      await client.close().catch(() => {});
+      await new Promise((r) => setTimeout(r, 300));
+    }
+  }
+  throw new Error(
+    `Temporary mongod did not become ready within ${timeoutMs}ms: ${lastErr instanceof Error ? lastErr.message : String(lastErr)}`,
+  );
+}
+
 /**
- * Restores a physical WiredTiger hot backup directly into a target dbPath.
+ * Restores a physical WiredTiger hot backup directly into a target dbPath,
+ * with optional Point-in-Time Recovery (PITR) oplog replay via an ephemeral local mongod.
  */
 export async function restorePhysicalBackup({
   config,
@@ -565,16 +645,22 @@ export async function restorePhysicalBackup({
   logger,
   targetDbPath,
   ref = "latest",
+  pitr,
   signal,
 }: PhysicalRestoreOptions): Promise<PhysicalRestoreResult> {
   const log = logger.child({ targetDbPath });
-  log.info({ ref }, "Starting physical backup restore");
+  log.info({ ref, pitr }, "Starting physical backup restore");
 
-  const resolvedRef =
-    ref === "latest" && typeof storage.list === "function"
+  const pitrPlan = pitr
+    ? await resolvePitrPlan(storage, scopeOf(config), pitr, { engine: "physical" })
+    : null;
+
+  const resolvedRef = pitrPlan
+    ? pitrPlan.baseBackup.key
+    : ref === "latest" && typeof storage.list === "function"
       ? await resolveBackup(storage, scopeOf(config), ref)
       : ref;
-  const manifestData = await readManifest(storage, resolvedRef);
+  const manifestData = pitrPlan?.baseManifest ?? (await readManifest(storage, resolvedRef));
   const backupKey = manifestData?.key || resolvedRef;
 
   const keyRing = resolveKeyRing(config);
@@ -654,10 +740,115 @@ export async function restorePhysicalBackup({
     "Physical restore extracted successfully",
   );
 
+  if (!pitrPlan) {
+    return {
+      key: backupKey,
+      restoredFiles: extractedCount,
+      totalBytes,
+      targetDbPath,
+    };
+  }
+
+  // Stage 2 (PITR): Boot ephemeral standalone mongod on targetDbPath, replay oplog slices, and shut down cleanly
+  const port = await findFreePort();
+  const ephemeralUri = `mongodb://127.0.0.1:${port}`;
+  const targetLimit = formatOplogTimestamp(pitrPlan.targetTs);
+  const exclusiveLimit = formatOplogTimestamp(incrementOplogTimestamp(pitrPlan.targetTs));
+  const mongodLog = path.join(config.workDir, `.pitr-mongod-${randomUUID()}.log`);
+
+  await fs.mkdir(config.workDir, { recursive: true });
+  log.info(
+    { port, slices: pitrPlan.slices.length, targetLimit },
+    "Starting temporary mongod for physical PITR oplog replay",
+  );
+
+  const proc = spawn(
+    "mongod",
+    [`--dbpath=${targetDbPath}`, `--port=${port}`, "--bind_ip=127.0.0.1", `--logpath=${mongodLog}`],
+    { stdio: "ignore" },
+  );
+
+  const procExit = new Promise<void>((resolve) => {
+    proc.once("close", () => resolve());
+    proc.once("error", () => resolve());
+  });
+
+  let tmpClient: MongoClient | null = null;
+  let replayedEntries = 0;
+
+  try {
+    tmpClient = await waitForMongodReady(ephemeralUri, 30_000);
+    // Clear replica set config on standalone recovery instance so it starts cleanly when re-added to RS
+    await tmpClient
+      .db("local")
+      .collection("system.replset")
+      .drop()
+      .catch(() => {});
+
+    for (const slice of pitrPlan.slices) {
+      const rawSlice = path.join(config.workDir, `.phys-pitr-${randomUUID()}.oplog.bson`);
+      const filteredSlice = path.join(config.workDir, `.phys-pitr-f-${randomUUID()}.oplog.bson`);
+      try {
+        await downloadAndExtractOplogSlice({ config, storage, signal }, slice.key, rawSlice);
+        const { keptEntries } = await filterOplogSliceFile(rawSlice, filteredSlice, {
+          targetTs: pitrPlan.targetTs,
+        });
+        if (keptEntries === 0) continue;
+
+        await replayOplogFile({
+          uri: ephemeralUri,
+          workDir: config.workDir,
+          oplogFile: filteredSlice,
+          oplogLimit: exclusiveLimit,
+          timeoutMs: config.timeoutMs,
+          signal,
+          logger: log,
+        });
+        replayedEntries += keptEntries;
+      } finally {
+        await Promise.allSettled([
+          fs.rm(rawSlice, { force: true }),
+          fs.rm(filteredSlice, { force: true }),
+        ]);
+      }
+    }
+
+    await tmpClient
+      .db("admin")
+      .command({ fsync: 1 })
+      .catch(() => {});
+    await tmpClient
+      .db("admin")
+      .command({ shutdown: 1, force: true })
+      .catch(() => {});
+    await tmpClient.close().catch(() => {});
+    tmpClient = null;
+    await procExit;
+  } finally {
+    if (tmpClient) {
+      await tmpClient
+        .db("admin")
+        .command({ shutdown: 1, force: true })
+        .catch(() => {});
+      await tmpClient.close().catch(() => {});
+    }
+    if (proc.exitCode === null && proc.signalCode === null) {
+      proc.kill("SIGTERM");
+      await Promise.race([procExit, new Promise((r) => setTimeout(r, 5_000))]);
+      if (proc.exitCode === null && proc.signalCode === null) {
+        proc.kill("SIGKILL");
+      }
+    }
+    await fs.rm(mongodLog, { force: true }).catch(() => {});
+  }
+
   return {
     key: backupKey,
     restoredFiles: extractedCount,
     totalBytes,
     targetDbPath,
+    pitrTarget: targetLimit,
+    replayedSlices: pitrPlan.slices.length,
+    replayedEntries,
   };
 }

@@ -8,6 +8,7 @@ import {
   MANIFEST_SUFFIX,
   MANIFEST_VERSION,
   databasePrefix,
+  isClusterScope,
   listBackups,
   readManifest,
   resolveKeyRing,
@@ -16,6 +17,7 @@ import {
 } from "./catalog.js";
 import { createDecryptor, createEncryptor, verifyManifest } from "./crypto.js";
 import { DigestStream } from "./digest.js";
+import { acquireHybridLock } from "./lock.js";
 import { runStreamPipeline } from "./stream.js";
 import type { BackupManifest, BackupScope, BackupSummary } from "./types/catalog.js";
 import type { AppConfig } from "./types/config.js";
@@ -98,6 +100,112 @@ export function formatOplogTimestamp(ts: OplogTimestamp | string): string {
 export function compareTimestamps(a: OplogTimestamp, b: OplogTimestamp): number {
   if (a.t !== b.t) return Math.sign(a.t - b.t);
   return Math.sign(a.i - b.i);
+}
+
+/**
+ * Advances an oplog timestamp by 1 ordinal so exclusive `--oplogLimit` includes `ts` itself.
+ */
+export function incrementOplogTimestamp(ts: OplogTimestamp): OplogTimestamp {
+  const t = ts.t >>> 0;
+  const i = ts.i >>> 0;
+  if (i < 0xffffffff) {
+    return { t, i: i + 1 };
+  }
+  return { t: (t + 1) >>> 0, i: 0 };
+}
+
+const EXCLUDED_OPLOG_NS = new Set([
+  "config.system.sessions",
+  "config.rangeDeletions",
+  "config.transactions",
+]);
+
+function isSystemExcludedNs(ns: string): boolean {
+  return EXCLUDED_OPLOG_NS.has(ns) || ns.startsWith("local.") || ns.startsWith("admin.mongovault");
+}
+
+function nsMatchesPattern(ns: string, pattern: string): boolean {
+  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
+  return new RegExp(`^${escaped}$`).test(ns);
+}
+
+function isNsIncluded(
+  ns: string,
+  { database, nsInclude, nsExclude }: { database?: string; nsInclude?: string; nsExclude?: string },
+): boolean {
+  if (isSystemExcludedNs(ns)) return false;
+  if (database && !isClusterScope(database)) {
+    if (ns !== `${database}.$cmd` && !ns.startsWith(`${database}.`)) {
+      return false;
+    }
+  }
+  if (nsInclude && !nsMatchesPattern(ns, nsInclude)) return false;
+  if (nsExclude && nsMatchesPattern(ns, nsExclude)) return false;
+  return true;
+}
+
+/**
+ * Filters a raw BSON oplog file to remove system/no-op entries, enforce namespace filters,
+ * and cap entries at `targetTs` (inclusive). Returns the number of kept entries.
+ */
+export async function filterOplogSliceFile(
+  srcBsonFile: string,
+  destBsonFile: string,
+  options: {
+    targetTs?: OplogTimestamp;
+    database?: string;
+    nsInclude?: string;
+    nsExclude?: string;
+  } = {},
+): Promise<{ keptEntries: number }> {
+  const raw = await fs.readFile(srcBsonFile);
+  const chunks: Buffer[] = [];
+  let offset = 0;
+  let keptEntries = 0;
+
+  while (offset + 4 <= raw.length) {
+    const docLen = raw.readInt32LE(offset);
+    if (docLen <= 0 || offset + docLen > raw.length) {
+      throw new Error(`Corrupted BSON document in oplog slice at offset ${offset}`);
+    }
+    const rawSlice = raw.subarray(offset, offset + docLen);
+    offset += docLen;
+
+    const doc = BSON.deserialize(rawSlice, { promoteValues: false }) as {
+      ts?: unknown;
+      op?: string;
+      ns?: string;
+      o?: { applyOps?: Array<{ ns?: string; [k: string]: unknown }>; [k: string]: unknown };
+    };
+
+    if (doc.op === "n") continue;
+
+    const docTs = fromBsonTimestamp(doc.ts);
+    if (options.targetTs && docTs && compareTimestamps(docTs, options.targetTs) > 0) {
+      continue;
+    }
+
+    if (doc.op === "c" && Array.isArray(doc.o?.applyOps)) {
+      const filteredOps = doc.o.applyOps.filter((inner) =>
+        isNsIncluded(String(inner.ns || ""), options),
+      );
+      if (filteredOps.length === 0) continue;
+      if (filteredOps.length !== doc.o.applyOps.length) {
+        doc.o.applyOps = filteredOps;
+        chunks.push(Buffer.from(BSON.serialize(doc)));
+        keptEntries++;
+        continue;
+      }
+    } else if (!isNsIncluded(String(doc.ns || ""), options)) {
+      continue;
+    }
+
+    chunks.push(rawSlice);
+    keptEntries++;
+  }
+
+  await fs.writeFile(destBsonFile, Buffer.concat(chunks), { mode: 0o600 });
+  return { keptEntries };
 }
 
 export function toBsonTimestamp(ts: OplogTimestamp): Timestamp {
@@ -609,11 +717,20 @@ export async function resolvePitrPlan(
   storage: StorageClient,
   scope: BackupScope,
   targetInput: string | OplogTimestamp,
+  options: { engine?: "logical" | "physical" } = {},
 ): Promise<PitrPlan> {
+  const targetEngine = options.engine ?? "logical";
   const targetTs = parsePitrTarget(targetInput);
-  const backups = (await listBackups(storage, scope)).filter((b) => b.complete);
+  const backups = (await listBackups(storage, scope)).filter((b) => {
+    if (!b.complete) return false;
+    const isPhysical = /\.physical\.tar\.gz(\.enc)?$/.test(b.key);
+    const isSharded = /\.cluster(\.enc)?$/.test(b.key);
+    return targetEngine === "physical" ? isPhysical : !isPhysical && !isSharded;
+  });
   if (backups.length === 0) {
-    throw new Error(`No complete base backups found under ${databasePrefix(scope)}`);
+    throw new Error(
+      `No complete ${targetEngine} base backups found under ${databasePrefix(scope)}`,
+    );
   }
 
   let selectedBackup: BackupSummary | null = null;
@@ -623,6 +740,15 @@ export async function resolvePitrPlan(
   for (const backup of backups) {
     const manifest = await readManifest(storage, backup.key);
     if (!manifest) continue;
+    if (
+      targetEngine === "logical" &&
+      (manifest.engine === "physical" || manifest.type === "sharded-cluster-backup")
+    ) {
+      continue;
+    }
+    if (targetEngine === "physical" && manifest.engine !== "physical") {
+      continue;
+    }
     const endTs: OplogTimestamp = manifest.oplogWindow?.endTs
       ? parseOplogTimestamp(manifest.oplogWindow.endTs)!
       : {
@@ -771,13 +897,30 @@ export function startOplogArchiver({
   createMongoClient = (u) => new MongoClient(u),
 }: StartOplogArchiverOptions): OplogArchiver {
   const intervalMs = (config.pitr?.flushIntervalSeconds ?? 60) * 1000;
+  const scope = scopeOf(config);
+  const lockFile = path.join(config.workDir, ".oplog.lock");
+  const distLockKey = `${pitrPrefix(scope)}.locks/oplog.lock.json`;
   let stopped = false;
   let activePromise: Promise<BackupManifest | null> | null = null;
   let timer: NodeJS.Timeout | null = null;
 
   async function tick(): Promise<void> {
     if (stopped || signal?.aborted) return;
+    let release: (() => Promise<void>) | null = null;
     try {
+      release = await acquireHybridLock({
+        file: lockFile,
+        storage,
+        lockKey: distLockKey,
+        staleAfterMs: Math.max(120_000, intervalMs * 3),
+        distributedTtlMs: Math.max(90_000, intervalMs * 2),
+        logger,
+      });
+      if (!release) {
+        logger.debug("Skipping PITR oplog slice tick: another instance holds the oplog lock");
+        return;
+      }
+
       activePromise = captureOplogSlice({
         config,
         storage,
@@ -794,6 +937,9 @@ export function startOplogArchiver({
       }
     } finally {
       activePromise = null;
+      if (release) {
+        await release().catch(() => {});
+      }
     }
   }
 

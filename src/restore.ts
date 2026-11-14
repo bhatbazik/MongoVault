@@ -7,7 +7,13 @@ import { linkedController, settleAll } from "./abort.js";
 import { isClusterScope, readManifest, resolveBackup, resolveKeyRing, scopeOf } from "./catalog.js";
 import { createDecryptor, verifyManifest } from "./crypto.js";
 import { DigestStream } from "./digest.js";
-import { downloadAndExtractOplogSlice, formatOplogTimestamp, resolvePitrPlan } from "./oplog.js";
+import {
+  downloadAndExtractOplogSlice,
+  filterOplogSliceFile,
+  formatOplogTimestamp,
+  incrementOplogTimestamp,
+  resolvePitrPlan,
+} from "./oplog.js";
 import { runStreamPipeline } from "./stream.js";
 import { mongorestore, replayOplogFile } from "./tools.js";
 import type { BackupManifest } from "./types/catalog.js";
@@ -234,12 +240,22 @@ export async function restoreBackup(
 
 export async function restorePointInTime(
   ctx: RestoreContext,
-  { pitr, uri, database, drop = false, preVerify = drop, parallelCollections }: RestoreOptions,
+  {
+    pitr,
+    uri,
+    database,
+    nsInclude,
+    nsExclude,
+    drop = false,
+    preVerify = drop,
+    parallelCollections,
+  }: RestoreOptions,
 ): Promise<RestoreResult> {
   const { config, storage, logger, signal, tools } = ctx;
   const effectiveReplay = tools?.replayOplogFile ?? replayOplogFile;
-  const plan = await resolvePitrPlan(storage, scopeOf(config), pitr!);
+  const plan = await resolvePitrPlan(storage, scopeOf(config), pitr!, { engine: "logical" });
   const targetLimit = formatOplogTimestamp(plan.targetTs);
+  const exclusiveLimit = formatOplogTimestamp(incrementOplogTimestamp(plan.targetTs));
 
   logger.info(
     {
@@ -256,47 +272,67 @@ export async function restorePointInTime(
     ref: plan.baseBackup.key,
     uri,
     database,
+    nsInclude,
+    nsExclude,
     drop,
     preVerify,
-    oplogReplay: Boolean(plan.baseManifest?.oplog),
-    oplogLimit: plan.slices.length === 0 && plan.baseManifest?.oplog ? targetLimit : undefined,
+    oplogReplay: Boolean(plan.baseManifest?.oplog) && !database && !nsInclude && !nsExclude,
+    oplogLimit:
+      plan.slices.length === 0 && plan.baseManifest?.oplog && !database && !nsInclude && !nsExclude
+        ? exclusiveLimit
+        : undefined,
     parallelCollections,
   });
 
-  // Stage 2: Sequentially download, verify, decrypt, and replay continuous oplog slices up to targetLimit
+  // Stage 2: Sequentially download, verify, decrypt, filter, and replay continuous oplog slices
   const controller = linkedController(signal);
   let replayedEntries = 0;
 
   try {
     for (const slice of plan.slices) {
       const sliceFile = path.join(config.workDir, `.pitr-slice-${randomUUID()}.oplog.bson`);
+      const filteredFile = path.join(config.workDir, `.pitr-filtered-${randomUUID()}.oplog.bson`);
       try {
-        const extracted = await downloadAndExtractOplogSlice(
+        await downloadAndExtractOplogSlice(
           { config, storage, signal: controller.signal },
           slice.key,
           sliceFile,
         );
+        const { keptEntries } = await filterOplogSliceFile(sliceFile, filteredFile, {
+          targetTs: plan.targetTs,
+          database,
+          nsInclude,
+          nsExclude,
+        });
+        if (keptEntries === 0) {
+          logger.debug({ sliceKey: slice.key }, "Skipping oplog slice with 0 matching entries");
+          continue;
+        }
         await effectiveReplay({
           uri,
           workDir: config.workDir,
-          oplogFile: sliceFile,
-          oplogLimit: targetLimit,
+          oplogFile: filteredFile,
+          oplogLimit: exclusiveLimit,
           timeoutMs: config.timeoutMs,
           signal: controller.signal,
           logger,
         });
-        replayedEntries += extracted.manifest?.oplogWindow?.entries ?? 0;
+        replayedEntries += keptEntries;
         logger.info(
           {
             sliceKey: slice.key,
             startTs: formatOplogTimestamp(slice.startTs),
             endTs: formatOplogTimestamp(slice.endTs),
+            keptEntries,
             oplogLimit: targetLimit,
           },
           "Replayed PITR oplog slice",
         );
       } finally {
-        await fs.rm(sliceFile, { force: true }).catch(() => {});
+        await Promise.allSettled([
+          fs.rm(sliceFile, { force: true }),
+          fs.rm(filteredFile, { force: true }),
+        ]);
       }
     }
 

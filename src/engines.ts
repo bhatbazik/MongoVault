@@ -105,6 +105,7 @@ export class PhysicalBackupEngine implements BackupEngineStrategy {
       logger: options.logger,
       targetDbPath: options.dbPath,
       ref: options.ref || "latest",
+      pitr: options.pitr,
       signal: options.signal,
     });
   }

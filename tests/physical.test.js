@@ -307,4 +307,26 @@ describe("physical backup engine", () => {
       return d;
     }
   });
+
+  it("encodes >8 GiB file sizes with GNU base-256 tar headers and rejects corrupted checksums", async () => {
+    const { createTarHeader, extractTarStream } = await import("../src/tar.js");
+    const { Readable } = await import("node:stream");
+
+    const tenGiB = 10 * 1024 * 1024 * 1024;
+    const header = createTarHeader("collection-huge.wt", tenGiB);
+    expect(header.length).toBe(512);
+    expect(header[124] & 0x80).toBe(0x80);
+
+    // Corrupt a byte in the header and verify extractTarStream rejects it
+    const corrupt = Buffer.from(header);
+    corrupt[0] = corrupt[0] ^ 0xff;
+    const destDir = await fs.mkdtemp(path.join(os.tmpdir(), "tar-corrupt-"));
+    try {
+      await expect(extractTarStream(Readable.from([corrupt]), destDir)).rejects.toThrow(
+        /checksum mismatch/i,
+      );
+    } finally {
+      await fs.rm(destDir, { recursive: true, force: true });
+    }
+  });
 });

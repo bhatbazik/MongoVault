@@ -90,7 +90,13 @@ export class FilesystemStorageClient implements StorageClient {
         await handle.writeFile(body);
         if (onProgress) onProgress({ loaded: Buffer.byteLength(body) });
       }
-      await handle.close();
+      await handle.close().catch(() => {});
+      const syncHandle = await fs.open(tmp, "r");
+      try {
+        await syncHandle.sync();
+      } finally {
+        await syncHandle.close();
+      }
       await fs.rename(tmp, dest);
     } catch (err) {
       await handle.close().catch(() => {});
@@ -130,8 +136,17 @@ export class FilesystemStorageClient implements StorageClient {
     const dest = path.resolve(this.resolvedBase, key);
     await fs.mkdir(path.dirname(dest), { recursive: true });
     const tmp = `${dest}.tmp-${randomUUID()}`;
-    await fs.writeFile(tmp, JSON.stringify(value, null, 2), "utf8");
-    await fs.rename(tmp, dest);
+    const handle = await fs.open(tmp, "w", 0o600);
+    try {
+      await handle.writeFile(JSON.stringify(value, null, 2), "utf8");
+      await handle.sync();
+      await handle.close();
+      await fs.rename(tmp, dest);
+    } catch (err) {
+      await handle.close().catch(() => {});
+      await fs.rm(tmp, { force: true }).catch(() => {});
+      throw err;
+    }
   }
 
   async getJson<T = unknown>(key: string): Promise<GetJsonResult<T> | null> {
@@ -498,7 +513,7 @@ export class S3StorageClient implements StorageClient {
 
   async refreshLock(key: string, token: string, ttlMs: number): Promise<boolean> {
     const current = await this.getJson<LockRecord>(key);
-    if (current?.data?.token === token) {
+    if (current?.data?.token === token && current.etag) {
       const updated: LockRecord = {
         ...current.data,
         expiresAt: Date.now() + ttlMs,
@@ -509,7 +524,7 @@ export class S3StorageClient implements StorageClient {
           Key: key,
           Body: JSON.stringify(updated, null, 2),
           ContentType: "application/json",
-          ...(current.etag ? { IfMatch: `"${current.etag}"` } : {}),
+          IfMatch: `"${current.etag}"`,
         };
         await this.client.send(new PutObjectCommand(putParams));
         return true;
