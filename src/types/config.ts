@@ -57,13 +57,6 @@ export interface PhysicalConfig {
   dbPath?: string;
 }
 
-export interface CloudSnapshotConfig {
-  provider: "aws-ebs" | "custom";
-  volumeId?: string;
-  region?: string;
-  commandHook?: string;
-}
-
 export interface ShardingConfig {
   enabled: boolean;
   configsvrUri?: string;
@@ -105,7 +98,6 @@ export interface AppConfig {
   retention: RetentionPolicy | null;
   drill: DrillConfig | null;
   physical?: PhysicalConfig | null;
-  snapshot?: CloudSnapshotConfig | null;
   sharding?: ShardingConfig | null;
   notifications: NotificationsConfig;
   http: HttpConfig;

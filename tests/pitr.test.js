@@ -792,4 +792,43 @@ describe("Continuous Oplog Archiver and PITR Restore Coordinator", () => {
       }),
     ).rejects.toThrow(/Failed to verify transaction boundaries in config.transactions/i);
   });
+
+  it("does not split chained multi-document transactions (partialTxn: true) across slices", async () => {
+    const config = createConfig(null);
+    // Set very small maxSliceMb so byte threshold is exceeded after first doc
+    config.pitr.maxSliceMb = 0.00001; // ~10 bytes
+
+    const oplogDocs = [
+      {
+        ts: toBsonTimestamp({ t: 1000, i: 1 }),
+        op: "c",
+        ns: "admin.$cmd",
+        o: { applyOps: [{ op: "i", ns: "app.items", o: { _id: 1 } }], partialTxn: true },
+      },
+      {
+        ts: toBsonTimestamp({ t: 1000, i: 2 }),
+        op: "c",
+        ns: "admin.$cmd",
+        o: { applyOps: [{ op: "i", ns: "app.items", o: { _id: 2 } }] },
+      },
+      {
+        ts: toBsonTimestamp({ t: 1005, i: 1 }),
+        op: "i",
+        ns: "app.items",
+        o: { _id: 3 },
+      },
+    ];
+
+    const manifest = await captureOplogSlice({
+      config,
+      storage: mockStorage,
+      logger,
+      createMongoClient: createFakeMongoClientFactory(oplogDocs),
+    });
+
+    expect(manifest).not.toBeNull();
+    // Even though doc 1 exceeded maxBytes, it had partialTxn: true so doc 2 (the final commit) must be included in the same slice
+    expect(manifest.oplogWindow.entries).toBe(2);
+    expect(manifest.oplogWindow.endTs).toBe("1000:2");
+  });
 });

@@ -164,6 +164,43 @@ export async function scanWiredTigerFiles(
   return results;
 }
 
+async function drainCursorDocs(cursor: unknown): Promise<Record<string, unknown>[]> {
+  const docs: Record<string, unknown>[] = [];
+  if (!cursor || typeof cursor !== "object") return docs;
+  const c = cursor as {
+    tryNext?: () => Promise<Record<string, unknown> | null>;
+    hasNext?: () => Promise<boolean>;
+    next?: () => Promise<Record<string, unknown> | null>;
+    [Symbol.asyncIterator]?: () => AsyncIterator<Record<string, unknown>>;
+  };
+
+  if (typeof c.tryNext === "function") {
+    while (true) {
+      const doc = await c.tryNext();
+      if (!doc) break;
+      docs.push(doc);
+    }
+  } else if (typeof c.hasNext === "function" && typeof c.next === "function") {
+    while (await c.hasNext()) {
+      const doc = await c.next();
+      if (!doc) break;
+      docs.push(doc);
+    }
+  } else if (typeof c[Symbol.asyncIterator] === "function") {
+    for await (const doc of c as AsyncIterable<Record<string, unknown>>) {
+      if (!doc) break;
+      docs.push(doc);
+    }
+  } else if (typeof c.next === "function") {
+    while (true) {
+      const doc = await c.next();
+      if (!doc) break;
+      docs.push(doc);
+    }
+  }
+  return docs;
+}
+
 /**
  * Executes a Physical Hot Backup of MongoDB WiredTiger files straight to S3/Storage.
  */
@@ -195,8 +232,102 @@ export async function runPhysicalBackup({
 
   try {
     await client.connect();
-    const probe = await probePhysicalCapability(client);
-    const resolvedDbPath = overrideDbPath || config.physical?.dbPath || probe.dbPath;
+    const admin = client.db("admin");
+    let resolvedDbPath = overrideDbPath || config.physical?.dbPath;
+
+    let cursorMeta: BackupCursorMetadata | null = null;
+    const dataFiles: Array<{ name: string; fullPath: string; size: number }> = [];
+    const journalFiles: Array<{ name: string; fullPath: string; size: number }> = [];
+    let filesToArchive: Array<{ name: string; fullPath: string; size: number }> = [];
+
+    // 1. Open $backupCursor directly (single open — never open twice via probePhysicalCapability)
+    try {
+      cursor = await createBackupCursorWithRetries(admin, CURSOR_CREATE_RETRIES);
+      const initialDocs = await drainCursorDocs(cursor);
+      for (const doc of initialDocs) {
+        if (doc.metadata) {
+          cursorMeta = doc.metadata as BackupCursorMetadata;
+          if (!resolvedDbPath && typeof cursorMeta.dbpath === "string") {
+            resolvedDbPath = cursorMeta.dbpath;
+          }
+        }
+      }
+
+      if (!resolvedDbPath) {
+        try {
+          const cmdOpts = await admin.command({ getCmdLineOpts: 1 });
+          resolvedDbPath =
+            cmdOpts?.parsed?.storage?.dbPath ||
+            cmdOpts?.argv?.[cmdOpts.argv.indexOf("--dbpath") + 1];
+        } catch {}
+      }
+
+      if (resolvedDbPath) {
+        for (const doc of initialDocs) {
+          const fileDoc = doc as unknown as BackupCursorFile;
+          if (fileDoc?.filename) {
+            const relName = trimDbPathPrefix(fileDoc.filename, resolvedDbPath);
+            const fullPath = path.join(resolvedDbPath, relName);
+            let size = fileDoc.fileLen || fileDoc.fileSize || 0;
+            if (!size) {
+              try {
+                size = (await fs.stat(fullPath)).size;
+              } catch {}
+            }
+            const targetList = relName.startsWith("journal/") ? journalFiles : dataFiles;
+            if (!targetList.some((f) => f.name === relName)) {
+              targetList.push({ name: relName, fullPath, size });
+            }
+          }
+        }
+
+        // Include storage.bson in dataFiles
+        const storageBsonPath = path.join(resolvedDbPath, "storage.bson");
+        try {
+          const stat = await fs.stat(storageBsonPath);
+          if (!dataFiles.some((f) => f.name === "storage.bson")) {
+            dataFiles.push({
+              name: "storage.bson",
+              fullPath: storageBsonPath,
+              size: stat.size,
+            });
+          }
+        } catch {}
+      }
+
+      // Keep cursor alive during long uploads using non-blocking tryNext poll
+      keepAliveTimer = setInterval(async () => {
+        try {
+          if (cursor && !(cursor as { closed?: boolean }).closed) {
+            const c = cursor as {
+              tryNext?: () => Promise<unknown>;
+              hasNext?: () => Promise<boolean>;
+            };
+            if (typeof c.tryNext === "function") {
+              await c.tryNext().catch(() => {});
+            } else if (typeof c.hasNext === "function") {
+              await c.hasNext().catch(() => {});
+            }
+          }
+        } catch {}
+      }, 45_000);
+      keepAliveTimer.unref();
+    } catch (cursorErr) {
+      cursorMeta = null;
+      if (cursor) {
+        await cursor.close().catch(() => {});
+        cursor = null;
+      }
+      log.warn({ err: cursorErr }, "Could not establish $backupCursor; falling back to fsyncLock");
+    }
+
+    if (!resolvedDbPath) {
+      try {
+        const cmdOpts = await admin.command({ getCmdLineOpts: 1 });
+        resolvedDbPath =
+          cmdOpts?.parsed?.storage?.dbPath || cmdOpts?.argv?.[cmdOpts.argv.indexOf("--dbpath") + 1];
+      } catch {}
+    }
 
     if (!resolvedDbPath) {
       throw new Error(
@@ -204,42 +335,41 @@ export async function runPhysicalBackup({
       );
     }
 
-    log.info(
-      {
-        resolvedDbPath,
-        supportsBackupCursor: probe.supportsBackupCursor,
-        supportsFsyncLock: probe.supportsFsyncLock,
-      },
-      "Physical storage environment detected",
-    );
+    const activeDbPath = resolvedDbPath;
 
-    let cursorMeta: BackupCursorMetadata | null = null;
-    let filesToArchive: Array<{ name: string; fullPath: string; size: number }> = [];
+    // Fallback to fsyncLock if $backupCursor returned empty or is not supported
+    if (!cursorMeta && dataFiles.length === 0) {
+      if (!fsyncLockFallback) {
+        throw new Error(
+          "Target MongoDB does not support $backupCursor and fsyncLock fallback is disabled",
+        );
+      }
 
-    if (probe.supportsBackupCursor) {
-      const admin = client.db("admin");
-      try {
-        cursor = await createBackupCursorWithRetries(admin, CURSOR_CREATE_RETRIES);
-        const firstDoc = await cursor.next();
-        if (firstDoc?.metadata) {
-          cursorMeta = firstDoc.metadata as BackupCursorMetadata;
+      log.info("Acquiring fsyncLock on MongoDB cluster...");
+      await admin.command({ fsync: 1, lock: true });
+      locked = true;
+
+      const scanned = await scanWiredTigerFiles(activeDbPath);
+      for (const f of scanned) {
+        if (f.name.startsWith("journal/")) {
+          journalFiles.push(f);
+        } else {
+          dataFiles.push(f);
         }
+      }
+      log.info({ filesCount: scanned.length }, "Scanned WiredTiger data files under lock");
+    }
 
-        while (await cursor.hasNext()) {
-          const doc = (await cursor.next()) as BackupCursorFile | null;
-          if (doc?.filename) {
-            const relName = trimDbPathPrefix(doc.filename, resolvedDbPath);
-            const fullPath = path.join(resolvedDbPath, relName);
-            const size = doc.fileLen || doc.fileSize || 0;
-            if (!filesToArchive.some((f) => f.name === relName)) {
-              filesToArchive.push({ name: relName, fullPath, size });
-            }
-          }
-        }
+    if (dataFiles.length === 0 && journalFiles.length === 0) {
+      throw new Error(`No WiredTiger files found under dbPath: ${activeDbPath}`);
+    }
 
-        // Request extended journal files via $backupCursorExtend if supported.
-        const extendTargetTs = cursorMeta?.oplogEnd?.ts || cursorMeta?.checkpointTimestamp;
-        if (cursorMeta?.backupId && extendTargetTs) {
+    // Helper to collect extended journal files AFTER all .wt data files have been copied
+    // (Percona PBM pattern: data files first, then $backupCursorExtend & journal files last).
+    const collectJournalFilesAfterDataCopy = async () => {
+      if (cursorMeta) {
+        const extendTargetTs = cursorMeta.oplogEnd?.ts || cursorMeta.checkpointTimestamp;
+        if (cursorMeta.backupId && extendTargetTs) {
           try {
             const extCursor = admin.aggregate([
               {
@@ -249,14 +379,23 @@ export async function runPhysicalBackup({
                 },
               },
             ]);
-            while (await extCursor.hasNext()) {
-              const jDoc = (await extCursor.next()) as BackupCursorFile | null;
+            const extDocs = await drainCursorDocs(extCursor);
+            for (const doc of extDocs) {
+              const jDoc = doc as unknown as BackupCursorFile;
               if (jDoc?.filename) {
-                const relName = trimDbPathPrefix(jDoc.filename, resolvedDbPath);
-                const fullPath = path.join(resolvedDbPath, relName);
-                const size = jDoc.fileLen || jDoc.fileSize || 0;
-                if (!filesToArchive.some((f) => f.name === relName)) {
-                  filesToArchive.push({ name: relName, fullPath, size });
+                const relName = trimDbPathPrefix(jDoc.filename, activeDbPath);
+                const fullPath = path.join(activeDbPath, relName);
+                let size = jDoc.fileLen || jDoc.fileSize || 0;
+                if (!size) {
+                  try {
+                    size = (await fs.stat(fullPath)).size;
+                  } catch {}
+                }
+                if (
+                  !journalFiles.some((f) => f.name === relName) &&
+                  !dataFiles.some((f) => f.name === relName)
+                ) {
+                  journalFiles.push({ name: relName, fullPath, size });
                 }
               }
             }
@@ -266,76 +405,37 @@ export async function runPhysicalBackup({
           }
         }
 
-        // Include storage.bson
-        const storageBsonPath = path.join(resolvedDbPath, "storage.bson");
-        try {
-          const stat = await fs.stat(storageBsonPath);
-          if (!filesToArchive.some((f) => f.name === "storage.bson")) {
-            filesToArchive.push({
-              name: "storage.bson",
-              fullPath: storageBsonPath,
-              size: stat.size,
-            });
-          }
-        } catch {}
-
-        // Include active journal logs
-        const journalDir = path.join(resolvedDbPath, "journal");
+        // Also scan journal directory for any WiredTigerLog* files created during data copy
+        const journalDir = path.join(activeDbPath, "journal");
         try {
           const jEntries = await fs.readdir(journalDir, { withFileTypes: true });
           for (const jEntry of jEntries) {
             if (jEntry.isFile() && jEntry.name.startsWith("WiredTigerLog")) {
               const relName = `journal/${jEntry.name}`;
-              if (!filesToArchive.some((f) => f.name === relName)) {
+              if (!journalFiles.some((f) => f.name === relName)) {
                 const fullJPath = path.join(journalDir, jEntry.name);
                 const stat = await fs.stat(fullJPath);
-                filesToArchive.push({ name: relName, fullPath: fullJPath, size: stat.size });
+                journalFiles.push({ name: relName, fullPath: fullJPath, size: stat.size });
               }
             }
           }
         } catch {}
-
-        // Keep cursor alive during long uploads
-        keepAliveTimer = setInterval(async () => {
-          try {
-            if (cursor && !cursor.closed) {
-              await cursor.hasNext().catch(() => {});
-            }
-          } catch {}
-        }, 45_000);
-        keepAliveTimer.unref();
-      } catch (cursorErr) {
-        log.warn(
-          { err: cursorErr },
-          "Could not establish $backupCursor; falling back to fsyncLock",
-        );
       }
+      filesToArchive = [...dataFiles, ...journalFiles];
+    };
+
+    async function* generateOrderedPhysicalTar(): AsyncGenerator<Buffer, void, unknown> {
+      // Phase 1: Stream all .wt data files first (without EOF marker)
+      yield* generateTarStream(dataFiles, controller.signal, { includeEof: false });
+      // Phase 2: Extend backup cursor and stream journal files last (with EOF marker)
+      await collectJournalFilesAfterDataCopy();
+      yield* generateTarStream(journalFiles, controller.signal, { includeEof: true });
     }
 
-    // Fallback to fsyncLock if $backupCursor returned empty or is not supported
-    if (filesToArchive.length === 0) {
-      if (!fsyncLockFallback && !probe.supportsBackupCursor) {
-        throw new Error(
-          "Target MongoDB does not support $backupCursor and fsyncLock fallback is disabled",
-        );
-      }
-
-      log.info("Acquiring fsyncLock on MongoDB cluster...");
-      await client.db("admin").command({ fsync: 1, lock: true });
-      locked = true;
-
-      filesToArchive = await scanWiredTigerFiles(resolvedDbPath);
-      log.info({ filesCount: filesToArchive.length }, "Scanned WiredTiger data files under lock");
-    }
-
-    if (filesToArchive.length === 0) {
-      throw new Error(`No WiredTiger files found under dbPath: ${resolvedDbPath}`);
-    }
-
-    const totalRawBytes = filesToArchive.reduce((acc, f) => acc + f.size, 0);
+    const initialRawBytes = [...dataFiles, ...journalFiles].reduce((acc, f) => acc + f.size, 0);
     log.info(
-      { filesCount: filesToArchive.length, totalRawBytes: formatBytes(totalRawBytes) },
-      "Starting streaming physical pack and upload",
+      { dataFilesCount: dataFiles.length, initialRawBytes: formatBytes(initialRawBytes) },
+      "Starting streaming physical pack and upload (data files -> journal files)",
     );
 
     const gzip = createGzip();
@@ -344,7 +444,7 @@ export async function runPhysicalBackup({
     const digest = new DigestStream();
     const body = new PassThrough({ highWaterMark: 1024 * 1024 });
 
-    const tarSource = Readable.from(generateTarStream(filesToArchive, controller.signal));
+    const tarSource = Readable.from(generateOrderedPhysicalTar());
     const stages = [tarSource, gzip, encryptor?.stream, digest, body];
 
     await settleAll(controller, [
@@ -478,11 +578,41 @@ export async function restorePhysicalBackup({
   const backupKey = manifestData?.key || resolvedRef;
 
   const keyRing = resolveKeyRing(config);
-  if (manifestData?.encryption) {
+  const isSigned = Boolean(manifestData?.signature?.hmac || manifestData?.encryption?.manifestHmac);
+  if (isSigned && manifestData) {
+    if (keyRing.length === 0) {
+      throw new Error(
+        `Physical backup manifest for ${backupKey} is signed with HMAC, but ENCRYPTION_KEY / key ring is not configured`,
+      );
+    }
+    verifyManifest(keyRing, manifestData);
+  } else if (manifestData?.encryption) {
     if (keyRing.length === 0) {
       throw new Error(`Physical backup ${backupKey} is encrypted, but ENCRYPTION_KEY is not set`);
     }
-    verifyManifest(keyRing, manifestData);
+  }
+
+  // Clean existing WiredTiger data and journal files in targetDbPath before extracting
+  // so no leftover orphan .wt or journal files from a prior database corrupt recovery.
+  try {
+    const existingEntries = await fs.readdir(targetDbPath, { withFileTypes: true });
+    for (const entry of existingEntries) {
+      if (
+        entry.name.endsWith(".wt") ||
+        entry.name.endsWith(".turtle") ||
+        entry.name.startsWith("WiredTiger") ||
+        entry.name === "storage.bson" ||
+        entry.name === "journal" ||
+        entry.name === "mongod.lock" ||
+        entry.name === "ongoingBackup.lock"
+      ) {
+        await fs
+          .rm(path.join(targetDbPath, entry.name), { recursive: true, force: true })
+          .catch(() => {});
+      }
+    }
+  } catch {
+    // targetDbPath may not exist yet
   }
 
   const digest = new DigestStream();
@@ -510,9 +640,10 @@ export async function restorePhysicalBackup({
     );
   }
 
-  // Remove any stale lock files in target dbPath (mongod.lock, WiredTiger.lock)
+  // Remove any stale lock files in target dbPath (mongod.lock, WiredTiger.lock, ongoingBackup.lock)
   await fs.rm(path.join(targetDbPath, "mongod.lock"), { force: true }).catch(() => {});
   await fs.rm(path.join(targetDbPath, "WiredTiger.lock"), { force: true }).catch(() => {});
+  await fs.rm(path.join(targetDbPath, "ongoingBackup.lock"), { force: true }).catch(() => {});
 
   log.info(
     {

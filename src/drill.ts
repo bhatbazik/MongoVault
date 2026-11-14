@@ -89,8 +89,47 @@ export async function runDrill(ctx: DrillContext): Promise<DrillResult> {
   logger.info({ key, isCluster, oplog: Boolean(manifest.oplog) }, "Restore drill started");
 
   const restoredDbs = new Set<string>();
+  const PROTECTED_SYSTEM_DBS = new Set(["admin", "local", "config"]);
   try {
     await client.connect();
+
+    // Server-level topology isolation check: ensure DRILL_MONGODB_URI does not resolve
+    // to the same physical cluster as MONGODB_URI via a different hostname/alias.
+    try {
+      const prodClient = createMongoClient(config.mongo.uri);
+      try {
+        await prodClient.connect();
+        const prodAdmin = prodClient.db("admin");
+        const drillAdmin = client.db("admin");
+        if (typeof prodAdmin.command === "function" && typeof drillAdmin.command === "function") {
+          const [prodHello, drillHello] = await Promise.all([
+            prodAdmin.command({ hello: 1 }).catch(() => null),
+            drillAdmin.command({ hello: 1 }).catch(() => null),
+          ]);
+          if (prodHello && drillHello) {
+            const sameNode =
+              Boolean(prodHello.me && drillHello.me) && prodHello.me === drillHello.me;
+            const sameReplicaSet =
+              Boolean(prodHello.setName && drillHello.setName) &&
+              prodHello.setName === drillHello.setName &&
+              Array.isArray(prodHello.hosts) &&
+              Array.isArray(drillHello.hosts) &&
+              prodHello.hosts.some((h: string) => drillHello.hosts.includes(h));
+            if (sameNode || sameReplicaSet) {
+              throw new Error(
+                "Safety violation: DRILL_MONGODB_URI resolves to the same MongoDB cluster as MONGODB_URI. Drills must run against an isolated staging/test instance.",
+              );
+            }
+          }
+        }
+      } finally {
+        await prodClient.close().catch(() => {});
+      }
+    } catch (err) {
+      if (err instanceof Error && err.message.startsWith("Safety violation:")) {
+        throw err;
+      }
+    }
 
     if (!isCluster) {
       const database = `${manifest.database}_${drillTag}`;
@@ -217,6 +256,7 @@ export async function runDrill(ctx: DrillContext): Promise<DrillResult> {
     }
   } finally {
     for (const dbName of restoredDbs) {
+      if (PROTECTED_SYSTEM_DBS.has(dbName)) continue;
       await client
         .db(dbName)
         .dropDatabase()

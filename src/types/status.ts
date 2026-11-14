@@ -61,7 +61,7 @@ export interface SystemStatus {
   pitr: PitrStatus;
   operation: OperationLockStatus;
   recentBackups: BackupSummary[];
-  engine?: "logical" | "physical" | "snapshot";
+  engine?: "logical" | "physical";
   objectLock?: {
     enabled: boolean;
     mode?: string;

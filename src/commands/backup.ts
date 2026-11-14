@@ -51,7 +51,6 @@ export class BackupCommand implements CommandHandler {
         storage,
         logger,
         dbPath: values["db-path"],
-        volumeId: values["volume-id"],
       });
 
       if (values.json) {

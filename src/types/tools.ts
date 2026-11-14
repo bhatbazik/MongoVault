@@ -80,7 +80,10 @@ export interface ReplayOplogFileOptions {
 
 export interface BackupTools {
   mongodump: (options: MongodumpOptions) => Promise<MongodumpResult>;
-  getOplogBounds?: (uri: string) => Promise<OplogBounds | null>;
+  getOplogBounds?: (
+    uri: string,
+    options?: { phase?: "pre" | "post" },
+  ) => Promise<OplogBounds | null>;
 }
 
 export interface RestoreTools {

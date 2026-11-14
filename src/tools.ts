@@ -203,7 +203,7 @@ export async function mongorestore({
   }
 
   const { file: configFile, cleanup: cleanupConfig } = await writeUriConfig(workDir, uri);
-  const args = [`--config=${configFile}`, "--archive", "--gzip"];
+  const args = [`--config=${configFile}`, "--archive", "--gzip", "--stopOnError"];
   if (nsInclude) args.push(`--nsInclude=${nsInclude}`);
   if (nsExclude) args.push(`--nsExclude=${nsExclude}`);
   if (nsFrom && nsTo) args.push(`--nsFrom=${nsFrom}`, `--nsTo=${nsTo}`);
@@ -253,7 +253,12 @@ export async function replayOplogFile({
   const emptyDir = path.join(workDir, `.empty-${randomUUID()}`);
   await fs.mkdir(emptyDir, { recursive: true });
 
-  const args = [`--config=${configFile}`, "--oplogReplay", `--oplogFile=${oplogFile}`];
+  const args = [
+    `--config=${configFile}`,
+    "--stopOnError",
+    "--oplogReplay",
+    `--oplogFile=${oplogFile}`,
+  ];
   if (oplogLimit) {
     args.push(`--oplogLimit=${oplogLimit}`);
   }

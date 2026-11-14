@@ -250,4 +250,61 @@ describe("physical backup engine", () => {
 
     await fs.rm(tempRoot, { recursive: true, force: true });
   });
+
+  it("bounds TAR stream output when live WiredTiger files grow or shrink during hot backup", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mv-tar-live-"));
+    const destDir = await fs.mkdtemp(path.join(os.tmpdir(), "mv-tar-dest-"));
+    try {
+      const growingFile = path.join(tempDir, "collection-grow.wt");
+      const shrinkingFile = path.join(tempDir, "collection-shrink.wt");
+      const tailFile = path.join(tempDir, "WiredTiger.wt");
+
+      await fs.writeFile(growingFile, Buffer.alloc(100, 0x41));
+      await fs.writeFile(shrinkingFile, Buffer.alloc(200, 0x42));
+      await fs.writeFile(tailFile, Buffer.from("TAIL_OK"));
+
+      const entries = [
+        { name: "collection-grow.wt", fullPath: growingFile, size: 100 },
+        { name: "collection-shrink.wt", fullPath: shrinkingFile, size: 200 },
+        { name: "WiredTiger.wt", fullPath: tailFile, size: 7 },
+      ];
+
+      // Mutate files after stat/header creation by intercepting generator steps
+      const gen = generateTarStream(entries);
+      const chunks = [];
+      let step = 0;
+      for await (const chunk of gen) {
+        step++;
+        if (step === 1) {
+          // Right after header for growingFile is emitted (100 bytes), append 500 extra bytes on disk!
+          await fs.appendFile(growingFile, Buffer.alloc(500, 0x58));
+          // And truncate shrinkingFile from 200 bytes down to 50 bytes before its header/read!
+        }
+        if (step === 4) {
+          // Right after header for shrinkingFile is emitted (after step 1=hdr1, 2=data1, 3=pad1, 4=hdr2),
+          // truncate shrinkingFile on disk from 200 down to 50 bytes before its stream is read!
+          await fs.truncate(shrinkingFile, 50);
+        }
+        chunks.push(chunk);
+      }
+
+      const result = await extractTarStream(Readable.from(Buffer.concat(chunks)), destDir);
+      expect(result.extractedCount).toBe(3);
+
+      const extractedGrow = await fs.readFile(path.join(destDir, "collection-grow.wt"));
+      const extractedShrink = await fs.readFile(path.join(destDir, "collection-shrink.wt"));
+      const extractedTail = await fs.readFile(path.join(destDir, "WiredTiger.wt"), "utf8");
+
+      expect(extractedGrow.length).toBe(100);
+      expect(extractedShrink.length).toBe(200);
+      expect(extractedTail).toBe("TAIL_OK");
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+      await fs.rm(tempDestDirIfAny(destDir), { recursive: true, force: true });
+    }
+
+    function tempDestDirIfAny(d) {
+      return d;
+    }
+  });
 });

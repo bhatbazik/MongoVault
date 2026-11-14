@@ -214,4 +214,45 @@ describe("restore drill", () => {
     });
     expect(result.oplogVariances).toHaveLength(2);
   });
+
+  it("blocks drill when DRILL_MONGODB_URI resolves via hello to the same cluster as MONGODB_URI and protects system DBs", async () => {
+    const tools = createMockTools({ "app.users": 10, "admin.system.users": 1 });
+    const config = {
+      mongo: { uri: "mongodb://10.0.0.1:27017", database: "*", excludeCollections: [] },
+      drill: { uri: "mongodb://prod-alias.internal:27017" },
+      storage: { prefix: "backups" },
+      workDir: tmpDir,
+      timeoutMs: 5000,
+      encryptionKey: null,
+      schedule: { timezone: "UTC" },
+    };
+
+    await runBackup({ config, storage: mockStorage, logger, tools });
+
+    const sameClusterClient = {
+      async connect() {},
+      async close() {},
+      db() {
+        return {
+          async command(cmd) {
+            if (cmd.hello) {
+              return { setName: "rs0", me: "10.0.0.1:27017", hosts: ["10.0.0.1:27017"] };
+            }
+            return { ok: 1 };
+          },
+          async dropDatabase() {},
+        };
+      },
+    };
+
+    await expect(
+      runDrill({
+        config,
+        storage: mockStorage,
+        logger,
+        tools,
+        createMongoClient: () => sameClusterClient,
+      }),
+    ).rejects.toThrow(/Safety violation: DRILL_MONGODB_URI resolves to the same MongoDB cluster/);
+  });
 });

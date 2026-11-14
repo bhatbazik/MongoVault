@@ -339,6 +339,19 @@ export async function runShardedClusterBackup({
       .replace(/\.\d{3}Z$/, "Z");
     const clusterKey = `${databasePrefix(scope)}${startedAt.toISOString().slice(0, 10)}/${stamp}.cluster${encrypted ? ".enc" : ""}`;
 
+    // Capture post-backup clusterTime so oplogReplay limit is at or after the shard dumps
+    try {
+      const postPing = await client.db("admin").command({ ping: 1 });
+      if (postPing?.$clusterTime?.clusterTime) {
+        const parsed = fromBsonTimestamp(postPing.$clusterTime.clusterTime);
+        if (parsed) {
+          clusterTimeStr = `${parsed.t}:${parsed.i}`;
+        }
+      }
+    } catch {
+      // Ignore
+    }
+
     const clusterMeta: ShardedClusterMeta = {
       clusterTime: clusterTimeStr,
       configsvr: {
@@ -370,6 +383,8 @@ export async function runShardedClusterBackup({
       sharding: clusterMeta,
     };
 
+    // Write the .cluster catalog marker object so listBackups() and resolveBackup("latest") discover it
+    await storage.putJson(clusterKey, clusterMeta);
     await writeManifest(storage, clusterManifest, config.encryptionKey);
 
     log.info(

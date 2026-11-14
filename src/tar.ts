@@ -80,7 +80,9 @@ export function createTarHeader(name: string, size: number, mtime: number = Date
 export async function* generateTarStream(
   files: TarEntry[],
   signal?: AbortSignal,
+  options: { includeEof?: boolean } = {},
 ): AsyncGenerator<Buffer, void, unknown> {
+  const { includeEof = true } = options;
   for (const file of files) {
     if (signal?.aborted) return;
     let stat;
@@ -89,28 +91,57 @@ export async function* generateTarStream(
     } catch {
       continue;
     }
-    const header = createTarHeader(file.name, stat.size, stat.mtimeMs);
+    const expectedSize = stat.size;
+    const header = createTarHeader(file.name, expectedSize, stat.mtimeMs);
     yield header;
 
-    // Stream file contents in 64KB chunks
-    const stream = fsSync.createReadStream(file.fullPath, { highWaterMark: 64 * 1024 });
-    for await (const chunk of stream) {
-      if (signal?.aborted) {
-        stream.destroy();
-        return;
+    // Stream file contents in 64KB chunks, strictly bounded to expectedSize
+    // so live WiredTiger writes (file growth or truncation) never shift TAR headers.
+    let bytesEmitted = 0;
+    if (expectedSize > 0) {
+      const stream = fsSync.createReadStream(file.fullPath, { highWaterMark: 64 * 1024 });
+      for await (const rawChunk of stream) {
+        if (signal?.aborted) {
+          stream.destroy();
+          return;
+        }
+        const chunk = Buffer.isBuffer(rawChunk) ? rawChunk : Buffer.from(rawChunk);
+        const remaining = expectedSize - bytesEmitted;
+        if (chunk.length >= remaining) {
+          if (remaining > 0) {
+            yield chunk.subarray(0, remaining);
+            bytesEmitted += remaining;
+          }
+          stream.destroy();
+          break;
+        }
+        yield chunk;
+        bytesEmitted += chunk.length;
       }
-      yield Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    }
+
+    // Zero-pad if the file shrank or truncated while being read during hot backup
+    if (bytesEmitted < expectedSize) {
+      let missing = expectedSize - bytesEmitted;
+      const zeroChunkSize = 64 * 1024;
+      while (missing > 0) {
+        const n = Math.min(missing, zeroChunkSize);
+        yield Buffer.alloc(n, 0);
+        missing -= n;
+      }
     }
 
     // Pad file data to 512-byte block boundary
-    const remainder = stat.size % 512;
+    const remainder = expectedSize % 512;
     if (remainder > 0) {
       yield Buffer.alloc(512 - remainder, 0);
     }
   }
 
   // End of archive marker: two 512-byte zero blocks (1024 bytes)
-  yield Buffer.alloc(1024, 0);
+  if (includeEof) {
+    yield Buffer.alloc(1024, 0);
+  }
 }
 
 /**

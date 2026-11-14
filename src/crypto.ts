@@ -303,7 +303,6 @@ function canonicalManifestPayload(
     excludedCollections: manifest.excludedCollections ?? [],
     collections: manifest.collections ?? {},
     ...(manifest.physical ? { physical: manifest.physical } : {}),
-    ...(manifest.snapshot ? { snapshot: manifest.snapshot } : {}),
     ...(manifest.sharding ? { sharding: manifest.sharding } : {}),
     encryption: cleanEncryption,
   });

@@ -25,7 +25,7 @@ export interface ManifestOplogWindow {
   gapDetected?: boolean;
 }
 
-export type BackupEngine = "logical" | "physical" | "snapshot";
+export type BackupEngine = "logical" | "physical";
 
 export interface PhysicalBackupFile {
   name: string;
@@ -40,14 +40,6 @@ export interface PhysicalBackupMeta {
   checkpointTimestamp?: string;
   oplogStart?: string;
   oplogEnd?: string;
-}
-
-export interface CloudSnapshotMeta {
-  provider: "aws-ebs" | "custom";
-  snapshotId: string;
-  volumeId: string;
-  region?: string;
-  clusterTime?: string;
 }
 
 export interface ShardedClusterShardBackup {
@@ -94,7 +86,6 @@ export interface BackupManifest {
   excludedCollections: string[];
   collections: Record<string, number>;
   physical?: PhysicalBackupMeta;
-  snapshot?: CloudSnapshotMeta;
   sharding?: ShardedClusterMeta;
   objectLock?: {
     mode: "GOVERNANCE" | "COMPLIANCE";

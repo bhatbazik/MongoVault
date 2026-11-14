@@ -193,8 +193,9 @@ export async function listOplogSlices(
 export async function getOplogBounds(
   uri: string,
   {
+    phase = "pre",
     createMongoClient = (u: string) => new MongoClient(u),
-  }: { createMongoClient?: (u: string) => MongoClient } = {},
+  }: { phase?: "pre" | "post"; createMongoClient?: (u: string) => MongoClient } = {},
 ): Promise<OplogBounds> {
   const client = createMongoClient(uri);
   try {
@@ -216,27 +217,49 @@ export async function getOplogBounds(
     const oldestTs = fromBsonTimestamp(oldestDoc?.ts);
     let newestTs = fromBsonTimestamp(newestDoc?.ts);
 
-    // Check config.transactions for uncommitted/prepared distributed transactions
-    // so long-running transactions started before the snapshot aren't missed
+    // Prefer majority-committed opTime when replica set status is available
     try {
-      const configDb = client.db("config");
-      const txCol =
-        configDb && typeof configDb.collection === "function"
-          ? configDb.collection("transactions")
+      const adminDb = typeof client.db === "function" ? client.db("admin") : null;
+      const replStatus =
+        adminDb && typeof adminDb.command === "function"
+          ? await adminDb.command({ replSetGetStatus: 1 }).catch(() => null)
           : null;
-      if (txCol && typeof txCol.find === "function") {
-        const activeTx = await txCol
-          .find({ state: { $in: ["prepared", "inProgress"] } })
-          .sort({ startOpTime: 1 })
-          .limit(1)
-          .next();
-        const txTs = fromBsonTimestamp(activeTx?.startOpTime?.ts);
-        if (txTs && newestTs && compareTimestamps(txTs, newestTs) < 0) {
-          newestTs = txTs;
-        }
+      const majorityTs = replStatus?.optimes?.lastCommittedOpTime?.ts
+        ? fromBsonTimestamp(replStatus.optimes.lastCommittedOpTime.ts)
+        : replStatus?.optimes?.readConcernMajorityOpTime?.ts
+          ? fromBsonTimestamp(replStatus.optimes.readConcernMajorityOpTime.ts)
+          : null;
+      if (majorityTs) {
+        newestTs = majorityTs;
       }
     } catch {
-      // Ignore if config.transactions is inaccessible or mocked
+      // Ignore if replSetGetStatus is unavailable
+    }
+
+    // On pre-backup boundary discovery, check config.transactions for uncommitted/prepared
+    // transactions so long-running transactions started before the snapshot aren't missed.
+    // Never pull back the post-backup endTs to an older transaction's startOpTime.
+    if (phase === "pre") {
+      try {
+        const configDb = client.db("config");
+        const txCol =
+          configDb && typeof configDb.collection === "function"
+            ? configDb.collection("transactions")
+            : null;
+        if (txCol && typeof txCol.find === "function") {
+          const activeTx = await txCol
+            .find({ state: { $in: ["prepared", "inProgress"] } })
+            .sort({ startOpTime: 1 })
+            .limit(1)
+            .next();
+          const txTs = fromBsonTimestamp(activeTx?.startOpTime?.ts);
+          if (txTs && newestTs && compareTimestamps(txTs, newestTs) < 0) {
+            newestTs = txTs;
+          }
+        }
+      } catch {
+        // Ignore if config.transactions is inaccessible or mocked
+      }
     }
 
     return {
@@ -357,8 +380,11 @@ export async function captureOplogSlice({
     const firstBackup = backups[0];
     if (firstBackup) {
       const latestManifest = await readManifest(storage, firstBackup.key);
-      if (latestManifest?.oplogWindow?.endTs) {
-        cursorStartTs = parseOplogTimestamp(latestManifest.oplogWindow.endTs);
+      // Anchor initial slice to startTs (or endTs) so any writes between mongodump closing
+      // its internal oplog cursor and post-backup boundary recording are overlapped, never lost.
+      const anchorStr = latestManifest?.oplogWindow?.startTs ?? latestManifest?.oplogWindow?.endTs;
+      if (anchorStr) {
+        cursorStartTs = parseOplogTimestamp(anchorStr);
       }
     }
   }
@@ -485,12 +511,36 @@ export async function captureOplogSlice({
         if (!docTs) continue;
         const rawBuf = Buffer.isBuffer(doc) ? doc : Buffer.from(BSON.serialize(doc));
 
-        if (!firstTs) firstTs = docTs;
+        if (!firstTs) {
+          firstTs = docTs;
+          // Post-cursor sufficiency check (Percona PBM pattern): verify that local.oplog.rs
+          // did not roll over past cursorStartTs between the initial check and cursor positioning.
+          if (!gapDetected && cursorStartTs) {
+            const postCursorOldestDoc = await oplog
+              .find({}, { projection: { ts: 1 } })
+              .sort({ $natural: 1 })
+              .limit(1)
+              .next();
+            const postCursorOldestTs = fromBsonTimestamp(postCursorOldestDoc?.ts);
+            if (postCursorOldestTs && compareTimestamps(postCursorOldestTs, cursorStartTs) > 0) {
+              gapDetected = true;
+              logger.warn(
+                {
+                  lastArchivedTs: formatOplogTimestamp(cursorStartTs),
+                  oldestAvailableTs: formatOplogTimestamp(postCursorOldestTs),
+                },
+                "PITR oplog gap detected after cursor open: MongoDB oplog rolled over past last archived timestamp",
+              );
+            }
+          }
+        }
         lastTs = docTs;
         rawDocs.push(rawBuf);
         accumulatedBytes += rawBuf.length;
 
-        if (accumulatedBytes >= maxBytes) {
+        // Never split an in-flight chained multi-document transaction (partialTxn: true) across slices
+        const isPartialTxn = Boolean((doc as { o?: { partialTxn?: boolean } }).o?.partialTxn);
+        if (accumulatedBytes >= maxBytes && !isPartialTxn) {
           break;
         }
       }

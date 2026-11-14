@@ -2,7 +2,6 @@ import { runBackup } from "./backup.js";
 import { runPhysicalBackup, restorePhysicalBackup } from "./physical.js";
 import { restoreBackup } from "./restore.js";
 import { runShardedClusterBackup, restoreShardedCluster } from "./sharding.js";
-import { runCloudSnapshot, restoreCloudSnapshot } from "./snapshot.js";
 import type { BackupManifest } from "./types/catalog.js";
 import type { AppConfig } from "./types/config.js";
 import type { Logger } from "./types/logger.js";
@@ -14,7 +13,6 @@ export interface BackupEngineOptions {
   logger: Logger;
   signal?: AbortSignal;
   dbPath?: string;
-  volumeId?: string;
 }
 
 export interface RestoreEngineOptions {
@@ -112,31 +110,6 @@ export class PhysicalBackupEngine implements BackupEngineStrategy {
   }
 }
 
-export class SnapshotBackupEngine implements BackupEngineStrategy {
-  readonly name = "snapshot";
-
-  async backup(options: BackupEngineOptions): Promise<BackupManifest> {
-    const res = await runCloudSnapshot({
-      config: options.config,
-      storage: options.storage,
-      logger: options.logger,
-      signal: options.signal,
-      volumeId: options.volumeId,
-    });
-    return res.manifest;
-  }
-
-  async restore(options: RestoreEngineOptions): Promise<unknown> {
-    return restoreCloudSnapshot({
-      config: options.config,
-      storage: options.storage,
-      logger: options.logger,
-      ref: options.ref || "latest",
-      signal: options.signal,
-    });
-  }
-}
-
 /**
  * Sharded cluster backup engine (Experimental).
  * Coordinates multi-shard cluster backups across mongos, config servers, and shard replica sets.
@@ -173,7 +146,6 @@ export class EngineRegistry {
   private static readonly engines = new Map<string, BackupEngineStrategy>([
     ["logical", new LogicalBackupEngine()],
     ["physical", new PhysicalBackupEngine()],
-    ["snapshot", new SnapshotBackupEngine()],
     ["sharded", new ShardedBackupEngine()],
   ]);
 
@@ -224,9 +196,6 @@ export class EngineRegistry {
       /\.physical\.tar\.gz(\.enc)?$/.test(params.key || "")
     ) {
       return this.get("physical");
-    }
-    if (params.engine === "snapshot" || params.key?.endsWith(".snapshot")) {
-      return this.get("snapshot");
     }
     if (
       params.sharding ||

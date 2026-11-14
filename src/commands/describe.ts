@@ -41,11 +41,6 @@ export class DescribeCommand implements CommandHandler {
             `Physical:     ${manifest.physical.cursorType} (${manifest.physical.filesCount} files, dbPath: ${manifest.physical.dbPath})`,
           );
         }
-        if (manifest.snapshot) {
-          console.log(
-            `Snapshot:     ${manifest.snapshot.provider} (${manifest.snapshot.snapshotId}, volume: ${manifest.snapshot.volumeId})`,
-          );
-        }
         if (manifest.sharding) {
           console.log(
             `Sharding:     ${Object.keys(manifest.sharding.shards).length} shards (clusterTime: ${manifest.sharding.clusterTime})`,

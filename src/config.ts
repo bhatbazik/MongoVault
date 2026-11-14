@@ -68,13 +68,8 @@ const schema = z
     S3_OBJECT_LOCK_RETENTION_DAYS: z.coerce.number().int().positive().default(30),
     S3_OBJECT_LOCK_LEGAL_HOLD: flag(false),
 
-    BACKUP_ENGINE: z.enum(["logical", "physical", "snapshot"]).default("logical"),
+    BACKUP_ENGINE: z.enum(["logical", "physical"]).default("logical"),
     PHYSICAL_DB_PATH: z.string().optional(),
-
-    SNAPSHOT_PROVIDER: z.enum(["aws-ebs", "custom"]).default("aws-ebs"),
-    SNAPSHOT_VOLUME_ID: z.string().optional(),
-    SNAPSHOT_REGION: z.string().optional(),
-    SNAPSHOT_COMMAND_HOOK: z.string().optional(),
 
     SHARDING_ENABLED: flag(false),
     SHARDING_CONFIGSVR_URI: z.string().optional(),
@@ -300,14 +295,6 @@ function toConfig(env: z.infer<typeof schema>): AppConfig {
       ? { uri: env.DRILL_MONGODB_URI, cron: env.DRILL_CRON ?? null }
       : null,
     physical: env.PHYSICAL_DB_PATH ? { dbPath: env.PHYSICAL_DB_PATH } : null,
-    snapshot: env.SNAPSHOT_VOLUME_ID
-      ? {
-          provider: env.SNAPSHOT_PROVIDER,
-          volumeId: env.SNAPSHOT_VOLUME_ID,
-          region: env.SNAPSHOT_REGION,
-          commandHook: env.SNAPSHOT_COMMAND_HOOK,
-        }
-      : null,
     sharding: env.SHARDING_ENABLED
       ? {
           enabled: true,

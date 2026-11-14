@@ -32,7 +32,7 @@ export async function runBackup({
   try {
     const preOplog =
       config.mongo.oplog && effectiveTools.getOplogBounds
-        ? await effectiveTools.getOplogBounds(config.mongo.uri).catch(() => null)
+        ? await effectiveTools.getOplogBounds(config.mongo.uri, { phase: "pre" }).catch(() => null)
         : null;
 
     const dump = await effectiveTools.mongodump({
@@ -59,7 +59,9 @@ export async function runBackup({
     const dumpTask = dump.done.then(async (res) => {
       const dumpEndOplog =
         config.mongo.oplog && effectiveTools.getOplogBounds
-          ? await effectiveTools.getOplogBounds(config.mongo.uri).catch(() => null)
+          ? await effectiveTools
+              .getOplogBounds(config.mongo.uri, { phase: "post" })
+              .catch(() => null)
           : null;
       return { collections: res.collections, dumpEndOplog };
     });

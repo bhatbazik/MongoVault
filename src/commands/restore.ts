@@ -43,11 +43,6 @@ export class RestoreCommand implements CommandHandler {
           console.log(
             `Files:      ${result.restoredFiles} restored (${formatBytes(result.totalBytes as number)})`,
           );
-        } else if (engine.name === "snapshot") {
-          console.log("\nCloud Snapshot Restored Successfully");
-          console.log(`Snapshot ID:  ${result.snapshotId}`);
-          console.log(`Volume ID:    ${result.volumeId}`);
-          console.log(`New Volume:   ${result.newVolumeId || "n/a"}`);
         } else if (engine.name === "sharded") {
           console.log("\nSharded Cluster Restored Successfully");
           console.log(`Key:          ${result.key}`);

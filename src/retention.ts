@@ -1,5 +1,10 @@
 import { listBackups, manifestKey, readManifest, resolveBackup, scopeOf } from "./catalog.js";
-import { formatOplogTimestamp, listOplogSlices, parsePitrTarget } from "./oplog.js";
+import {
+  formatOplogTimestamp,
+  listOplogSlices,
+  parseOplogTimestamp,
+  parsePitrTarget,
+} from "./oplog.js";
 import type { BackupSummary } from "./types/catalog.js";
 import type { DateParts } from "./types/common.js";
 import type { RetentionPolicy } from "./types/config.js";
@@ -97,11 +102,23 @@ export async function prune(
     (b) => !b.complete && now - (b.createdAt as unknown as number) > ORPHAN_AGE_MS,
   );
 
-  // Prune PITR oplog slices older than the oldest retained base backup
+  // Prune PITR oplog slices older than the oldest retained base backup's oplog start boundary
   const oldestKeptBackup = keep.length > 0 ? keep[keep.length - 1] : null;
-  const oldestKeptEpochSec = oldestKeptBackup
+  let oldestKeptEpochSec = oldestKeptBackup
     ? Math.floor(new Date(oldestKeptBackup.createdAt).getTime() / 1000)
     : null;
+  if (oldestKeptBackup && typeof storage.getJson === "function") {
+    const oldestManifest = await readManifest(storage, oldestKeptBackup.key).catch(() => null);
+    const startTsStr = oldestManifest?.oplogWindow?.startTs;
+    if (startTsStr) {
+      try {
+        const parsedStart = parseOplogTimestamp(startTsStr);
+        if (parsedStart && (oldestKeptEpochSec === null || parsedStart.t < oldestKeptEpochSec)) {
+          oldestKeptEpochSec = parsedStart.t;
+        }
+      } catch {}
+    }
+  }
   const slices = await listOplogSlices(storage, scope);
   const expiredSlices = slices.filter((slice) => {
     if (!slice.complete) {

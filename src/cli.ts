@@ -35,9 +35,8 @@ Commands:
 
 Options:
   --key <string>            Target backup key (default: latest)
-  --engine <string>         Backup engine: logical, physical, or snapshot (default: logical)
+  --engine <string>         Backup engine: logical or physical (default: logical)
   --db-path <path>          WiredTiger database path for physical backup or restore
-  --volume-id <string>      Cloud volume ID for cloud snapshot engine
   --sharding                Execute synchronized multi-shard cluster backup (experimental)
   --uri <string>            Target MongoDB URI for restore (default: MONGODB_URI)
   --database <string>       Target database name for restore (default: original database)
@@ -83,7 +82,6 @@ export async function runCli(
       key: { type: "string" },
       engine: { type: "string" },
       "db-path": { type: "string" },
-      "volume-id": { type: "string" },
       sharding: { type: "boolean", default: false },
       uri: { type: "string" },
       database: { type: "string" },

@@ -10,7 +10,7 @@ import type { StorageClient, StorageObject } from "./types/storage.js";
 export const MANIFEST_SUFFIX = ".manifest.json";
 export const MANIFEST_VERSION = 2;
 
-const ARCHIVE = /\.(?:archive\.gz|physical\.tar\.gz|snapshot|cluster)(\.enc)?$/;
+const ARCHIVE = /\.(?:archive\.gz|physical\.tar\.gz|cluster)(\.enc)?$/;
 const STAMP =
   /(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(?:\.\d+)?Z\.(?:archive|physical|cluster)/;
 

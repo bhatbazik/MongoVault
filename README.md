@@ -32,8 +32,7 @@
   - [Engine Resolution Logic](#engine-resolution-logic)
   - [1. Logical Backup Engine (`logical`)](#1-logical-backup-engine-logical)
   - [2. Physical Hot Backup Engine (`physical`)](#2-physical-hot-backup-engine-physical)
-  - [3. Cloud Volume Snapshot Engine (`snapshot`)](#3-cloud-volume-snapshot-engine-snapshot)
-  - [4. Sharded Cluster Engine (`sharded`)](#4-sharded-cluster-engine-sharded)
+  - [3. Sharded Cluster Engine (`sharded`)](#3-sharded-cluster-engine-sharded)
   - [Engine Comparison Matrix](#engine-comparison-matrix)
 - [Part 5 — Subsystems Deep Dive](#part-5--subsystems-deep-dive)
   - [5.1 Streaming Architecture, Backpressure and Cancellation](#51-streaming-architecture-backpressure-and-cancellation)
@@ -158,10 +157,9 @@ When a restore is requested:
 ### Core Capabilities
 
 - **Zero-Disk Streaming:** Direct streaming from MongoDB through compression and encryption into storage.
-- **Four Backup Engines:**
+- **Backup Engines:**
   - `logical`: Streaming `mongodump` archive with collection parallelism and optional oplog capture.
   - `physical`: Hot WiredTiger database file backup via `$backupCursor` and `$backupCursorExtend` with `fsyncLock` fallback.
-  - `snapshot`: Cloud volume snapshots (AWS EBS or custom hooks) coordinated under `fsyncLock`.
   - `sharded`: Multi-shard cluster backup coordinating `mongos`, balancer drain, `configsvr`, and shard replica sets.
 - **Second-Level Point-in-Time Recovery (PITR):** Continuous background oplog archiver tails `local.oplog.rs`, checks for uncommitted distributed transactions in `config.transactions`, and writes contiguous `.oplog.bson.gz` slices.
 - **Framed AEAD Envelope Encryption (`aes-256-gcm-chunked`):** 256-bit DEK generated per archive, wrapped by master keys. Streams are encrypted in 64 KiB frames with per-chunk nonces, 128-bit GCM authentication tags, frame sequence counters, and explicit final frame markers to prevent truncation attacks.
@@ -199,7 +197,7 @@ flowchart TD
         Config["Configuration & Validation\n(Zod schema)"]
         LockMgr["Hybrid Lock Manager\n(Local PID + S3 Lease)"]
         Scheduler["Job Scheduler\n(Backup, Drill, PITR Slicer)"]
-        Engines["Engine Registry\n(Logical, Physical, Snapshot, Sharded)"]
+        Engines["Engine Registry\n(Logical, Physical, Sharded)"]
     end
 
     subgraph DataPlane["Streaming Data Plane"]
@@ -250,7 +248,6 @@ src/
 ├── backup.ts             # Logical backup coordinator and pipeline builder
 ├── restore.ts            # Restore pipeline, selective filters, pre-verification
 ├── physical.ts           # Physical hot backup via $backupCursor / fsyncLock
-├── snapshot.ts           # Cloud volume snapshot orchestrator (EBS / custom)
 ├── sharding.ts           # Sharded cluster backup coordinator & balancer control
 ├── oplog.ts              # Continuous PITR oplog tailing, slicing, and replay
 ├── crypto.ts             # AES-256-GCM chunked AEAD, key wrapping, HMAC signing
@@ -284,9 +281,9 @@ src/
 - **Inputs:** `process.env`.
 - **Outputs:** Immutable, strongly typed `AppConfig` object. Throws `ConfigError` with path-specific diagnostics if validation fails.
 
-#### 3. Backup and Restore Engines (`src/engines.ts`, `src/backup.ts`, `src/physical.ts`, `src/snapshot.ts`, `src/sharding.ts`)
+#### 3. Backup and Restore Engines (`src/engines.ts`, `src/backup.ts`, `src/physical.ts`, `src/sharding.ts`)
 
-- **Responsibility:** Implements the `BackupEngineStrategy` interface across four concrete strategies: `LogicalBackupEngine`, `PhysicalBackupEngine`, `SnapshotBackupEngine`, and `ShardedBackupEngine`. Manages database connection state, locks, and subprocess execution.
+- **Responsibility:** Implements the `BackupEngineStrategy` interface across concrete strategies: `LogicalBackupEngine`, `PhysicalBackupEngine`, and `ShardedBackupEngine`. Manages database connection state, locks, and subprocess execution.
 - **Inputs:** `BackupEngineOptions` or `RestoreEngineOptions`.
 - **Outputs:** `BackupManifest` record upon backup completion; restoration summary object upon restore completion.
 
@@ -366,7 +363,6 @@ flowchart LR
         EngineReg["Engine Registry"]
         LogicalEng["Logical Engine\n(mongodump)"]
         PhysicalEng["Physical Engine\n($backupCursor)"]
-        SnapshotEng["Snapshot Engine\n(AWS EBS / Hook)"]
         ShardedEng["Sharded Engine\n(mongos coordinator)"]
     end
 
@@ -392,7 +388,6 @@ flowchart LR
 
     EngineReg --> LogicalEng
     EngineReg --> PhysicalEng
-    EngineReg --> SnapshotEng
     EngineReg --> ShardedEng
 
     LogicalEng --> StreamSubsystem
@@ -586,14 +581,13 @@ flowchart TD
     Start["Request Operation\n(Backup or Restore)"] --> IsBackup{"Operation Type?"}
 
     IsBackup -- Backup --> CheckEngineParam{"--engine flag\nprovided?"}
-    CheckEngineParam -- Yes --> UseFlagEngine["Use Engine from --engine\n(logical | physical | snapshot)"]
+    CheckEngineParam -- Yes --> UseFlagEngine["Use Engine from --engine\n(logical | physical)"]
     CheckEngineParam -- No --> CheckSharding{"--sharding flag or\nSHARDING_ENABLED=true?"}
     CheckSharding -- Yes --> UseSharded["Use 'sharded' Engine"]
     CheckSharding -- No --> UseConfigEngine["Use BACKUP_ENGINE\n(default: 'logical')"]
 
     IsBackup -- Restore --> CheckRestoreFlags{"Restore Flags?"}
     CheckRestoreFlags -- "--db-path or *.physical.tar.gz" --> UsePhysicalRestore["Use 'physical' Engine"]
-    CheckRestoreFlags -- "--engine snapshot or *.snapshot" --> UseSnapshotRestore["Use 'snapshot' Engine"]
     CheckRestoreFlags -- "--sharding or *.cluster" --> UseShardedRestore["Use 'sharded' Engine"]
     CheckRestoreFlags -- Default --> UseLogicalRestore["Use 'logical' Engine"]
 ```
@@ -691,35 +685,7 @@ stateDiagram-v2
 
 ---
 
-### 3. Cloud Volume Snapshot Engine (`snapshot`)
-
-#### What it is
-
-The `snapshot` engine coordinates point-in-time cloud storage block-volume snapshots (AWS EBS or custom cloud infrastructure) under write quiescence.
-
-#### How it works internally
-
-1. Connects to MongoDB `admin` database and executes `db.fsyncLock()`, flushing all dirty in-memory pages to disk and freezing writes.
-2. Queries the cluster's replica set status to record the exact majority-committed cluster timestamp (`lastCommittedOpTime`).
-3. Invokes the snapshot driver:
-   - `aws-ebs`: Issues volume snapshot requests against the AWS EC2 API for the configured `SNAPSHOT_VOLUME_ID`.
-   - `custom`: Executes an external executable hook (`SNAPSHOT_COMMAND_HOOK create <volumeId>`).
-4. Immediately executes `db.fsyncUnlock()`, unfreezing writes. The write lock is held only for the seconds required to initiate the volume snapshot, not for the duration of the data transfer.
-5. Writes a `.snapshot` manifest to storage recording the cloud `snapshotId`, `volumeId`, and cluster timestamp.
-
-#### Advantages
-
-- Near-instantaneous backup execution regardless of database size; offloads data movement entirely to cloud storage hypervisors.
-- Write lock is held for mere seconds.
-
-#### Limitations
-
-- Requires AWS API permissions or custom volume snapshot tooling.
-- Restore must be performed at the cloud infrastructure level (attaching new volumes) rather than through database tools.
-
----
-
-### 4. Sharded Cluster Engine (`sharded` — Experimental)
+### 3. Sharded Cluster Engine (`sharded` — Experimental)
 
 #### What it is
 
@@ -793,16 +759,16 @@ sequenceDiagram
 
 ### Engine Comparison Matrix
 
-| Feature / Dimension      | `logical`                      | `physical`                     | `snapshot`                      | `sharded` (Experimental)                |
-| :----------------------- | :----------------------------- | :----------------------------- | :------------------------------ | :-------------------------------------- |
-| **Backup Mechanism**     | `mongodump` BSON stream        | WiredTiger `$backupCursor` Tar | Cloud Volume Snapshot           | `mongos` multi-node coordinator         |
-| **Data Format**          | `.archive.gz[.enc]`            | `.physical.tar.gz[.enc]`       | Cloud Provider Volume           | Multi-prefix archives + `.cluster`      |
-| **Hardware Locality**    | Network accessible             | Same host / volume mount       | Cloud provider API access       | Network accessible to `mongos` & shards |
-| **Database Consistency** | Point-in-time via `--oplog`    | WiredTiger checkpoint          | Storage-flush under `fsyncLock` | Balancer-quiesced + shard oplogs        |
-| **Impact on Primary**    | Minimal (`secondaryPreferred`) | None (reads raw files)         | Writes locked for seconds       | Minimal (secondary preferred per shard) |
-| **Restore Speed**        | Moderate (rebuilds indexes)    | Maximum (raw file extract)     | Instantaneous (volume attach)   | Moderate (restores config + shards)     |
-| **Selective Restore**    | Yes (namespace filtering)      | No (full database directory)   | No (full block volume)          | Yes (can restore individual shards)     |
-| **Target MongoDB State** | Online and operational         | **Must be stopped**            | Attached as new volume          | Target cluster online; balancer stopped |
+| Feature / Dimension      | `logical`                      | `physical`                     | `sharded` (Experimental)                |
+| :----------------------- | :----------------------------- | :----------------------------- | :-------------------------------------- |
+| **Backup Mechanism**     | `mongodump` BSON stream        | WiredTiger `$backupCursor` Tar | `mongos` multi-node coordinator         |
+| **Data Format**          | `.archive.gz[.enc]`            | `.physical.tar.gz[.enc]`       | Multi-prefix archives + `.cluster`      |
+| **Hardware Locality**    | Network accessible             | Same host / volume mount       | Network accessible to `mongos` & shards |
+| **Database Consistency** | Point-in-time via `--oplog`    | WiredTiger checkpoint          | Balancer-quiesced + shard oplogs        |
+| **Impact on Primary**    | Minimal (`secondaryPreferred`) | None (reads raw files)         | Minimal (secondary preferred per shard) |
+| **Restore Speed**        | Moderate (rebuilds indexes)    | Maximum (raw file extract)     | Moderate (restores config + shards)     |
+| **Selective Restore**    | Yes (namespace filtering)      | No (full database directory)   | Yes (can restore individual shards)     |
+| **Target MongoDB State** | Online and operational         | **Must be stopped**            | Target cluster online; balancer stopped |
 
 ---
 
@@ -1518,9 +1484,6 @@ node dist/index.js backup --database analytics --read-preference secondary
 # Physical WiredTiger hot backup
 node dist/index.js backup --engine physical --db-path /var/lib/mongodb
 
-# Cloud volume snapshot under fsyncLock
-node dist/index.js backup --engine snapshot --volume-id vol-0123456789abcdef0
-
 # Synchronized multi-shard cluster backup via mongos
 node dist/index.js backup --sharding
 ```
@@ -1703,12 +1666,8 @@ Configuration settings are validated at startup via Zod (`src/config.ts`).
 | `MONGODB_PARALLEL_COLLECTIONS`         | Number  |         `2`          |    No     | Concurrently dumped collections (`1`–`32`). Lower to `1`–`2` for memory-constrained hosts.    |
 | `MONGODB_READ_PREFERENCE`              | String  | `secondaryPreferred` |    No     | Read preference: `primary`, `primaryPreferred`, `secondary`, `secondaryPreferred`, `nearest`. |
 | **Backup Engines & Sharding**          |         |                      |           |                                                                                               |
-| `BACKUP_ENGINE`                        | String  |      `logical`       |    No     | Default engine: `logical`, `physical`, or `snapshot`.                                         |
+| `BACKUP_ENGINE`                        | String  |      `logical`       |    No     | Default engine: `logical` or `physical`.                                                      |
 | `PHYSICAL_DB_PATH`                     |  Path   |        _None_        |   Cond.   | Local WiredTiger filesystem path. Required when `BACKUP_ENGINE=physical`.                     |
-| `SNAPSHOT_PROVIDER`                    | String  |      `aws-ebs`       |    No     | Cloud snapshot provider: `aws-ebs` or `custom`.                                               |
-| `SNAPSHOT_VOLUME_ID`                   | String  |        _None_        |   Cond.   | Cloud block-volume ID. Required when `BACKUP_ENGINE=snapshot`.                                |
-| `SNAPSHOT_REGION`                      | String  |        _None_        |    No     | AWS region for EBS volume snapshot calls.                                                     |
-| `SNAPSHOT_COMMAND_HOOK`                | String  |        _None_        |    No     | External shell executable invoked for custom snapshot creation and restoration.               |
 | `SHARDING_ENABLED`                     | Boolean |       `false`        |    No     | Coordinates distributed backup across `mongos`, `configsvr`, and shard replica sets.          |
 | `SHARDING_CONFIGSVR_URI`               | String  |        _None_        |    No     | Optional dedicated Config Server connection URI.                                              |
 | **Point-in-Time Recovery (PITR)**      |         |                      |           |                                                                                               |
@@ -1853,7 +1812,6 @@ src/
 ├── backup.ts             # Logical backup pipeline
 ├── restore.ts            # Restore pipeline and verification
 ├── physical.ts           # WiredTiger $backupCursor implementation
-├── snapshot.ts           # Cloud volume snapshot driver implementation
 ├── sharding.ts           # Coordinated multi-shard cluster engine
 ├── oplog.ts              # PITR archiver, tailer, and replay logic
 ├── crypto.ts             # AEAD 64 KiB chunked cipher and key wrapping

@@ -8,7 +8,6 @@ export interface CliParsedValues {
   key?: string;
   engine?: string;
   "db-path"?: string;
-  "volume-id"?: string;
   sharding?: boolean;
   uri?: string;
   database?: string;
