@@ -129,16 +129,12 @@ export class ShardedBackupEngine implements BackupEngineStrategy {
   }
 
   async restore(options: RestoreEngineOptions): Promise<unknown> {
-    if (options.pitr) {
-      throw new Error(
-        "Point-in-Time Recovery (--pitr) is not supported for sharded cluster restores",
-      );
-    }
     return restoreShardedCluster({
       config: options.config,
       storage: options.storage,
       logger: options.logger,
       ref: options.ref || "latest",
+      pitr: options.pitr,
       signal: options.signal,
       drop: options.drop,
     });

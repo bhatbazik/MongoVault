@@ -7,6 +7,7 @@ import { runBackup } from "./backup.js";
 import {
   MANIFEST_VERSION,
   databasePrefix,
+  listBackups,
   manifestKey,
   readManifest,
   resolveBackup,
@@ -25,16 +26,20 @@ import {
   fromBsonTimestamp,
   incrementOplogTimestamp,
   parseOplogTimestamp,
+  parsePitrTarget,
+  resolvePitrPlan,
 } from "./oplog.js";
 import { restoreBackup } from "./restore.js";
 import { replayOplogFile } from "./tools.js";
 import type {
   BackupManifest,
+  BackupScope,
   ShardedClusterMeta,
   ShardedClusterShardBackup,
 } from "./types/catalog.js";
 import type { AppConfig } from "./types/config.js";
 import type { Logger } from "./types/logger.js";
+import type { OplogTimestamp, PitrPlan } from "./types/oplog.js";
 import type {
   ClusterTopology,
   ShardInfo,
@@ -43,6 +48,7 @@ import type {
   ShardedRestoreOptions,
   ShardedRestoreResult,
 } from "./types/sharding.js";
+import type { StorageClient } from "./types/storage.js";
 
 /**
  * Builds a MongoDB connection URI for an individual shard replica set while
@@ -480,30 +486,248 @@ export async function runShardedClusterBackup({
   }
 }
 
+export interface ShardedPitrPlan {
+  clusterBackupKey: string;
+  clusterManifest: BackupManifest;
+  clusterMeta: ShardedClusterMeta;
+  targetTs: OplogTimestamp;
+  configsvrPlan: PitrPlan | null;
+  shardPlans: Record<string, PitrPlan>;
+}
+
 /**
- * Restores a sharded cluster backup.
+ * Captures continuous PITR oplog slices in parallel across configsvr and all shards.
+ */
+export async function captureShardedOplogSlices({
+  config,
+  storage,
+  logger,
+  signal,
+  createMongoClient = (u) => new MongoClient(u),
+}: {
+  config: AppConfig;
+  storage: StorageClient;
+  logger: Logger;
+  signal?: AbortSignal;
+  createMongoClient?: (uri: string) => MongoClient;
+}): Promise<{
+  configsvr: BackupManifest | null;
+  shards: Record<string, BackupManifest | null>;
+} | null> {
+  const client = createMongoClient(config.mongo.uri);
+  let topology: ClusterTopology;
+  try {
+    await client.connect();
+    topology = await discoverClusterTopology(client);
+  } finally {
+    await client.close().catch(() => {});
+  }
+
+  if (!topology.isSharded) {
+    return null;
+  }
+
+  const configsvrDirectUri = topology.configsvr?.host
+    ? buildShardUri(config.mongo.uri, topology.configsvr.host)
+    : config.sharding?.configsvrUri;
+
+  const configsvrPromise = configsvrDirectUri
+    ? captureOplogSlice({
+        config: {
+          ...config,
+          storage: { ...config.storage, prefix: `${config.storage.prefix}/configsvr` },
+          mongo: { ...config.mongo, uri: configsvrDirectUri, database: "*", oplog: true },
+        },
+        storage,
+        logger: logger.child({ component: "configsvr" }),
+        signal,
+        createMongoClient,
+      })
+    : Promise.resolve(null);
+
+  const shardEntries = await Promise.all(
+    topology.shards.map(async (shard) => {
+      const shardUri = buildShardUri(config.mongo.uri, shard.host);
+      const manifest = await captureOplogSlice({
+        config: {
+          ...config,
+          storage: { ...config.storage, prefix: `${config.storage.prefix}/shards/${shard.id}` },
+          mongo: { ...config.mongo, uri: shardUri, database: "*", oplog: true },
+        },
+        storage,
+        logger: logger.child({ shardId: shard.id }),
+        signal,
+        createMongoClient,
+      });
+      return [shard.id, manifest] as const;
+    }),
+  );
+
+  const configsvr = await configsvrPromise;
+  return {
+    configsvr,
+    shards: Object.fromEntries(shardEntries),
+  };
+}
+
+/**
+ * Resolves a consistent sharded cluster PITR plan across configsvr and all shards.
+ */
+export async function resolveShardedPitrPlan(
+  storage: StorageClient,
+  scope: BackupScope,
+  targetInput: string | OplogTimestamp,
+): Promise<ShardedPitrPlan> {
+  const targetTs = parsePitrTarget(targetInput);
+  const backups = (await listBackups(storage, scope)).filter(
+    (b) => b.complete && /\.cluster(\.enc)?$/.test(b.key),
+  );
+
+  if (backups.length === 0) {
+    throw new Error(`No complete sharded cluster backups found under ${databasePrefix(scope)}`);
+  }
+
+  let selectedKey: string | null = null;
+  let selectedManifest: BackupManifest | null = null;
+  let selectedMeta: ShardedClusterMeta | null = null;
+
+  for (const backup of backups) {
+    const manifest = await readManifest(storage, backup.key);
+    const meta = manifest?.sharding;
+    if (!manifest || !meta) continue;
+    const cTs = meta.clusterTime
+      ? parseOplogTimestamp(meta.clusterTime)
+      : {
+          t:
+            Math.floor(new Date(manifest.completedAt || manifest.createdAt).getTime() / 1000) >>> 0,
+          i: 0,
+        };
+    if (cTs && compareTimestamps(cTs, targetTs) <= 0) {
+      selectedKey = backup.key;
+      selectedManifest = manifest;
+      selectedMeta = meta;
+      break;
+    }
+  }
+
+  if (!selectedKey || !selectedManifest || !selectedMeta) {
+    throw new Error(
+      `No sharded cluster backup found at or before target PITR timestamp ${formatOplogTimestamp(targetTs)}`,
+    );
+  }
+
+  const configsvrManifest = await readManifest(storage, selectedMeta.configsvr.backupKey);
+  const configsvrPlan = configsvrManifest?.oplog
+    ? await resolvePitrPlan(
+        storage,
+        { prefix: `${scope.prefix}/configsvr`, database: "*" },
+        targetTs,
+        { engine: "logical", includeBaseWindow: true },
+      )
+    : null;
+
+  const shardPlans: Record<string, PitrPlan> = {};
+  for (const [shardId, shard] of Object.entries(selectedMeta.shards)) {
+    if (shard.status !== "success" || !shard.backupKey) {
+      throw new Error(`Cannot perform sharded PITR: shard "${shardId}" has incomplete base backup`);
+    }
+    shardPlans[shardId] = await resolvePitrPlan(
+      storage,
+      { prefix: `${scope.prefix}/shards/${shardId}`, database: "*" },
+      targetTs,
+      { engine: "logical" },
+    );
+  }
+
+  return {
+    clusterBackupKey: selectedKey,
+    clusterManifest: selectedManifest,
+    clusterMeta: selectedMeta,
+    targetTs,
+    configsvrPlan,
+    shardPlans,
+  };
+}
+
+async function replayOplogSlices({
+  config,
+  storage,
+  signal,
+  logger,
+  slices,
+  targetTs,
+  uri,
+  nsInclude,
+  oplogLimit,
+}: {
+  config: AppConfig;
+  storage: StorageClient;
+  signal?: AbortSignal;
+  logger: Logger;
+  slices: Array<{ key: string }>;
+  targetTs: OplogTimestamp;
+  uri: string;
+  nsInclude?: string;
+  oplogLimit: string;
+}): Promise<number> {
+  let replayed = 0;
+  for (const slice of slices) {
+    const rawSlice = path.join(config.workDir, `.shard-pitr-${randomUUID()}.oplog.bson`);
+    const filteredSlice = path.join(config.workDir, `.shard-pitr-f-${randomUUID()}.oplog.bson`);
+    try {
+      await downloadAndExtractOplogSlice({ config, storage, signal }, slice.key, rawSlice);
+      const { keptEntries } = await filterOplogSliceFile(rawSlice, filteredSlice, {
+        targetTs,
+        nsInclude,
+      });
+      if (keptEntries === 0) continue;
+      await replayOplogFile({
+        uri,
+        workDir: config.workDir,
+        oplogFile: filteredSlice,
+        oplogLimit,
+        timeoutMs: config.timeoutMs,
+        signal,
+        logger,
+      });
+      replayed += keptEntries;
+    } finally {
+      await Promise.allSettled([
+        fs.rm(rawSlice, { force: true }),
+        fs.rm(filteredSlice, { force: true }),
+      ]);
+    }
+  }
+  return replayed;
+}
+
+/**
+ * Restores a sharded cluster backup, with optional Point-in-Time Recovery (PITR).
  */
 export async function restoreShardedCluster({
   config,
   storage,
   logger,
   ref = "latest",
+  pitr,
   signal,
   drop = false,
   createMongoClient = (u) => new MongoClient(u),
   restoreRunner = restoreBackup,
 }: ShardedRestoreOptions): Promise<ShardedRestoreResult> {
   const scope = scopeOf(config);
-  const resolvedKey =
-    ref === "latest" && typeof storage.list === "function"
+  const pitrPlan = pitr ? await resolveShardedPitrPlan(storage, scope, pitr) : null;
+  const resolvedKey = pitrPlan
+    ? pitrPlan.clusterBackupKey
+    : ref === "latest" && typeof storage.list === "function"
       ? await resolveBackup(storage, scope, ref)
       : ref;
 
-  const log = logger.child({ ref: resolvedKey });
+  const log = logger.child({ ref: resolvedKey, ...(pitr ? { pitr } : {}) });
   log.info("Initiating sharded cluster restore");
 
-  const manifest = await readManifest(storage, resolvedKey);
-  const clusterMeta = manifest?.sharding;
+  const manifest = pitrPlan?.clusterManifest ?? (await readManifest(storage, resolvedKey));
+  const clusterMeta = pitrPlan?.clusterMeta ?? manifest?.sharding;
   if (!manifest || !clusterMeta) {
     throw new Error(`No sharded cluster metadata found in manifest for ${resolvedKey}`);
   }
@@ -516,6 +740,7 @@ export async function restoreShardedCluster({
   const client = createMongoClient(config.mongo.uri);
   const balancer = new BalancerController(client, log);
   let balancerStopped = false;
+  let replayedSlices = 0;
 
   try {
     await client.connect();
@@ -536,9 +761,13 @@ export async function restoreShardedCluster({
       : config.mongo.uri;
 
     const clusterTs = parseOplogTimestamp(clusterMeta.clusterTime);
-    const exclusiveClusterLimit = clusterTs
-      ? formatOplogTimestamp(incrementOplogTimestamp(clusterTs))
+    const effectiveTargetTs = pitrPlan ? pitrPlan.targetTs : clusterTs;
+    const exclusiveLimit = effectiveTargetTs
+      ? formatOplogTimestamp(incrementOplogTimestamp(effectiveTargetTs))
       : clusterMeta.clusterTime;
+
+    const configsvrNsInclude =
+      "config.databases,config.collections,config.chunks,config.tags,config.settings";
 
     // 2. Restore configsvr routing tables directly to configsvr (if discovered)
     log.info(
@@ -554,15 +783,25 @@ export async function restoreShardedCluster({
         ref: clusterMeta.configsvr.backupKey,
         uri: targetConfigsvrUri,
         database: targetTopology?.configsvr?.host ? "*" : "config",
-        ...(targetTopology?.configsvr?.host
-          ? {
-              nsInclude:
-                "config.databases,config.collections,config.chunks,config.tags,config.settings",
-            }
-          : {}),
+        ...(targetTopology?.configsvr?.host ? { nsInclude: configsvrNsInclude } : {}),
         drop,
       },
     );
+
+    if (pitrPlan?.configsvrPlan && pitrPlan.configsvrPlan.slices.length > 0) {
+      await replayOplogSlices({
+        config,
+        storage,
+        signal,
+        logger: log.child({ target: "configsvr-pitr" }),
+        slices: pitrPlan.configsvrPlan.slices,
+        targetTs: pitrPlan.targetTs,
+        uri: targetConfigsvrUri,
+        nsInclude: targetTopology?.configsvr?.host ? configsvrNsInclude : undefined,
+        oplogLimit: exclusiveLimit,
+      });
+      replayedSlices += pitrPlan.configsvrPlan.slices.length;
+    }
 
     // 3. Restore each shard (using target cluster shard host mapping when available)
     const restoredShards: string[] = [];
@@ -576,6 +815,7 @@ export async function restoreShardedCluster({
       const targetShardUri = resolvedHost
         ? buildShardUri(config.mongo.uri, resolvedHost)
         : config.mongo.uri;
+      const shardPitrPlan = pitrPlan?.shardPlans[shardId] ?? null;
 
       log.info({ shardId, backupKey: shard.backupKey }, "Restoring shard...");
       await restoreRunner(
@@ -586,42 +826,35 @@ export async function restoreShardedCluster({
           database: "*",
           drop,
           oplogReplay: true,
-          oplogLimit: exclusiveClusterLimit,
+          oplogLimit: shardPitrPlan && shardPitrPlan.slices.length > 0 ? undefined : exclusiveLimit,
         },
       );
 
       if (shard.bridgingSliceKey) {
-        const rawSlice = path.join(config.workDir, `.shard-bridge-${randomUUID()}.oplog.bson`);
-        const filteredSlice = path.join(
-          config.workDir,
-          `.shard-bridge-f-${randomUUID()}.oplog.bson`,
-        );
-        try {
-          await downloadAndExtractOplogSlice(
-            { config, storage, signal },
-            shard.bridgingSliceKey,
-            rawSlice,
-          );
-          const { keptEntries } = await filterOplogSliceFile(rawSlice, filteredSlice, {
-            ...(clusterTs ? { targetTs: clusterTs } : {}),
-          });
-          if (keptEntries > 0) {
-            await replayOplogFile({
-              uri: targetShardUri,
-              workDir: config.workDir,
-              oplogFile: filteredSlice,
-              oplogLimit: exclusiveClusterLimit,
-              timeoutMs: config.timeoutMs,
-              signal,
-              logger: log.child({ target: shardId }),
-            });
-          }
-        } finally {
-          await Promise.allSettled([
-            fs.rm(rawSlice, { force: true }),
-            fs.rm(filteredSlice, { force: true }),
-          ]);
-        }
+        await replayOplogSlices({
+          config,
+          storage,
+          signal,
+          logger: log.child({ target: shardId }),
+          slices: [{ key: shard.bridgingSliceKey }],
+          targetTs: effectiveTargetTs!,
+          uri: targetShardUri,
+          oplogLimit: exclusiveLimit,
+        });
+      }
+
+      if (shardPitrPlan && shardPitrPlan.slices.length > 0) {
+        await replayOplogSlices({
+          config,
+          storage,
+          signal,
+          logger: log.child({ target: shardId }),
+          slices: shardPitrPlan.slices,
+          targetTs: pitrPlan!.targetTs,
+          uri: targetShardUri,
+          oplogLimit: exclusiveLimit,
+        });
+        replayedSlices += shardPitrPlan.slices.length;
       }
 
       restoredShards.push(shardId);
@@ -637,10 +870,12 @@ export async function restoreShardedCluster({
       balancerStopped = false;
     }
 
+    const pitrTarget = pitrPlan ? formatOplogTimestamp(pitrPlan.targetTs) : undefined;
     log.info(
       {
         restoredShards,
         clusterTime: clusterMeta.clusterTime,
+        ...(pitrTarget ? { pitrTarget, replayedSlices } : {}),
       },
       "Sharded cluster restore completed successfully",
     );
@@ -650,6 +885,7 @@ export async function restoreShardedCluster({
       clusterTime: clusterMeta.clusterTime,
       restoredShards,
       configsvrRestored: true,
+      ...(pitrTarget ? { pitrTarget, replayedSlices } : {}),
     };
   } finally {
     if (balancerStopped) {

@@ -811,18 +811,26 @@ export async function restorePhysicalBackup({
     "Starting temporary mongod for physical PITR oplog replay",
   );
 
-  const proc = spawn(
-    "mongod",
-    [
-      `--dbpath=${targetDbPath}`,
-      `--port=${port}`,
-      "--bind_ip=127.0.0.1",
-      `--logpath=${mongodLog}`,
-      "--setParameter=ttlMonitorEnabled=false",
-      "--setParameter=disableLogicalSessionCacheRefresh=true",
-    ],
-    { stdio: "ignore" },
-  );
+  const recoveryArgs = [
+    `--dbpath=${targetDbPath}`,
+    `--port=${port}`,
+    "--bind_ip=127.0.0.1",
+    `--logpath=${mongodLog}`,
+    "--setParameter=ttlMonitorEnabled=false",
+    "--setParameter=disableLogicalSessionCacheRefresh=true",
+    "--setParameter=takeUnstableCheckpointOnShutdown=true",
+  ];
+  if (config.physical?.directoryPerDb) {
+    recoveryArgs.push("--directoryperdb");
+  }
+  if (config.physical?.encryptionKeyFile) {
+    recoveryArgs.push(
+      "--enableEncryption",
+      `--encryptionKeyFile=${config.physical.encryptionKeyFile}`,
+    );
+  }
+
+  const proc = spawn("mongod", recoveryArgs, { stdio: "ignore" });
 
   const procExit = new Promise<void>((resolve) => {
     proc.once("close", () => resolve());
@@ -839,12 +847,32 @@ export async function restorePhysicalBackup({
       () => proc.exitCode !== null || proc.signalCode !== null,
       mongodLog,
     );
-    // Clear replica set config on standalone recovery instance so it starts cleanly when re-added to RS
-    await tmpClient
-      .db("local")
-      .collection("system.replset")
-      .drop()
-      .catch(() => {});
+    // Clear stale replica-set coordination state and sessions on recovery instance
+    // so it starts cleanly as a standalone or newly initialized replica set.
+    const localDb = tmpClient.db("local");
+    await Promise.all([
+      localDb
+        .collection("system.replset")
+        .drop()
+        .catch(() => {}),
+      localDb
+        .collection("replset.minvalid")
+        .drop()
+        .catch(() => {}),
+      localDb
+        .collection("replset.oplogTruncateAfterPoint")
+        .drop()
+        .catch(() => {}),
+      localDb
+        .collection("replset.election")
+        .drop()
+        .catch(() => {}),
+      tmpClient
+        .db("config")
+        .collection("system.sessions")
+        .drop()
+        .catch(() => {}),
+    ]);
 
     for (const slice of pitrPlan.slices) {
       const rawSlice = path.join(config.workDir, `.phys-pitr-${randomUUID()}.oplog.bson`);

@@ -70,6 +70,8 @@ const schema = z
 
     BACKUP_ENGINE: z.enum(["logical", "physical"]).default("logical"),
     PHYSICAL_DB_PATH: z.string().optional(),
+    PHYSICAL_ENCRYPTION_KEY_FILE: z.string().optional(),
+    PHYSICAL_DIRECTORY_PER_DB: flag(false),
 
     SHARDING_ENABLED: flag(false),
     SHARDING_CONFIGSVR_URI: z.string().optional(),
@@ -294,7 +296,16 @@ function toConfig(env: z.infer<typeof schema>): AppConfig {
     drill: env.DRILL_MONGODB_URI
       ? { uri: env.DRILL_MONGODB_URI, cron: env.DRILL_CRON ?? null }
       : null,
-    physical: env.PHYSICAL_DB_PATH ? { dbPath: env.PHYSICAL_DB_PATH } : null,
+    physical:
+      env.PHYSICAL_DB_PATH || env.PHYSICAL_ENCRYPTION_KEY_FILE || env.PHYSICAL_DIRECTORY_PER_DB
+        ? {
+            ...(env.PHYSICAL_DB_PATH ? { dbPath: env.PHYSICAL_DB_PATH } : {}),
+            ...(env.PHYSICAL_ENCRYPTION_KEY_FILE
+              ? { encryptionKeyFile: env.PHYSICAL_ENCRYPTION_KEY_FILE }
+              : {}),
+            ...(env.PHYSICAL_DIRECTORY_PER_DB ? { directoryPerDb: true } : {}),
+          }
+        : null,
     sharding: env.SHARDING_ENABLED
       ? {
           enabled: true,

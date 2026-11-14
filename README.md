@@ -643,11 +643,12 @@ The `physical` engine performs hot physical copies of raw WiredTiger storage eng
    db.adminCommand({ aggregate: 1, pipeline: [{ $backupCursor: {} }], cursor: {} });
    ```
 2. The cursor locks the checkpoint and returns an ordered list of active database files (e.g., `WiredTiger.wt`, `collection-*.wt`, `index-*.wt`).
-3. If checkpoint conflicts occur (MongoDB error code `50915`), MongoVault applies exponential backoff retries.
-4. If supported by MongoDB Enterprise, extended journal files are requested via `$backupCursorExtend` to record write changes that occur during file copying.
+3. If checkpoint conflicts occur (MongoDB error code `50915` or `50917`), MongoVault applies linear backoff retries (`(attempt + 1) * 1s`, up to 10 attempts).
+4. If supported by MongoDB, extended journal files are requested via `$backupCursorExtend` after all `.wt` data files are streamed, along with `journal/WiredTigerLog*` files, to record write changes that occur during file copying.
 5. In standalone instances or engines without `$backupCursor` support, it falls back to `db.fsyncLock()`.
 6. Files are packed on the fly into standard 512-byte POSIX UStar tar headers (`src/tar.ts`), compressed with gzip, encrypted, and uploaded to storage without creating an intermediate tarball on disk.
 7. An asynchronous keep-alive timer pings the cursor every 45 seconds to prevent MongoDB from timing out the backup cursor during large uploads.
+8. On PITR physical restore, an ephemeral `mongod` is booted on `targetDbPath` (supporting `PHYSICAL_ENCRYPTION_KEY_FILE` and `PHYSICAL_DIRECTORY_PER_DB`) with `ttlMonitorEnabled=false`, `disableLogicalSessionCacheRefresh=true`, and `takeUnstableCheckpointOnShutdown=true`, clears stale replica-set coordination state, replays filtered oplog slices, and shuts down cleanly.
 
 #### Execution Lifecycle State Machine
 
@@ -700,10 +701,11 @@ The `sharded` engine acts as a coordinator across a MongoDB Sharded Cluster (`mo
 2. Queries `config.shards` to discover all shard replica set connection addresses.
 3. Stops the cluster balancer via `db.adminCommand({ balancerStop: 1 })` and polls `balancerStatus` until all in-flight chunk migrations are fully drained.
 4. Captures the cluster-wide logical time (`$clusterTime`) via an admin ping command.
-5. Backs up Config Server metadata (`config` database) under `<prefix>/configsvr` to record routing tables, chunk distribution maps, and collection schemas.
-6. Iterates through each shard replica set sequentially, deriving direct shard URIs with preserved credentials via `buildShardUri()`, and streams a full backup of each shard under `<prefix>/shards/<shardId>` with `oplog: true`.
-7. Restarts the cluster balancer via `db.adminCommand({ balancerStart: 1 })`.
+5. Backs up Config Server metadata under `<prefix>/configsvr` and all shard replica sets in **parallel** under `<prefix>/shards/<shardId>` with `oplog: true`, deriving direct shard URIs with preserved credentials via `buildShardUri()`.
+6. Computes the common `clusterTime` across all shards and captures bridging oplog slices for any shard whose dump finished earlier.
+7. Restarts the cluster balancer via `db.adminCommand({ balancerStart: 1 })` (and guarantees restart in `finally` on both backup and restore).
 8. Writes a unified `.cluster` manifest binding the Config Server and shard backup manifests to the recorded cluster timestamp.
+9. Supports continuous sharded PITR archiving (`captureShardedOplogSlices` across `configsvr` + all shards) and fail-closed sharded PITR restore (`resolveShardedPitrPlan` + `restoreShardedCluster` with `--pitr`).
 
 #### Coordinated Multi-Shard Sequence
 
@@ -759,16 +761,17 @@ sequenceDiagram
 
 ### Engine Comparison Matrix
 
-| Feature / Dimension      | `logical`                      | `physical`                     | `sharded` (Experimental)                |
-| :----------------------- | :----------------------------- | :----------------------------- | :-------------------------------------- |
-| **Backup Mechanism**     | `mongodump` BSON stream        | WiredTiger `$backupCursor` Tar | `mongos` multi-node coordinator         |
-| **Data Format**          | `.archive.gz[.enc]`            | `.physical.tar.gz[.enc]`       | Multi-prefix archives + `.cluster`      |
-| **Hardware Locality**    | Network accessible             | Same host / volume mount       | Network accessible to `mongos` & shards |
-| **Database Consistency** | Point-in-time via `--oplog`    | WiredTiger checkpoint          | Balancer-quiesced + shard oplogs        |
-| **Impact on Primary**    | Minimal (`secondaryPreferred`) | None (reads raw files)         | Minimal (secondary preferred per shard) |
-| **Restore Speed**        | Moderate (rebuilds indexes)    | Maximum (raw file extract)     | Moderate (restores config + shards)     |
-| **Selective Restore**    | Yes (namespace filtering)      | No (full database directory)   | Yes (can restore individual shards)     |
-| **Target MongoDB State** | Online and operational         | **Must be stopped**            | Target cluster online; balancer stopped |
+| Feature / Dimension      | `logical`                      | `physical`                      | `sharded` (Experimental)                |
+| :----------------------- | :----------------------------- | :------------------------------ | :-------------------------------------- |
+| **Backup Mechanism**     | `mongodump` BSON stream        | WiredTiger `$backupCursor` Tar  | `mongos` multi-node coordinator         |
+| **Data Format**          | `.archive.gz[.enc]`            | `.physical.tar.gz[.enc]`        | Multi-prefix archives + `.cluster`      |
+| **Hardware Locality**    | Network accessible             | Same host / volume mount        | Network accessible to `mongos` & shards |
+| **Database Consistency** | Point-in-time via `--oplog`    | WiredTiger checkpoint           | Balancer-quiesced + shard oplogs        |
+| **Impact on Primary**    | Minimal (`secondaryPreferred`) | None (reads raw files)          | Minimal (secondary preferred per shard) |
+| **Restore Speed**        | Moderate (rebuilds indexes)    | Maximum (raw file extract)      | Moderate (restores config + shards)     |
+| **Selective Restore**    | Yes (namespace filtering)      | No (full database directory)    | Yes (can restore individual shards)     |
+| **PITR Support**         | Yes (base + oplog slices)      | Yes (ephemeral `mongod` replay) | Yes (configsvr + shard oplog slices)    |
+| **Target MongoDB State** | Online and operational         | **Must be stopped**             | Target cluster online; balancer stopped |
 
 ---
 

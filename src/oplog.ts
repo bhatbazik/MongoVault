@@ -76,6 +76,17 @@ export function parsePitrTarget(value: unknown): OplogTimestamp {
   if (!value) {
     throw new Error("Point-in-time target is required");
   }
+  if (
+    typeof value === "object" &&
+    value !== null &&
+    "t" in value &&
+    "i" in value &&
+    typeof (value as { t: unknown }).t === "number" &&
+    typeof (value as { i: unknown }).i === "number"
+  ) {
+    const v = value as { t: number; i: number };
+    return { t: v.t >>> 0, i: v.i >>> 0 };
+  }
   const str = String(value).trim();
   if (/^\d+[:_]\d+$/.test(str)) {
     return parseOplogTimestamp(str)!;
@@ -173,9 +184,50 @@ function isCmdTargetIncluded(
   return isNsIncluded(ns, options);
 }
 
+const DONT_PRESERVE_UUID_EXACT = new Set([
+  "admin.system.users",
+  "admin.system.roles",
+  "admin.system.keys",
+  "config.databases",
+  "config.collections",
+  "config.chunks",
+]);
+
+function shouldStripUuid(ns: string): boolean {
+  return (
+    DONT_PRESERVE_UUID_EXACT.has(ns) ||
+    ns.includes(".system.buckets.") ||
+    ns.endsWith(".system.views")
+  );
+}
+
+function isDisallowedConfigSetting(doc: {
+  ns?: string;
+  o?: Record<string, unknown>;
+  o2?: Record<string, unknown>;
+}): boolean {
+  if (doc.ns !== "config.settings") return false;
+  const id = doc.o2?._id ?? doc.o?._id;
+  return id === "balancer" || id === "automerge";
+}
+
+function sanitizeOplogEntry(doc: Record<string, unknown>): boolean {
+  let modified = false;
+  const ns = String(doc.ns || "");
+  if (doc.ui !== undefined && shouldStripUuid(ns)) {
+    delete doc.ui;
+    modified = true;
+  }
+  if (doc.op === "c" && doc.o && typeof doc.o === "object" && "create" in doc.o && doc.o2) {
+    delete doc.o2;
+    modified = true;
+  }
+  return modified;
+}
+
 /**
  * Filters a raw BSON oplog file to remove system/no-op entries, enforce namespace filters,
- * and cap entries at `targetTs` (inclusive). Returns the number of kept entries.
+ * sanitize UUID/DDL metadata, and cap entries at `targetTs` (inclusive). Returns the number of kept entries.
  */
 export async function filterOplogSliceFile(
   srcBsonFile: string,
@@ -204,10 +256,12 @@ export async function filterOplogSliceFile(
       ts?: unknown;
       op?: string;
       ns?: string;
+      ui?: unknown;
       o?: {
         applyOps?: Array<{ op?: string; ns?: string; [k: string]: unknown }>;
         [k: string]: unknown;
       };
+      o2?: Record<string, unknown>;
     };
 
     if (doc.op === "n") continue;
@@ -217,6 +271,7 @@ export async function filterOplogSliceFile(
     ) {
       continue;
     }
+    if (isDisallowedConfigSetting(doc)) continue;
 
     const docTs = fromBsonTimestamp(doc.ts);
     if (options.targetTs && docTs && compareTimestamps(docTs, options.targetTs) > 0) {
@@ -224,17 +279,32 @@ export async function filterOplogSliceFile(
     }
 
     if (doc.op === "c" && Array.isArray(doc.o?.applyOps)) {
-      const filteredOps = doc.o.applyOps.filter(
-        (inner) =>
-          inner.op !== "n" &&
-          isCmdTargetIncluded(
+      let innerModified = false;
+      const filteredOps = doc.o.applyOps.filter((inner) => {
+        if (inner.op === "n") return false;
+        if (
+          isDisallowedConfigSetting(
+            inner as { ns?: string; o?: Record<string, unknown>; o2?: Record<string, unknown> },
+          )
+        ) {
+          return false;
+        }
+        if (
+          !isCmdTargetIncluded(
             String(inner.ns || ""),
             inner.o as Record<string, unknown> | undefined,
             options,
-          ),
-      );
+          )
+        ) {
+          return false;
+        }
+        if (sanitizeOplogEntry(inner)) {
+          innerModified = true;
+        }
+        return true;
+      });
       if (filteredOps.length === 0) continue;
-      if (filteredOps.length !== doc.o.applyOps.length) {
+      if (innerModified || filteredOps.length !== doc.o.applyOps.length) {
         doc.o.applyOps = filteredOps;
         chunks.push(Buffer.from(BSON.serialize(doc)));
         keptEntries++;
@@ -244,7 +314,11 @@ export async function filterOplogSliceFile(
       continue;
     }
 
-    chunks.push(rawSlice);
+    if (sanitizeOplogEntry(doc as Record<string, unknown>)) {
+      chunks.push(Buffer.from(BSON.serialize(doc)));
+    } else {
+      chunks.push(rawSlice);
+    }
     keptEntries++;
   }
 
@@ -842,18 +916,21 @@ export async function resolvePitrPlan(
     const prevEndStr = sliceManifest?.oplogWindow?.previousEndTs;
     const prevEndTs = prevEndStr ? parseOplogTimestamp(prevEndStr) : null;
 
+    const effectiveExpectedPrevEndTs =
+      verifiedSlices.length === 0 && includeBaseWindow ? baseEndTs : expectedPrevEndTs;
+
     if (prevEndTs) {
-      if (compareTimestamps(prevEndTs, expectedPrevEndTs) > 0) {
+      if (compareTimestamps(prevEndTs, effectiveExpectedPrevEndTs) > 0) {
         throw new Error(
-          `PITR timeline gap detected between ${formatOplogTimestamp(expectedPrevEndTs)} and slice ${slice.key} (starts after ${formatOplogTimestamp(prevEndTs)})`,
+          `PITR timeline gap detected between ${formatOplogTimestamp(effectiveExpectedPrevEndTs)} and slice ${slice.key} (starts after ${formatOplogTimestamp(prevEndTs)})`,
         );
       }
     } else if (
       sliceManifest?.oplogWindow &&
-      compareTimestamps(slice.startTs, expectedPrevEndTs) > 0
+      compareTimestamps(slice.startTs, effectiveExpectedPrevEndTs) > 0
     ) {
       throw new Error(
-        `PITR timeline gap detected before slice ${slice.key} (oplog rolled over after ${formatOplogTimestamp(expectedPrevEndTs)})`,
+        `PITR timeline gap detected before slice ${slice.key} (oplog rolled over after ${formatOplogTimestamp(effectiveExpectedPrevEndTs)})`,
       );
     }
 
@@ -973,16 +1050,33 @@ export function startOplogArchiver({
 
       // Drain all pending oplog slices up to the current majority commit point so
       // high write throughput (> maxSliceMb per flushIntervalSeconds) never falls behind.
-      while (!stopped && !signal?.aborted) {
-        activePromise = captureOplogSlice({
-          config,
-          storage,
-          logger,
-          signal,
-          createMongoClient,
-        });
-        const captured = await activePromise;
-        if (!captured) break;
+      if (config.sharding?.enabled) {
+        const { captureShardedOplogSlices } = await import("./sharding.js");
+        while (!stopped && !signal?.aborted) {
+          const result = await captureShardedOplogSlices({
+            config,
+            storage,
+            logger,
+            signal,
+            createMongoClient,
+          });
+          if (!result) break;
+          const anyCaptured =
+            Boolean(result.configsvr) || Object.values(result.shards).some(Boolean);
+          if (!anyCaptured) break;
+        }
+      } else {
+        while (!stopped && !signal?.aborted) {
+          activePromise = captureOplogSlice({
+            config,
+            storage,
+            logger,
+            signal,
+            createMongoClient,
+          });
+          const captured = await activePromise;
+          if (!captured) break;
+        }
       }
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));

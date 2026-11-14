@@ -55,6 +55,8 @@ export interface DrillConfig {
 
 export interface PhysicalConfig {
   dbPath?: string;
+  encryptionKeyFile?: string;
+  directoryPerDb?: boolean;
 }
 
 export interface ShardingConfig {

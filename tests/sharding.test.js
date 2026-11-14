@@ -333,26 +333,185 @@ describe("multi-shard cluster coordinator", () => {
     await expect(balancer.stopAndDrain(100)).rejects.toThrow(ActiveChunkMigrationError);
   });
 
-  it("rejects --pitr on ShardedBackupEngine.restore() instead of silently ignoring it", async () => {
-    const { ShardedBackupEngine } = await import("../src/engines.js");
-    const engine = new ShardedBackupEngine();
+  it("resolves sharded PITR plan across configsvr and all shards and fails closed on missing coverage", async () => {
+    const { resolveShardedPitrPlan } = await import("../src/sharding.js");
+    const { writeManifest } = await import("../src/catalog.js");
+    const { uploadOplogSlice, toBsonTimestamp } = await import("../src/oplog.js");
+    const { BSON } = await import("mongodb");
+    const { Readable } = await import("node:stream");
+
+    const objects = new Map();
+    const mockStorage = {
+      async upload(key, body) {
+        const chunks = [];
+        for await (const c of body) chunks.push(c);
+        const data = Buffer.concat(chunks);
+        objects.set(key, { data, size: data.length, lastModified: new Date() });
+      },
+      async head(key) {
+        const obj = objects.get(key);
+        return obj ? { size: obj.size, lastModified: obj.lastModified, metadata: {} } : null;
+      },
+      async download(key) {
+        return Readable.from(objects.get(key).data);
+      },
+      async putJson(key, value) {
+        const data = Buffer.from(JSON.stringify(value));
+        objects.set(key, { data, size: data.length, json: value, lastModified: new Date() });
+      },
+      async getJson(key) {
+        const obj = objects.get(key);
+        return obj?.json ? { data: obj.json } : null;
+      },
+      async *list(prefix) {
+        for (const [key, obj] of objects.entries()) {
+          if (key.startsWith(prefix)) {
+            yield { key, size: obj.size, lastModified: obj.lastModified || new Date() };
+          }
+        }
+      },
+    };
+    const mockLogger = {
+      child() {
+        return this;
+      },
+      info() {},
+      warn() {},
+      error() {},
+      debug() {},
+    };
+
+    const clusterKey = "prod/_cluster/2026-03-10/20260310T120000Z.cluster";
+    const cfgKey = "prod/configsvr/_cluster/2026-03-10/20260310T120000Z.archive.gz";
+    const s1Key = "prod/shards/shard01/_cluster/2026-03-10/20260310T120000Z.archive.gz";
+
+    await mockStorage.putJson(clusterKey, { clusterTime: "1000:5" });
+    await writeManifest(mockStorage, {
+      version: 2,
+      type: "sharded-cluster-backup",
+      engine: "logical",
+      key: clusterKey,
+      database: "*",
+      createdAt: "2026-03-10T12:00:00.000Z",
+      completedAt: "2026-03-10T12:01:00.000Z",
+      durationMs: 60000,
+      size: 100,
+      sha256: "sharded-cluster",
+      compression: "gzip",
+      encryption: null,
+      oplog: true,
+      excludedCollections: [],
+      collections: {},
+      sharding: {
+        clusterTime: "1000:5",
+        configsvr: {
+          backupKey: cfgKey,
+          manifestKey: `${cfgKey}.manifest.json`,
+          host: "cfg/c1:27019",
+        },
+        shards: {
+          shard01: {
+            shardId: "shard01",
+            host: "shard01/s1:27018",
+            backupKey: s1Key,
+            status: "success",
+          },
+        },
+      },
+    });
+
+    await mockStorage.upload(cfgKey, Readable.from([Buffer.from("cfg")]));
+    await writeManifest(mockStorage, {
+      version: 2,
+      key: cfgKey,
+      database: "*",
+      createdAt: "2026-03-10T12:00:00.000Z",
+      completedAt: "2026-03-10T12:01:00.000Z",
+      durationMs: 1000,
+      size: 3,
+      sha256: "cfg",
+      compression: "gzip",
+      encryption: null,
+      oplog: true,
+      oplogWindow: { startTs: "1000:1", endTs: "1000:5" },
+      excludedCollections: [],
+      collections: {},
+    });
+
+    await mockStorage.upload(s1Key, Readable.from([Buffer.from("s1")]));
+    await writeManifest(mockStorage, {
+      version: 2,
+      key: s1Key,
+      database: "*",
+      createdAt: "2026-03-10T12:00:00.000Z",
+      completedAt: "2026-03-10T12:01:00.000Z",
+      durationMs: 1000,
+      size: 2,
+      sha256: "s1",
+      compression: "gzip",
+      encryption: null,
+      oplog: true,
+      oplogWindow: { startTs: "1000:1", endTs: "1000:5" },
+      excludedCollections: [],
+      collections: {},
+    });
+
     await expect(
-      engine.restore({
-        config: {
-          mongo: { uri: "mongodb://localhost:27017", database: "*" },
-          storage: { prefix: "p" },
-        },
-        storage: {},
-        logger: {
-          child: () => ({}),
-          info: () => {},
-          warn: () => {},
-          error: () => {},
-          debug: () => {},
-        },
-        pitr: "2026-03-10T12:00:00Z",
-      }),
-    ).rejects.toThrow("not supported for sharded cluster restores");
+      resolveShardedPitrPlan(mockStorage, { prefix: "prod", database: "*" }, "1010:1"),
+    ).rejects.toThrow("no oplog slices are available");
+
+    await uploadOplogSlice({
+      config: {
+        mongo: { uri: "mongodb://c1:27019", database: "*" },
+        storage: { prefix: "prod/configsvr" },
+      },
+      storage: mockStorage,
+      logger: mockLogger,
+      rawDocs: [
+        Buffer.from(
+          BSON.serialize({
+            ts: toBsonTimestamp({ t: 1008, i: 1 }),
+            op: "i",
+            ns: "config.databases",
+            o: { _id: "app" },
+          }),
+        ),
+      ],
+      startTs: { t: 1000, i: 6 },
+      endTs: { t: 1012, i: 1 },
+      previousEndTs: { t: 1000, i: 5 },
+    });
+
+    await uploadOplogSlice({
+      config: {
+        mongo: { uri: "mongodb://s1:27018", database: "*" },
+        storage: { prefix: "prod/shards/shard01" },
+      },
+      storage: mockStorage,
+      logger: mockLogger,
+      rawDocs: [
+        Buffer.from(
+          BSON.serialize({
+            ts: toBsonTimestamp({ t: 1009, i: 1 }),
+            op: "i",
+            ns: "app.users",
+            o: { _id: 1 },
+          }),
+        ),
+      ],
+      startTs: { t: 1000, i: 6 },
+      endTs: { t: 1012, i: 1 },
+      previousEndTs: { t: 1000, i: 5 },
+    });
+
+    const plan = await resolveShardedPitrPlan(
+      mockStorage,
+      { prefix: "prod", database: "*" },
+      "1010:1",
+    );
+    expect(plan.clusterBackupKey).toBe(clusterKey);
+    expect(plan.configsvrPlan.slices.length).toBe(1);
+    expect(plan.shardPlans.shard01.slices.length).toBe(1);
   });
 
   it("restarts cluster balancer in finally when restoreShardedCluster fails mid-restore", async () => {

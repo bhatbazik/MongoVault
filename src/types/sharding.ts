@@ -46,6 +46,7 @@ export interface ShardedRestoreOptions {
   storage: StorageClient;
   logger: Logger;
   ref?: string;
+  pitr?: string;
   signal?: AbortSignal;
   drop?: boolean;
   createMongoClient?: (uri: string) => MongoClient;
@@ -57,4 +58,6 @@ export interface ShardedRestoreResult {
   clusterTime: string;
   restoredShards: string[];
   configsvrRestored: boolean;
+  pitrTarget?: string;
+  replayedSlices?: number;
 }

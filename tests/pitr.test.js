@@ -1021,4 +1021,43 @@ describe("Continuous Oplog Archiver and PITR Restore Coordinator", () => {
     });
     expect(filteredPlan.slices.length).toBe(2);
   });
+
+  it("filters startIndexBuild, balancer settings, and strips UUID on system namespaces", async () => {
+    const { filterOplogSliceFile } = await import("../src/oplog.js");
+    const { Binary } = await import("mongodb");
+    const srcFile = path.join(tmpDir, "raw.bson");
+    const destFile = path.join(tmpDir, "filtered.bson");
+
+    const docs = [
+      {
+        ts: toBsonTimestamp({ t: 1000, i: 1 }),
+        op: "c",
+        ns: "app.$cmd",
+        o: { startIndexBuild: "users", indexes: [{ key: { email: 1 }, name: "email_1" }] },
+      },
+      {
+        ts: toBsonTimestamp({ t: 1000, i: 2 }),
+        op: "u",
+        ns: "config.settings",
+        o2: { _id: "balancer" },
+        o: { $set: { stopped: true } },
+      },
+      {
+        ts: toBsonTimestamp({ t: 1000, i: 3 }),
+        op: "i",
+        ns: "admin.system.users",
+        ui: new Binary(Buffer.alloc(16, 1), 4),
+        o: { _id: "admin.root", user: "root" },
+      },
+    ];
+    await fs.writeFile(srcFile, Buffer.concat(docs.map((d) => Buffer.from(BSON.serialize(d)))));
+
+    const { keptEntries } = await filterOplogSliceFile(srcFile, destFile);
+    expect(keptEntries).toBe(1);
+
+    const outBuf = await fs.readFile(destFile);
+    const outDoc = BSON.deserialize(outBuf, { promoteValues: false });
+    expect(outDoc.ns).toBe("admin.system.users");
+    expect(outDoc.ui).toBeUndefined();
+  });
 });
