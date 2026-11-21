@@ -248,7 +248,7 @@ src/
 ├── archive-stream.ts     # Zero-allocation mongodump --archive tap & collection streamer
 ├── backup.ts             # Logical backup coordinator and pipeline builder
 ├── restore.ts            # Restore pipeline, selective filters, pre-verification, recursive verify
-├── physical.ts           # Physical hot backup ($backupCursor / fsyncLock) & PBM 3/4-step recovery
+├── physical.ts           # Physical hot backup ($backupCursor / fsyncLock) & multi-step recovery
 ├── sharding.ts           # Sharded cluster coordinator, CsrsRestorer & cross-shard txn reconciliation
 ├── oplog.ts              # Continuous PITR oplog tailing, slicing, and plan resolution
 ├── oplog-applier.ts      # Stateful streaming OplogApplier, OplogFilter, IndexCatalog & TxnBuffer
@@ -654,7 +654,7 @@ The `physical` engine performs hot physical copies of raw WiredTiger storage eng
    - **>= 1.1× free space:** Extracts to a hidden staging directory, verifies SHA-256 & byte size, moves all existing entries (including `--directoryperdb` / `--wiredTigerDirectoryForIndexes` subdirectories) into a rollback directory, and swaps atomically.
    - **Small-disk mode (`< 1.1×` free, but `free + existing >= 1.1×`):** Runs zero-disk streaming pre-verification FIRST, then clears old data files and extracts directly into `targetDbPath` using 1× disk space.
    - **Insufficient disk space:** Fails fast before modifying any files.
-7. **PBM 3/4-Step WiredTiger & Replica Set Recovery (`PhysicalRecoveryCoordinator`):** Preserves `WiredTiger.backup` (removing only `mongod.lock`, `WiredTiger.lock`, `ongoingBackup.lock`) and boots ephemeral local `mongod` steps:
+7. **Multi-Step WiredTiger & Replica Set Recovery (`PhysicalRecoveryCoordinator`):** Preserves `WiredTiger.backup` (removing only `mongod.lock`, `WiredTiger.lock`, `ongoingBackup.lock`) and boots ephemeral local `mongod` steps:
    - For `$backupCursor` snapshots: writes `local.replset.minvalid` + `local.replset.oplogTruncateAfterPoint`, then runs `recoverFromOplogAsStandalone=true` + `takeUnstableCheckpointOnShutdown=true` to bring WiredTiger to the exact consistent point.
    - For `--pitr`: streams contiguous PITR oplog slices via `OplogApplier` (`unsafe: true`) and runs `buildPendingIndexes({ standalone: true })`.
    - Final cleanup (`resetRS`): clears `local.system.replset` via `deleteMany({})`, drops `config.cache.*`, `config.transactions`, `config.rangeDeletions`, and retries dropping `config.system.sessions`, then runs `fsync` and a graceful `shutdown({ force: false })` waiting for `mongod.lock` to clear.
@@ -714,7 +714,7 @@ The `sharded` engine coordinates consistent distributed backups, recursive verif
 7. **Sharded Restore & PITR (`restoreShardedCluster`):**
    - Validates HMAC manifest signature (failing closed if signed without keys), fails fast if any shard backup has `status !== "success"`, validates every backed-up shard maps to the target cluster topology, and drops existing user databases via `mongos` when `--drop` is set.
    - Restores CSRS routing metadata (`config.databases`, `config.collections`, `config.chunks`, `config.tags`, `config.settings`) via the zero-disk streaming **`CsrsRestorer`** (500-doc `bulkWrite` batches), preserving target `config.system.sessions` UUID and `balancer`/`automerge` settings.
-   - Restores base archives on all shards, streams bridging + PITR slices anchored via `baseKey` through per-node `OplogApplier` instances, executes **Percona-PBM cross-shard distributed transaction reconciliation** (`getTxnLeftovers` -> union cluster commits -> `handleUncommittedTxn`), builds deferred indexes, and runs `flushRouterConfig` on `mongos` and every shard primary.
+   - Restores base archives on all shards, streams bridging + PITR slices anchored via `baseKey` through per-node `OplogApplier` instances, executes **cross-shard distributed transaction reconciliation** (`getTxnLeftovers` -> union cluster commits -> `handleUncommittedTxn`), builds deferred indexes, and runs `flushRouterConfig` on `mongos` and every shard primary.
 
 #### Coordinated Multi-Shard Sequence
 
@@ -780,7 +780,7 @@ sequenceDiagram
 | **Impact on Primary**    | Minimal (`secondaryPreferred`)              | None (`$backupCursor`) / Lock (`fsyncLock`)     | Minimal (`secondaryPreferred` per shard)         |
 | **Restore Speed**        | Moderate (rebuilds indexes)                 | Maximum (raw file extract + WT recovery)        | Moderate (`CsrsRestorer` + parallel shards)      |
 | **Selective Restore**    | Yes (`--ns-include`/`--ns-exclude`/rename)  | No (full WiredTiger `dbPath`)                   | Yes (individual shard archives accessible)       |
-| **PITR Support**         | Yes (zero-disk streaming `OplogApplier`)    | Yes (PBM 3/4-step recovery + `OplogApplier`)    | Yes (CSRS + shard slices + cross-shard txn sync) |
+| **PITR Support**         | Yes (zero-disk streaming `OplogApplier`)    | Yes (multi-step recovery + `OplogApplier`)      | Yes (CSRS + shard slices + cross-shard txn sync) |
 | **Target MongoDB State** | Online and operational                      | **Must be stopped** (guarded via `mongod.lock`) | Target cluster online; balancer stopped          |
 
 ---
@@ -1828,7 +1828,7 @@ src/
 ├── archive-stream.ts     # Zero-allocation mongodump --archive tap & collection streamer
 ├── backup.ts             # Logical backup pipeline
 ├── restore.ts            # Restore pipeline, selective filters, recursive verification
-├── physical.ts           # WiredTiger $backupCursor / fsyncLock & PBM 3/4-step recovery
+├── physical.ts           # WiredTiger $backupCursor / fsyncLock & multi-step recovery
 ├── sharding.ts           # Coordinated multi-shard engine, CsrsRestorer & dist-txn sync
 ├── oplog.ts              # PITR archiver, tailer, streaming slice reader, plan resolver
 ├── oplog-applier.ts      # Stateful streaming OplogApplier, OplogFilter, IndexCatalog & TxnBuffer

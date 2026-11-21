@@ -12,7 +12,7 @@ const TXN_SPILL_THRESHOLD_BYTES = 8 * 1024 * 1024; // 8 MiB per-txn RAM cap befo
 const MAX_COMMIT_HISTORY = 100;
 
 /**
- * Config collections allowed during oplog replay (Percona PBM `configCollToKeep` + `settings`).
+ * Config collections allowed during oplog replay (`configCollToKeep` + `settings`).
  * All other `config.*` collections (locks, lockpings, mongos, cache.*, transactions, rangeDeletions,
  * system.sessions, system.preimages, actionlog, changelog, migrations) are excluded.
  */
@@ -270,7 +270,7 @@ function getFirstCommandKey(o?: Record<string, unknown>): string | null {
 }
 
 /**
- * PBM-faithful oplog namespace, config, sessions-UUID, and DDL sanitization filter.
+ * Streaming oplog namespace, config, sessions-UUID, and DDL sanitization filter.
  */
 export class OplogFilter {
   private readonly database?: string;
@@ -333,7 +333,7 @@ export class OplogFilter {
 
   /**
    * Filters `config.collections` and `config.chunks` routing records belonging to
-   * `config.system.sessions` (PBM `isRoutingDocExcluded`).
+   * `config.system.sessions`.
    */
   isRoutingDocExcluded(doc: OplogDoc): boolean {
     const ns = String(doc.ns || "");
@@ -496,7 +496,7 @@ export class OplogFilter {
       }
     }
 
-    // Database/collection cloning rewrite (PBM `cloneEntry`)
+    // Database/collection cloning rewrite
     if (this.clone) {
       const { fromDb, toDb, fromColl, toColl } = this.clone;
       const ns = String(doc.ns || "");
@@ -535,7 +535,6 @@ export class OplogFilter {
 /**
  * Tracks index creations, drops, renames, and collMod changes observed during oplog replay
  * so they can be cleanly executed via `createIndexes` commands (MongoDB 4.4–8.0 safe).
- * Mirrors `pbm/idx/catalog.go`.
  */
 export class IndexCatalog {
   private readonly catalog = new Map<string, Map<string, Record<string, unknown>>>();
@@ -788,15 +787,15 @@ export interface OplogApplierOptions {
   endTs?: OplogTimestamp;
   filter?: OplogFilterOptions;
   backupType?: "logical" | "physical";
-  /** If true, ignores DuplicateKey on `config.chunks` during unsafe/physical replay (PBM-818). */
+  /** If true, ignores DuplicateKey on `config.chunks` during unsafe/physical replay. */
   unsafe?: boolean;
 }
 
 /**
- * Stateful, streaming, Percona-PBM-grade oplog applier.
+ * Stateful, streaming oplog applier.
  * Handles multi-slice transactions, cross-shard distributed transaction reconciliation,
  * modern index DDL (`commitIndexBuild`/`createIndexes`/`collMod`), UUID rules,
- * `config.system.sessions` isolation, `system.views` creation (PBM-921), and
+ * `config.system.sessions` isolation, `system.views` creation, and
  * time-series bucket TTL delta edge cases.
  */
 export class OplogApplier {
@@ -908,7 +907,7 @@ export class OplogApplier {
 
   /**
    * Reconciles prepared/uncommitted distributed transactions against the union of
-   * committed transaction IDs reported by all shards (PBM `HandleUncommittedTxn`).
+   * committed transaction IDs reported by all shards.
    */
   async handleUncommittedTxn(
     clusterCommits: Map<string, OplogTimestamp | null>,
@@ -1184,7 +1183,7 @@ export class OplogApplier {
         case "create": {
           const targetColl = String(o.create || "");
           this.indexCatalog.dropCollection(dbName, targetColl);
-          // PBM pattern: ensure idempotent create when replaying onto existing collection
+          // Ensure idempotent create when replaying onto existing collection
           await this.target
             .applyOps([{ op: "c", ns: `${dbName}.$cmd`, o: { drop: targetColl } }])
             .catch(() => {});
@@ -1192,7 +1191,7 @@ export class OplogApplier {
         }
       }
     } else if (op.op === "i" && collName === "system.views") {
-      // PBM-921: ensure system.views exists before inserting views / timeseries metadata
+      // Ensure system.views exists before inserting views / timeseries metadata
       await this.target.ensureSystemViews(dbName);
     }
 
@@ -1219,7 +1218,7 @@ export class OplogApplier {
         return;
       }
 
-      // PBM-818: allow duplicate key on config.chunks in unsafe/physical replay
+      // Allow duplicate key on config.chunks in unsafe/physical replay
       const errCode = (err as { code?: number })?.code;
       if (this.unsafe && cleanOp.ns === "config.chunks" && errCode === 11000) {
         this.skippedEntries++;

@@ -137,7 +137,7 @@ export { matchesNamespacePattern };
 /**
  * Streaming filter over a raw BSON oplog file (O(1) RAM — never loads whole file into memory).
  * Removes system/no-op entries, enforces timeframe `[startTs, startExclusiveTs, targetTs]`
- * and PBM namespace/config/sessions/UUID rules. Returns the number of kept entries.
+ * and namespace/config/sessions/UUID rules. Returns the number of kept entries.
  */
 export async function filterOplogSliceFile(
   srcBsonFile: string,
@@ -733,7 +733,7 @@ export async function captureOplogSlice({
 
         if (!firstTs) {
           firstTs = docTs;
-          // Post-cursor sufficiency check (Percona PBM pattern): verify that local.oplog.rs
+          // Post-cursor sufficiency check: verify that local.oplog.rs
           // did not roll over past cursorStartTs between the initial check and cursor positioning.
           if (!gapDetected && cursorStartTs) {
             const postCursorOldestDoc = await oplog

@@ -30,7 +30,7 @@ import type {
 } from "./types/restore.js";
 
 /**
- * System namespaces excluded during full-cluster logical restores (matching Percona PBM)
+ * System namespaces excluded during full-cluster logical restores
  * so target cluster metadata, sessions, active transaction tables, and FCV are never clobbered.
  */
 export const CLUSTER_SYSTEM_NS_EXCLUDE = [

@@ -300,7 +300,7 @@ function binaryToHex(value: unknown): string | null {
 }
 
 /**
- * Percona-PBM-grade zero-disk streaming Config Server (CSRS) metadata restorer.
+ * Zero-disk streaming Config Server (CSRS) metadata restorer.
  * Streams `config.databases`, `config.collections`, `config.chunks`, `config.tags`,
  * and `config.settings` directly from the compressed/encrypted configsvr archive in
  * 500-document `bulkWrite` batches while preserving target `config.system.sessions`
@@ -1214,7 +1214,7 @@ function collectOrderedSliceKeys(
 
 /**
  * Restores a sharded cluster backup, with optional Point-in-Time Recovery (PITR),
- * programmatic CSRS restore, zero-disk streaming oplog replay, and Percona-PBM
+ * programmatic CSRS restore, zero-disk streaming oplog replay, and
  * cross-shard distributed transaction reconciliation.
  */
 export async function restoreShardedCluster({
@@ -1513,7 +1513,7 @@ export async function restoreShardedCluster({
         );
         replayedSlices = totalSlicesToReplay;
 
-        // Percona PBM cross-shard distributed transaction reconciliation:
+        // Cross-shard distributed transaction reconciliation:
         // Union all committed distributed txns across shards/configsvr, then resolve
         // any buffered prepared/uncommitted txns on every node.
         const clusterCommits = new Map<string, OplogTimestamp | null>();

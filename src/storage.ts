@@ -62,7 +62,6 @@ export function isLockActive(record: LockRecord | undefined | null, now = Date.n
 /**
  * Computes an S3 multipart `partSize` and RAM-safe `queueSize` so large uploads (up to 5 TiB)
  * never exceed AWS S3's 10,000-part limit while keeping memory bounded on small instances.
- * Mirrors Percona PBM `storage.ComputePartSize`.
  */
 export function computeS3UploadParams(
   configuredPartSize: number,

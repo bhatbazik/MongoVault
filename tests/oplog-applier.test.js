@@ -32,7 +32,7 @@ function createFakeTarget() {
   };
 }
 
-describe("OplogFilter & OplogApplier (Percona PBM semantics)", () => {
+describe("OplogFilter & OplogApplier", () => {
   it("filters config.* allowlist, balancer/automerge, config.system.sessions UUID, and clones renamed DBs", () => {
     const sessionsUuid = new Binary(Buffer.from("00112233445566778899aabbccddeeff", "hex"), 4);
     const otherUuid = new Binary(Buffer.from("ffeeddccbbaa99887766554433221100", "hex"), 4);

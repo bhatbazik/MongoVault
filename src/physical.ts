@@ -544,7 +544,7 @@ export async function runPhysicalBackup({
       throw new Error(`No WiredTiger files found under dbPath: ${activeDbPath}`);
     }
 
-    // Percona PBM pattern: stream .wt data files first, then call $backupCursorExtend
+    // Stream .wt data files first, then call $backupCursorExtend
     // to extend the pinned journal set up to majority committed opTime, and stream
     // ONLY the cursor-pinned journal files (never blind fs.readdir when extended).
     let extendedToTs: OplogTimestamp | null = null;
@@ -868,7 +868,7 @@ async function waitForLockFileCleared(dbPath: string, timeoutMs = 15_000): Promi
 }
 
 /**
- * Coordinates Percona-PBM-grade 3/4-step WiredTiger & Replica Set physical recovery:
+ * Coordinates multi-step WiredTiger & Replica Set physical recovery:
  * 1. Prepare `local.replset.minvalid` & `local.replset.oplogTruncateAfterPoint` (for `$backupCursor` snapshots).
  * 2. Boot with `recoverFromOplogAsStandalone=true` + `takeUnstableCheckpointOnShutdown=true` so WiredTiger
  *    replays the pinned journal + oplog to the exact consistent point.
@@ -1044,7 +1044,7 @@ export class PhysicalRecoveryCoordinator {
         .catch(() => {}),
     ]);
 
-    // Drop config.cache.* metadata collections (matching PBM)
+    // Drop config.cache.* metadata collections to ensure clean cluster state
     try {
       const cacheColls = await configDb
         .listCollections({ name: /^cache\./ }, { nameOnly: true })
@@ -1165,7 +1165,7 @@ async function verifyPhysicalArchiveZeroDisk(
 /**
  * Restores a physical WiredTiger hot backup directly into a target dbPath,
  * with small-disk awareness (1x-disk direct mode after zero-disk pre-verification),
- * PBM 3/4-step WiredTiger/RS recovery, and optional streaming PITR oplog replay.
+ * multi-step WiredTiger/RS recovery, and optional streaming PITR oplog replay.
  */
 export async function restorePhysicalBackup({
   config,
@@ -1392,7 +1392,7 @@ export async function restorePhysicalBackup({
     "Physical restore extracted successfully",
   );
 
-  // Run PBM 3/4-step WiredTiger recovery + optional PITR replay + RS state cleanup
+  // Run multi-step WiredTiger recovery + optional PITR replay + RS state cleanup
   let replayedEntries = 0;
   if (!skipRecovery) {
     const recoveryCtx: PhysicalRecoveryContext = {

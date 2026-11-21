@@ -55,7 +55,7 @@ export interface PhysicalRestoreOptions {
   signal?: AbortSignal;
   /**
    * Test-only hook to bypass booting an ephemeral `mongod` for WiredTiger/RS recovery.
-   * Defaults to `false` (full PBM 3/4-step recovery always runs in production).
+   * Defaults to `false` (full multi-step recovery always runs in production).
    */
   skipRecovery?: boolean;
   /**
