@@ -121,7 +121,7 @@ export async function writeManifest(
       manifest.encryption.manifestHmac = hmac;
     }
   }
-  await storage.putJson(manifestKey(manifest.key), manifest);
+  await storage.putJson(manifestKey(manifest.key), manifest, { immutable: true });
 }
 
 /**

@@ -21,6 +21,8 @@ export interface ManifestOplogWindow {
   previousEndTs?: string | null;
   startTs: string;
   endTs: string;
+  coverageStartTs?: string;
+  coverageEndTs?: string;
   entries?: number;
   gapDetected?: boolean;
 }
@@ -32,9 +34,18 @@ export interface PhysicalBackupFile {
   size: number;
 }
 
+export interface PhysicalStorageOptions {
+  directoryPerDB?: boolean;
+  directoryForIndexes?: boolean;
+  journalCompressor?: string;
+  blockCompressor?: string;
+}
+
 export interface PhysicalBackupMeta {
   dbPath?: string;
   cursorType?: "$backupCursor" | "fsyncLock";
+  mongoVersion?: string;
+  storageOptions?: PhysicalStorageOptions;
   filesCount?: number;
   files: PhysicalBackupFile[];
   checkpointTimestamp?: string;
@@ -48,6 +59,7 @@ export interface ShardedClusterShardBackup {
   backupKey: string;
   manifestKey: string;
   bridgingSliceKey?: string;
+  bridgingSliceKeys?: string[];
   status: "success" | "failed";
   size?: number;
 }
@@ -58,6 +70,8 @@ export interface ShardedClusterMeta {
     backupKey: string;
     manifestKey: string;
     host?: string;
+    bridgingSliceKey?: string;
+    bridgingSliceKeys?: string[];
   };
   shards: Record<string, ShardedClusterShardBackup>;
 }
