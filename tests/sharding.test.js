@@ -616,4 +616,107 @@ describe("multi-shard cluster coordinator", () => {
 
     expect(balancerStarted).toBe(true);
   });
+
+  it("fails closed in restoreShardedCluster when target topology is missing a backed-up shard mapping", async () => {
+    const { restoreShardedCluster } = await import("../src/sharding.js");
+
+    const mockClient = {
+      async connect() {},
+      async close() {},
+      db(name) {
+        if (name === "admin") {
+          return {
+            async command(cmd) {
+              if (cmd.hello || cmd.isMaster) return { msg: "isdbgrid", me: "mongos:27017" };
+              if (cmd.balancerStatus) return { mode: "off", inBalancerRound: false };
+              return { ok: 1 };
+            },
+          };
+        }
+        if (name === "config") {
+          return {
+            collection() {
+              return {
+                find() {
+                  return this;
+                },
+                async toArray() {
+                  // Target cluster only has shard01, missing shard02
+                  return [{ _id: "shard01", host: "shard01/target-s1:27018" }];
+                },
+              };
+            },
+          };
+        }
+        return {};
+      },
+    };
+
+    const manifest = {
+      version: 2,
+      type: "sharded-cluster-backup",
+      engine: "logical",
+      key: "prod/2026-03-10/20260310T120000Z.cluster",
+      database: "*",
+      sharding: {
+        clusterTime: "1774092000:5",
+        configsvr: {
+          backupKey: "cfg-key",
+          manifestKey: "cfg-key.manifest.json",
+          host: "cfg/c1:27019",
+        },
+        shards: {
+          shard01: {
+            shardId: "shard01",
+            host: "shard01/source-s1:27018",
+            backupKey: "s1-key",
+            manifestKey: "s1-key.manifest.json",
+            status: "success",
+          },
+          shard02: {
+            shardId: "shard02",
+            host: "shard02/source-s2:27018",
+            backupKey: "s2-key",
+            manifestKey: "s2-key.manifest.json",
+            status: "success",
+          },
+        },
+      },
+    };
+
+    const mockStorage = {
+      async getJson() {
+        return { data: manifest };
+      },
+    };
+    const mockLogger = {
+      child() {
+        return this;
+      },
+      info() {},
+      warn() {},
+      error() {},
+      debug() {},
+    };
+
+    let restoreInvoked = false;
+    await expect(
+      restoreShardedCluster({
+        config: {
+          mongo: { uri: "mongodb://mongos:27017", database: "*" },
+          storage: { prefix: "prod" },
+        },
+        storage: mockStorage,
+        logger: mockLogger,
+        ref: manifest.key,
+        createMongoClient: () => mockClient,
+        restoreRunner: async () => {
+          restoreInvoked = true;
+          return {};
+        },
+      }),
+    ).rejects.toThrow(/missing mapping for shard "shard02"/);
+
+    expect(restoreInvoked).toBe(false);
+  });
 });

@@ -19,6 +19,7 @@ export interface ConfigServerInfo {
 
 export interface ClusterTopology {
   isSharded: boolean;
+  hasConfigShard?: boolean;
   mongosHost?: string;
   configsvr?: ConfigServerInfo;
   shards: ShardInfo[];
