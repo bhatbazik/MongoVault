@@ -100,12 +100,12 @@ Traditional database backup tools stage full database dumps onto local disk befo
 
 MongoVault eliminates intermediate disk staging entirely. It treats backup and restore operations as continuous, backpressured stream pipelines.
 
-- **During Backup:** Data emitted by MongoDB (`mongodump --archive --gzip` or WiredTiger `$backupCursor`) is piped directly through memory into chunked authenticated encryption (`aes-256-gcm-chunked`), an inline SHA-256 digest calculator, and straight into an AWS S3 multipart upload (or mounted filesystem). Memory buffers are governed by Node.js stream backpressure (`highWaterMark: 1 MiB`), keeping in-flight streaming buffer memory bounded (~65 MiB buffer memory under default configuration).
-- **During Restore:** Encrypted data is pulled as a byte stream from S3 or disk, verified against per-chunk AEAD authentication tags in 64 KiB frames, decrypted, decompressed, and fed straight into `mongorestore` or a POSIX UStar tar extractor.
+- **During Backup:** Data emitted by MongoDB (`mongodump` archive stream or WiredTiger `$backupCursor` TAR stream) is piped directly through memory into gzip compression, chunked authenticated encryption (`aes-256-gcm-chunked`), an inline SHA-256 digest calculator, and straight into an AWS S3 multipart upload (or mounted filesystem). Memory buffers are governed by Node.js stream backpressure (`highWaterMark: 1 MiB`), and S3 multipart sizing auto-scales `partSize` (up to 512 MiB) while clamping `queueSize = 1` on large part sizes so multi-terabyte backups succeed safely on small-RAM, small-disk hosts.
+- **During Restore:** Encrypted data is pulled as a resumable byte stream (with automatic HTTP `Range` + `IfMatch` resume on S3 drops), verified against per-chunk AEAD authentication tags in 64 KiB frames (rejecting trailing bytes or truncation), decrypted, decompressed, and fed straight into `mongorestore`, the native streaming `OplogApplier`, `CsrsRestorer`, or the POSIX UStar/PAX tar extractor.
 
 > [!NOTE]
-> **Diskless Architecture Scope & PITR Qualification:**
-> The primary backup streaming pipeline, base restore pipeline, physical hot copy, and verification engine are strictly **zero-temporary-disk**. However, incremental Point-in-Time Recovery (PITR) slice replay temporarily stages individual uncompressed oplog slices to `WORK_DIR` as ephemeral `.pitr-slice-<uuid>.oplog.bson` files. This is required because `mongorestore` mandates a seekable filesystem path when using `--oplogFile` with `--oplogLimit`. Each slice file is deleted immediately upon replay completion.
+> **Zero-Temporary-Disk Architecture Scope:**
+> The backup streaming pipeline, base restore pipeline, physical hot copy, verification engine, CSRS metadata restore, and **continuous Point-in-Time Recovery (PITR) oplog slice replay** are all **zero-temporary-disk** streaming pipelines. `WORK_DIR` is used only for atomic PID lockfiles, ephemeral `0o600` URI config files for `mongodump`/`mongorestore`, and automatic disk-spilling if a single multi-document transaction exceeds the 8 MiB per-transaction RAM cap during PITR replay (spill files are unlinked immediately on commit/dispose).
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
@@ -138,7 +138,7 @@ MongoVault eliminates intermediate disk staging entirely. It treats backup and r
 When a backup is requested (via cron, daemon startup, or CLI):
 
 1. **Locking:** MongoVault acquires a local atomic PID lockfile and a distributed lease object in storage (`.locks/backup.lock.json`) with automated background heartbeat renewal to ensure single-writer exclusivity.
-2. **Topology Discovery & Strategy Selection:** The engine inspects the target MongoDB instance, verifying cluster topology (standalone, replica set, or sharded cluster), feature compatibility, and whether logical, physical, snapshot, or sharded backup is specified.
+2. **Topology Discovery & Strategy Selection:** The engine inspects the target MongoDB instance, verifying cluster topology (standalone, replica set, or sharded cluster), feature compatibility, and whether `logical`, `physical`, or `sharded` backup is specified.
 3. **Boundary Recording:** If oplog capture or Point-in-Time Recovery is active, MongoVault inspects `local.oplog.rs` and the replica set majority commit point (`lastCommittedOpTime`) to record the exact transaction boundaries.
 4. **Streaming Transformation:** The selected engine initiates data extraction, passing chunks through gzip compression, AEAD chunk encryption using a freshly generated 256-bit Data Encryption Key (DEK), and SHA-256 hashing.
 5. **Atomic Storage & Manifest Finalization:** The stream is uploaded in parts. When complete, MongoVault verifies the uploaded size against storage headers (`head`), generates a cryptographic manifest (`.manifest.json`) containing collection document counts and SHA-256 checksums, signs the manifest with HMAC-SHA256, and writes it to storage.
@@ -152,7 +152,7 @@ When a restore is requested:
 2. **Pre-Verification Safety Gate:** If `--drop` is specified (dropping target collections), MongoVault streams and verifies the archive's SHA-256 checksum, chunk tags, and gzip integrity _before_ touching existing database collections.
 3. **Namespace Remapping & Filtering:** Restore parameters (`--ns-include`, `--ns-exclude`, `--database`) are dynamically translated into `mongorestore` arguments or database renames.
 4. **Zero-Disk Ingestion:** Data is streamed from storage, decrypted and authenticated frame-by-frame, decompressed, and ingested directly into MongoDB over the wire.
-5. **Point-in-Time Oplog Splicing (if `--pitr` is requested):** After restoring the base dump, MongoVault identifies, downloads, decrypts, and sequentially replays contiguous incremental oplog slices up to the exact target second and ordinal limit.
+5. **Point-in-Time Oplog Splicing (if `--pitr` is requested):** After restoring the base dump, MongoVault resolves a contiguous oplog plan, streams each slice through decrypt/gunzip into the stateful `OplogApplier` (0 temporary slice files), reconciles multi-slice transactions, and rebuilds deferred indexes up to the exact target second and ordinal limit.
 
 ### Core Capabilities
 
@@ -245,11 +245,16 @@ src/
 ├── cli.ts                # CLI parser, command registry lookup, help formatter
 ├── config.ts             # Configuration parsing, type coercion, Zod validation
 ├── engines.ts            # BackupEngineStrategy interface and EngineRegistry
+├── archive-stream.ts     # Zero-allocation mongodump --archive tap & collection streamer
 ├── backup.ts             # Logical backup coordinator and pipeline builder
-├── restore.ts            # Restore pipeline, selective filters, pre-verification
-├── physical.ts           # Physical hot backup via $backupCursor / fsyncLock
-├── sharding.ts           # Sharded cluster backup coordinator & balancer control
-├── oplog.ts              # Continuous PITR oplog tailing, slicing, and replay
+├── restore.ts            # Restore pipeline, selective filters, pre-verification, recursive verify
+├── physical.ts           # Physical hot backup ($backupCursor / fsyncLock) & PBM 3/4-step recovery
+├── sharding.ts           # Sharded cluster coordinator, CsrsRestorer & cross-shard txn reconciliation
+├── oplog.ts              # Continuous PITR oplog tailing, slicing, and plan resolution
+├── oplog-applier.ts      # Stateful streaming OplogApplier, OplogFilter, IndexCatalog & TxnBuffer
+├── check.ts              # Preflight verification (tools, MongoDB, oplog, txns, physical, sharding, storage)
+├── status.ts             # Real-time topology, storage, lock, and PITR contiguity status
+├── diagnostic.ts         # Sanitized diagnostic bundle exporter (URI credential redaction)
 ├── crypto.ts             # AES-256-GCM chunked AEAD, key wrapping, HMAC signing
 ├── stream.ts             # Variadic pipeline executor and backpressure runner
 ├── digest.ts             # In-flight SHA-256 hashing and byte count transform
@@ -412,7 +417,7 @@ The following chronological sequence occurs when executing a backup (`mongodb-ba
 3. **Lock Acquisition:** `acquireHybridLock()` executes:
    - Creates a local lockfile (`${WORK_DIR}/.backup.lock`) using `flag: "wx"`. If locked, it inspects the holding PID and file modification time; stale locks are taken over via atomic rename.
    - If storage supports locking, acquires a distributed lease (`<prefix>/.locks/backup.lock.json`) via an S3 conditional PUT (`IfNoneMatch: "*"`). Spawns a background unref'd heartbeat timer to renew the lease every 30 seconds.
-4. **Engine Resolution:** `EngineRegistry.resolveForBackup()` selects the strategy (`logical`, `physical`, `snapshot`, or `sharded`).
+4. **Engine Resolution:** `EngineRegistry.resolveForBackup()` selects the strategy (`logical`, `physical`, or `sharded`).
 5. **Pre-Dump Metadata & Oplog Bounds:** For logical backups with oplog capture, MongoVault connects to MongoDB and queries `local.oplog.rs` for initial timestamp bounds (`preOplog`).
 6. **Subprocess Spawning with Credential Protection:** MongoVault writes the MongoDB connection URI into an ephemeral YAML configuration file (`${WORK_DIR}/.<uuid>.yaml`, mode `0o600`), and spawns `mongodump` passing `--config=<file>`. This ensures database credentials are never visible in system process tables (`ps aux`).
 7. **Pipeline Assembly & Streaming Execution:**
@@ -561,11 +566,10 @@ When executing a point-in-time restore (`mongodb-backup restore --pitr "2026-03-
    - It lists all archived `.oplog.bson.gz` slices covering the window between the base backup commit point and the target timestamp.
    - It verifies continuity across slice manifests: each slice's `previousEndTs` must match or overlap the prior slice's `endTs`. If an oplog rollover gap is detected, execution halts with an error.
 3. **Stage 1 (Base Dump Restore):** The base backup archive is restored using the standard restore pipeline, establishing the database state at the base snapshot time.
-4. **Stage 2 (Sequential Slice Replay):**
-   - For each verified slice, MongoVault downloads the encrypted slice and extracts it to an isolated temporary BSON file in `WORK_DIR` (`.pitr-slice-<uuid>.oplog.bson`).
-   - It invokes `mongorestore --oplogReplay --oplogLimit=<target> --oplogFile=<sliceFile>`.
-   - `mongorestore` applies oplog operations idempotently up to the target timestamp.
-   - The temporary slice file is securely removed immediately after replay.
+4. **Stage 2 (Zero-Disk Streaming Slice Replay):**
+   - For each verified slice, MongoVault opens a streaming pipeline (`streamOplogSlice`: download -> SHA-256 digest -> AEAD frame decrypt -> gunzip) directly into the stateful `OplogApplier` (`src/oplog-applier.ts`) with **zero temporary slice files on disk**.
+   - `OplogApplier` enforces `startExclusiveTs` (avoiding re-applying ops already replayed from the base archive) and inclusive `endTs`, distinguishes retryable single-document writes from multi-document transactions, buffers multi-slice `partialTxn` operations (automatically spilling single transactions > 8 MiB to `WORK_DIR`), tracks DDL index operations (`commitIndexBuild` / `createIndexes` / `dropIndexes` / `collMod`) in `IndexCatalog`, applies namespace/UUID/rename rules, and runs `applyOps` with `bypassDocumentValidation: true`.
+   - After the final slice completes, `OplogApplier.buildPendingIndexes()` builds all surviving post-backup indexes.
 5. **Completion:** MongoVault logs the total number of replayed slices and operations.
 
 ---
@@ -602,11 +606,11 @@ The `logical` engine is MongoVault's default backup mechanism. It executes `mong
 
 #### How it works internally
 
-1. Spawns `mongodump` with `--archive --gzip` and writes database connection options to a temporary YAML config.
-2. In cluster-wide backups (`MONGODB_DATABASE=*`), `--oplog` captures all oplog entries written during the dump, ensuring point-in-time consistency.
-3. Collection dumping concurrency is tuned via `--numParallelCollections`.
+1. Writes database connection options to a temporary `0o600` YAML config and performs a lightweight pre-backup database size estimate so S3 multipart upload can auto-scale `partSize` for large databases.
+2. In cluster-wide backups (`MONGODB_DATABASE=*`) with `--oplog`, spawns `mongodump --oplog --archive` and streams the uncompressed archive through a zero-allocation `ArchiveOplogTap` (`src/archive-stream.ts`) before `zlib.createGzip()`. This extracts the exact embedded oplog bounds (`firstTs`, `lastTs`, `entries`) in O(1) RAM so `manifest.oplogWindow.endTs` matches the exact last embedded oplog entry with zero post-dump timeline gap.
+3. Collection dumping concurrency is tuned via `--numParallelCollections`, and `--readPreference` is only appended if not already specified in `MONGODB_URI`.
 4. Parses `mongodump` stderr output in real time to capture per-collection document counts for the manifest.
-5. Uploads the stream in multipart parts directly to storage.
+5. On restore, passes `--bypassDocumentValidation`, `--preserveUUID` (when `--drop` is active without DB rename), splits comma-separated `--ns-include`/`--ns-exclude` into repeated flags, and excludes internal system namespaces (`CLUSTER_SYSTEM_NS_EXCLUDE`) on non-oplog full-cluster drops.
 
 #### Interaction with MongoDB
 
@@ -638,17 +642,22 @@ The `physical` engine performs hot physical copies of raw WiredTiger storage eng
 
 #### How it works internally
 
-1. Connects to `admin` database and invokes the WiredTiger backup cursor:
+1. Connects to `admin`, records `mongoVersion` (`buildInfo`) and WiredTiger storage options (`directoryPerDB`, `directoryForIndexes`, `journalCompressor`, `blockCompressor`) from `getCmdLineOpts`, and invokes the WiredTiger backup cursor:
    ```javascript
    db.adminCommand({ aggregate: 1, pipeline: [{ $backupCursor: {} }], cursor: {} });
    ```
-2. The cursor locks the checkpoint and returns an ordered list of active database files (e.g., `WiredTiger.wt`, `collection-*.wt`, `index-*.wt`).
-3. If checkpoint conflicts occur (MongoDB error code `50915` or `50917`), MongoVault applies linear backoff retries (`(attempt + 1) * 1s`, up to 10 attempts).
-4. If supported by MongoDB, extended journal files are requested via `$backupCursorExtend` after all `.wt` data files are streamed, along with `journal/WiredTigerLog*` files, to record write changes that occur during file copying.
-5. In standalone instances or engines without `$backupCursor` support, it falls back to `db.fsyncLock()`.
-6. Files are packed on the fly into standard 512-byte POSIX UStar tar headers (`src/tar.ts`), compressed with gzip, encrypted, and uploaded to storage without creating an intermediate tarball on disk.
-7. An asynchronous keep-alive timer pings the cursor every 45 seconds to prevent MongoDB from timing out the backup cursor during large uploads.
-8. On PITR physical restore, an ephemeral `mongod` is booted on `targetDbPath` (supporting `PHYSICAL_ENCRYPTION_KEY_FILE` and `PHYSICAL_DIRECTORY_PER_DB`) with `ttlMonitorEnabled=false`, `disableLogicalSessionCacheRefresh=true`, and `takeUnstableCheckpointOnShutdown=true`, clears stale replica-set coordination state, replays filtered oplog slices, and shuts down cleanly.
+2. The cursor pins the checkpoint and returns an ordered list of active database files (e.g., `WiredTiger.wt`, `collection-*.wt`, `index-*.wt`). If checkpoint conflicts occur (error code `50915` or `50917`), MongoVault applies linear backoff retries (`(attempt + 1) * 1s`, up to 10 attempts).
+3. In standalone instances or Community servers without `$backupCursor`, it falls back to `db.fsyncLock()`, checks `config.transactions` for active transactions, captures the exact `local.oplog.rs` boundary while locked, verifies `fsyncUnlock` on completion, and streams all WiredTiger files.
+4. Files are packed on the fly into POSIX UStar / PAX extended TAR headers (`src/tar.ts`, supporting paths > 255 UTF-8 bytes and files > 8 GiB via GNU base-256), compressed with gzip, encrypted, and uploaded straight to storage. If a live `.wt` file shrinks during read, backup fails loudly rather than zero-padding corrupted B-tree pages.
+5. After all `.wt` data files finish streaming, MongoVault queries majority `lastCommittedOpTime` and calls `$backupCursorExtend` to fetch and stream only the cursor-pinned journal files covering up to the majority timestamp. An asynchronous keep-alive timer pings `$backupCursor` every 45 seconds and aborts the backup immediately if the cursor is lost.
+6. **Physical Restore & Small-Disk 1x Mode:** Before touching disk, `restorePhysicalBackup` checks for a non-empty `mongod.lock` (refusing to overwrite a live `mongod`), validates `major.minor` version compatibility against local `mongod`, and inspects free space via `fs.statfs()`:
+   - **>= 1.1× free space:** Extracts to a hidden staging directory, verifies SHA-256 & byte size, moves all existing entries (including `--directoryperdb` / `--wiredTigerDirectoryForIndexes` subdirectories) into a rollback directory, and swaps atomically.
+   - **Small-disk mode (`< 1.1×` free, but `free + existing >= 1.1×`):** Runs zero-disk streaming pre-verification FIRST, then clears old data files and extracts directly into `targetDbPath` using 1× disk space.
+   - **Insufficient disk space:** Fails fast before modifying any files.
+7. **PBM 3/4-Step WiredTiger & Replica Set Recovery (`PhysicalRecoveryCoordinator`):** Preserves `WiredTiger.backup` (removing only `mongod.lock`, `WiredTiger.lock`, `ongoingBackup.lock`) and boots ephemeral local `mongod` steps:
+   - For `$backupCursor` snapshots: writes `local.replset.minvalid` + `local.replset.oplogTruncateAfterPoint`, then runs `recoverFromOplogAsStandalone=true` + `takeUnstableCheckpointOnShutdown=true` to bring WiredTiger to the exact consistent point.
+   - For `--pitr`: streams contiguous PITR oplog slices via `OplogApplier` (`unsafe: true`) and runs `buildPendingIndexes({ standalone: true })`.
+   - Final cleanup (`resetRS`): clears `local.system.replset` via `deleteMany({})`, drops `config.cache.*`, `config.transactions`, `config.rangeDeletions`, and retries dropping `config.system.sessions`, then runs `fsync` and a graceful `shutdown({ force: false })` waiting for `mongod.lock` to clear.
 
 #### Execution Lifecycle State Machine
 
@@ -686,26 +695,26 @@ stateDiagram-v2
 
 ---
 
-### 3. Sharded Cluster Engine (`sharded` — Experimental)
+### 3. Sharded Cluster Engine (`sharded`)
 
 #### What it is
 
-The `sharded` engine acts as a coordinator across a MongoDB Sharded Cluster (`mongos`, Config Servers, and Shard Replica Sets). It is currently classified as **Experimental** pending a dedicated cross-shard atomic freeze protocol and integration test harness.
-
-> [!IMPORTANT]
-> **Consistency Boundary:** Stopping chunk balancing prevents chunk migration anomalies, and capturing `$clusterTime` anchors oplog replay limits on restore. However, obtaining `$clusterTime` from a ping does **not** stop client application writes or freeze multi-shard distributed transactions. For strict zero-skew cross-shard ACID consistency on production clusters with active writes, application writes should be quiesced during the backup window or cloud volume snapshots should be used.
+The `sharded` engine coordinates consistent distributed backups, recursive verification, and Point-in-Time Recovery across a MongoDB Sharded Cluster (`mongos`, Config Server Replica Set / CSRS, and Shard Replica Sets).
 
 #### How it works internally
 
-1. Connects to `mongos` and executes `hello` / `isMaster` to confirm cluster topology (`msg: "isdbgrid"`).
-2. Queries `config.shards` to discover all shard replica set connection addresses.
-3. Stops the cluster balancer via `db.adminCommand({ balancerStop: 1 })` and polls `balancerStatus` until all in-flight chunk migrations are fully drained.
-4. Captures the cluster-wide logical time (`$clusterTime`) via an admin ping command.
-5. Backs up Config Server metadata under `<prefix>/configsvr` and all shard replica sets in **parallel** under `<prefix>/shards/<shardId>` with `oplog: true`, deriving direct shard URIs with preserved credentials via `buildShardUri()`.
-6. Computes the common `clusterTime` across all shards and captures bridging oplog slices for any shard whose dump finished earlier.
-7. Restarts the cluster balancer via `db.adminCommand({ balancerStart: 1 })` (and guarantees restart in `finally` on both backup and restore).
-8. Writes a unified `.cluster` manifest binding the Config Server and shard backup manifests to the recorded cluster timestamp.
-9. Supports continuous sharded PITR archiving (`captureShardedOplogSlices` across `configsvr` + all shards) and fail-closed sharded PITR restore (`resolveShardedPitrPlan` + `restoreShardedCluster` with `--pitr`).
+1. Connects to `mongos` and executes `hello` / `isMaster` to confirm cluster topology (`msg: "isdbgrid"`), queries `config.shards` and `getShardMap` to discover CSRS and shard replica sets, and guards against unsupported Embedded Config Shard-only clusters (`_id: "config"` with no dedicated shards).
+2. Stops the cluster balancer via `balancerStop` (with `maxTimeMS`) and polls `balancerStatus` until all in-flight chunk migrations conclude (`mode: "off"`, `inBalancerRound: false`), failing closed with `ActiveChunkMigrationError` if migrations cannot drain.
+3. Captures the cluster-wide `$clusterTime` and backs up CSRS and shards with **bounded concurrency** (up to 4 shards in parallel, clamping `S3_QUEUE_SIZE = 1` per concurrent shard to keep RAM bounded on small instances).
+   - For CSRS on MongoDB 8.0+, dumps `database: "config"` excluding transient/resharding collections (avoiding `mongodump`'s `config.reshardingOperations` abort) and bridges CSRS oplog from pre-dump `oplogBounds` through `clusterTime`.
+   - For every shard, streams full replica-set dumps with `--oplog` under `<prefix>/shards/<shardId>`.
+4. Captures backup-scoped, multi-slice bridging oplogs (`_bridging/<stamp>/`, with `updateState: false` so live PITR `state.json` is never mutated) for CSRS and any shard whose dump finished before the common `clusterTime`.
+5. Writes an encrypted (when `ENCRYPTION_KEY` is set) `.cluster[.enc]` metadata object with real SHA-256 digest and HMAC-signed `.manifest.json`. `verifyBackup` recursively verifies `.cluster[.enc]`, CSRS archive, all shard archives, and all bridging slices; `delete`/`prune` cascade-deletes all child objects.
+6. Restarts the cluster balancer (only if it was originally enabled) in a guaranteed `finally` block on both backup and restore.
+7. **Sharded Restore & PITR (`restoreShardedCluster`):**
+   - Validates HMAC manifest signature (failing closed if signed without keys), fails fast if any shard backup has `status !== "success"`, validates every backed-up shard maps to the target cluster topology, and drops existing user databases via `mongos` when `--drop` is set.
+   - Restores CSRS routing metadata (`config.databases`, `config.collections`, `config.chunks`, `config.tags`, `config.settings`) via the zero-disk streaming **`CsrsRestorer`** (500-doc `bulkWrite` batches), preserving target `config.system.sessions` UUID and `balancer`/`automerge` settings.
+   - Restores base archives on all shards, streams bridging + PITR slices anchored via `baseKey` through per-node `OplogApplier` instances, executes **Percona-PBM cross-shard distributed transaction reconciliation** (`getTxnLeftovers` -> union cluster commits -> `handleUncommittedTxn`), builds deferred indexes, and runs `flushRouterConfig` on `mongos` and every shard primary.
 
 #### Coordinated Multi-Shard Sequence
 
@@ -731,47 +740,48 @@ sequenceDiagram
     Coord->>Mongos: Capture cluster timestamp ($clusterTime)
     Mongos-->>Coord: clusterTime (t:i)
 
-    Note over Coord,Storage: 1. Backup Config Server Metadata
-    Coord->>ConfigSvr: mongodump (database: config)
+    Note over Coord,Storage: 1. Backup CSRS & Shards (Bounded Parallel, Max 4)
+    Coord->>ConfigSvr: mongodump (db: config, safe exclusions) + bridge oplog
     ConfigSvr-->>Storage: Stream to <prefix>/configsvr/
 
-    Note over Coord,Storage: 2. Sequentially Backup Shard Data & Oplog
-    Coord->>Shard1: mongodump with oplog (buildShardUri)
+    Coord->>Shard1: mongodump --oplog (buildShardUri)
     Shard1-->>Storage: Stream to <prefix>/shards/shard01/
 
-    Coord->>Shard2: mongodump with oplog (buildShardUri)
+    Coord->>Shard2: mongodump --oplog (buildShardUri)
     Shard2-->>Storage: Stream to <prefix>/shards/shard02/
+
+    Note over Coord,Storage: 2. Backup-Scoped Multi-Slice Oplog Bridging to clusterTime
+    Coord->>Storage: Upload _bridging/<stamp>/*.oplog.bson.gz[.enc]
 
     Coord->>Mongos: db.adminCommand({ balancerStart: 1 })
     Mongos-->>Coord: Balancer restarted
 
-    Coord->>Storage: Write unified .cluster manifest
+    Coord->>Storage: Write encrypted .cluster[.enc] & HMAC manifest
     Storage-->>Coord: Manifest committed
 ```
 
-> [!WARNING]
+> [!NOTE]
 > **Cross-Shard Consistency & Balancer Safety Enforcement:**
-> During sharded backups, MongoVault invokes `balancerStop` and verifies that active migrations finish (`mode: "off"` and `inBalancerRound: false`).
 >
-> - **Fail-Closed Migration Drain:** If chunk migrations are active when the timeout expires or if balancer status fails to confirm `mode: "off"`, MongoVault **fails closed** and throws `ActiveChunkMigrationError`. It does not proceed with sequential shard dumping under unverified balancer states.
-> - **Timestamp Anchoring on Restore:** During restore (`restoreShardedCluster`), all shard restores replay oplog operations up to the unified `$clusterTime` captured in the cluster manifest (`oplogReplay: true`, `oplogLimit: clusterMeta.clusterTime`).
-> - **Cross-Shard Application Writes:** While stopping the balancer halts chunk moves, ongoing application writes can still occur between sequential shard dumps. For zero-skew guarantees on clusters with high-volume cross-shard distributed transactions, schedule backups during quiet windows or consider volume snapshots.
+> - **Fail-Closed Migration Drain:** If chunk migrations cannot conclude within 30 seconds or `balancerStatus` does not confirm `mode: "off"`, MongoVault fails closed with `ActiveChunkMigrationError`.
+> - **Distributed Transaction Reconciliation:** Bridging and PITR oplog replay buffers prepared transactions across all shards and CSRS, unions committed distributed transaction IDs across the cluster, and applies or discards prepared leftovers atomically before `flushRouterConfig`.
+> - **Embedded Config Shards:** Dedicated Config Server Replica Sets (CSRS) with dedicated shards are required; Embedded Config Shard-only clusters (`_id: "config"` with no dedicated shards) are rejected upfront.
 
 ---
 
 ### Engine Comparison Matrix
 
-| Feature / Dimension      | `logical`                      | `physical`                      | `sharded` (Experimental)                |
-| :----------------------- | :----------------------------- | :------------------------------ | :-------------------------------------- |
-| **Backup Mechanism**     | `mongodump` BSON stream        | WiredTiger `$backupCursor` Tar  | `mongos` multi-node coordinator         |
-| **Data Format**          | `.archive.gz[.enc]`            | `.physical.tar.gz[.enc]`        | Multi-prefix archives + `.cluster`      |
-| **Hardware Locality**    | Network accessible             | Same host / volume mount        | Network accessible to `mongos` & shards |
-| **Database Consistency** | Point-in-time via `--oplog`    | WiredTiger checkpoint           | Balancer-quiesced + shard oplogs        |
-| **Impact on Primary**    | Minimal (`secondaryPreferred`) | None (reads raw files)          | Minimal (secondary preferred per shard) |
-| **Restore Speed**        | Moderate (rebuilds indexes)    | Maximum (raw file extract)      | Moderate (restores config + shards)     |
-| **Selective Restore**    | Yes (namespace filtering)      | No (full database directory)    | Yes (can restore individual shards)     |
-| **PITR Support**         | Yes (base + oplog slices)      | Yes (ephemeral `mongod` replay) | Yes (configsvr + shard oplog slices)    |
-| **Target MongoDB State** | Online and operational         | **Must be stopped**             | Target cluster online; balancer stopped |
+| Feature / Dimension      | `logical`                                   | `physical`                                      | `sharded`                                        |
+| :----------------------- | :------------------------------------------ | :---------------------------------------------- | :----------------------------------------------- |
+| **Backup Mechanism**     | `mongodump` BSON stream + `ArchiveOplogTap` | WiredTiger `$backupCursor` / `fsyncLock` TAR    | `mongos` + CSRS + bounded-parallel shards        |
+| **Data Format**          | `.archive.gz[.enc]`                         | `.physical.tar.gz[.enc]`                        | Multi-prefix archives + `.cluster[.enc]`         |
+| **Hardware Locality**    | Network accessible                          | Same host / volume mount                        | Network accessible to `mongos`, CSRS, & shards   |
+| **Database Consistency** | Point-in-time via `--oplog`                 | WiredTiger checkpoint + `$backupCursorExtend`   | Balancer-quiesced + bridging oplogs + dist txns  |
+| **Impact on Primary**    | Minimal (`secondaryPreferred`)              | None (`$backupCursor`) / Lock (`fsyncLock`)     | Minimal (`secondaryPreferred` per shard)         |
+| **Restore Speed**        | Moderate (rebuilds indexes)                 | Maximum (raw file extract + WT recovery)        | Moderate (`CsrsRestorer` + parallel shards)      |
+| **Selective Restore**    | Yes (`--ns-include`/`--ns-exclude`/rename)  | No (full WiredTiger `dbPath`)                   | Yes (individual shard archives accessible)       |
+| **PITR Support**         | Yes (zero-disk streaming `OplogApplier`)    | Yes (PBM 3/4-step recovery + `OplogApplier`)    | Yes (CSRS + shard slices + cross-shard txn sync) |
+| **Target MongoDB State** | Online and operational                      | **Must be stopped** (guarded via `mongod.lock`) | Target cluster online; balancer stopped          |
 
 ---
 
@@ -965,11 +975,12 @@ export interface StorageClient {
 }
 ```
 
-- **S3 Multipart Uploads (`@aws-sdk/lib-storage`):**
-  - Part size is controlled via `S3_PART_SIZE_MB` (default: 32 MiB, min: 5 MiB).
-  - Parallel upload concurrency is set via `S3_QUEUE_SIZE` (default: 2 streams).
-  - In-flight memory is bounded: `32 MiB * 2 workers = ~64 MiB`.
-  - `leavePartsOnError: false` ensures aborted uploads do not leave orphan multipart chunks accumulating storage costs in S3.
+- **S3 Multipart Uploads (`@aws-sdk/lib-storage`) & Resumable Downloads:**
+  - Part size defaults to `S3_PART_SIZE_MB` (default: 32 MiB, min: 5 MiB) and **automatically scales up** (up to 512 MiB via `computeS3UploadParams`) based on estimated database/file size so multi-terabyte backups (up to 5 TiB) never hit AWS S3's 10,000-part limit.
+  - Parallel upload concurrency is controlled via `S3_QUEUE_SIZE` (default: 2) and automatically clamped to `1` whenever `partSize >= 128 MiB` to protect small-RAM hosts.
+  - `S3Client` uses adaptive retries (`maxAttempts: 5`, `retryMode: "adaptive"`), and `S3StorageClient.download()` automatically resumes dropped downloads from the exact byte offset using HTTP `Range` + `IfMatch: etag`.
+  - `leavePartsOnError: false` ensures aborted uploads do not leave orphan multipart chunks.
+  - **S3 Object Lock Safety:** WORM retention headers are applied strictly to immutable backup archives, oplog slices, and manifests — never to mutable control/state/probe keys (`state.json`, `.locks/*`, `.probe-*`).
 - **Filesystem Storage (`FilesystemStorageClient`):**
   - Used when `STORAGE_TYPE=filesystem`. Writes files to `STORAGE_PATH`.
   - All writes are staged to atomic temporary files (`${file}.tmp-<uuid>`) with file permissions `0o600` and committed via atomic filesystem renames (`fs.rename`), preventing partially written files from being read.
@@ -1132,9 +1143,9 @@ Timestamp(1773153000, 14)  ==>  Second: 1773153000, Ordinal: 14
 When `PITR_ENABLED=true`, MongoVault runs a continuous archiver (`src/oplog.ts`):
 
 1. **High-Water Mark Tracking:** Reads `<prefix>/_pitr/state.json` to find the last archived timestamp (`lastTs`). If absent, it queries the newest completed base backup manifest.
-2. **Fail-Closed Majority Commit Filtering:** MongoVault queries `admin.command({ replSetGetStatus: 1 })` to identify `lastCommittedOpTime` (or `readConcernMajorityOpTime`). If the query fails or optimes cannot be determined, slice capture **fails closed** and throws an error rather than continuing with an open upper boundary, ensuring operations that may roll back during failover are never archived.
-3. **Transaction-Boundary Protection:** MongoVault inspects `config.transactions` for active distributed transactions in state `prepared` or `inProgress`. If an active transaction began prior to the majority commit point (`startOpTime < majorityTs`), the slice upper boundary is capped at `startOpTime`, and slice advancement pauses until the transaction finishes. This guarantees that multi-document transactions are never split or torn across slices prior to commitment.
-4. **BSON Type Preservation:** Queries `local.oplog.rs` with `{ promoteValues: false }`, ensuring BSON `Long`, `Double`, and `Int32` types are preserved identically without lossy conversion to JavaScript numbers.
+2. **Fail-Closed Majority Commit Filtering:** MongoVault queries `admin.command({ replSetGetStatus: 1 })`, clamps `lastCommittedOpTime` to `appliedOpTime`, and detects post-restore timeline divergence (`cursorStartTs > majorityTs`). If the query fails or optimes cannot be determined, slice capture **fails closed** rather than archiving un-majority-committed ops.
+3. **Transaction-Boundary Protection:** MongoVault queries `config.transactions` sorted by `{ "startOpTime.ts": 1 }` for active transactions (`prepared` or `inProgress`). When an active transaction started prior to `majorityTs`, the slice upper boundary is capped strictly **before** (`$lt`) `startOpTime`, ensuring uncommitted multi-document transactions are never torn across slice boundaries.
+4. **Raw BSON Zero-Deserialization Reads:** Queries `local.oplog.rs` with `{ raw: true }`, keeping exact raw BSON wire bytes intact (zero lossy JS number coercion, O(1) per-doc overhead) and recording `coverageStartTs`/`coverageEndTs` for quiet-cluster PITR proof.
 5. **Batch Slicing & Upload:** Batches entries up to `PITR_MAX_SLICE_MB` (default: 16 MiB). Compresses with gzip, encrypts with AEAD, computes SHA-256, and uploads to:
    `<prefix>/_pitr/<YYYY-MM-DD>/<startTs.t>_<startTs.i>__<endTs.t>_<endTs.i>.oplog.bson.gz[.enc]`
 6. **State Update:** Updates `state.json` with the new `lastTs`.
@@ -1183,13 +1194,13 @@ flowchart TD
     H -- Yes --> I["Error: PITR timeline gap detected<br/>Oplog rolled over"]
     H -- No --> J["Stage 1: Restore Base Backup<br/>(Stream & drop target tables)"]
 
-    J --> K["Stage 2: Sequential Slice Replay"]
-    K --> L["Download & decrypt slice to<br/>.pitr-slice-uuid.oplog.bson"]
-    L --> M["mongorestore --oplogReplay<br/>--oplogLimit=1773153015:4294967295"]
-    M --> N["Delete temporary slice file"]
-    N --> O{"More slices<br/>in plan?"}
+    J --> K["Stage 2: Zero-Disk Streaming OplogApplier"]
+    K --> L["streamOplogSlice()<br/>Download -> SHA-256 -> AEAD Decrypt -> Gunzip"]
+    L --> M["OplogApplier.applyStream()<br/>Txns + Filter + IndexCatalog + applyOps"]
+    M --> O{"More slices<br/>in plan?"}
     O -- Yes --> L
-    O -- No --> P["PITR Restore Complete<br/>(Database restored to exact second)"]
+    O -- No --> N["OplogApplier.buildPendingIndexes()"]
+    N --> P["PITR Restore Complete<br/>(Database restored to exact second)"]
 ```
 
 ---
@@ -1671,7 +1682,9 @@ Configuration settings are validated at startup via Zod (`src/config.ts`).
 | **Backup Engines & Sharding**          |         |                      |           |                                                                                               |
 | `BACKUP_ENGINE`                        | String  |      `logical`       |    No     | Default engine: `logical` or `physical`.                                                      |
 | `PHYSICAL_DB_PATH`                     |  Path   |        _None_        |   Cond.   | Local WiredTiger filesystem path. Required when `BACKUP_ENGINE=physical`.                     |
-| `SHARDING_ENABLED`                     | Boolean |       `false`        |    No     | Coordinates distributed backup across `mongos`, `configsvr`, and shard replica sets.          |
+| `PHYSICAL_ENCRYPTION_KEY_FILE`         |  Path   |        _None_        |    No     | WiredTiger Encryption-at-Rest keyfile passed to recovery `mongod` during physical restore.    |
+| `PHYSICAL_DIRECTORY_PER_DB`            | Boolean |       `false`        |    No     | Enables `--directoryperdb` on ephemeral recovery `mongod` (auto-detected from manifest too).  |
+| `SHARDING_ENABLED`                     | Boolean |       `false`        |    No     | Coordinates distributed backup/restore across `mongos`, `configsvr`, and shard replica sets.  |
 | `SHARDING_CONFIGSVR_URI`               | String  |        _None_        |    No     | Optional dedicated Config Server connection URI.                                              |
 | **Point-in-Time Recovery (PITR)**      |         |                      |           |                                                                                               |
 | `PITR_ENABLED`                         | Boolean |       `false`        |    No     | Runs continuous oplog slicer daemon. Requires replica set and `MONGODB_DATABASE=*`.           |
@@ -1683,7 +1696,7 @@ Configuration settings are validated at startup via Zod (`src/config.ts`).
 | `S3_BUCKET`                            | String  |  `mongodb-backups`   |   Cond.   | S3 bucket name. Required when `STORAGE_TYPE=s3`.                                              |
 | `S3_ACCESS_KEY_ID`                     | String  |         `""`         |   Cond.   | AWS Access Key ID. Required when `STORAGE_TYPE=s3`.                                           |
 | `S3_SECRET_ACCESS_KEY`                 | String  |         `""`         |   Cond.   | AWS Secret Access Key. Required when `STORAGE_TYPE=s3`.                                       |
-| `S3_REGION`                            | String  |     `ap-south-1`     |    No     | AWS region. Falls back to `process.env.AWS_REGION` or `ap-south-1`.                           |
+| `S3_REGION`                            | String  |     `ap-south-1`     |    No     | AWS region. Falls back to `AWS_REGION` or `ap-south-1`.                                       |
 | `S3_ENDPOINT`                          |   URL   |        _None_        |    No     | Custom S3 endpoint URL (e.g. LocalStack, MinIO, AWS VPC Endpoint).                            |
 | `S3_FORCE_PATH_STYLE`                  | Boolean |       `false`        |    No     | Forces path-style addressing (`http://endpoint/bucket`). Required for LocalStack/MinIO.       |
 | `S3_PREFIX`                            | String  |     `"mongodb"`      |    No     | Key prefix inside the bucket.                                                                 |
@@ -1702,7 +1715,7 @@ Configuration settings are validated at startup via Zod (`src/config.ts`).
 | `BACKUP_TIMEZONE`                      | String  |       `"UTC"`        |    No     | IANA timezone identifier for cron schedules and retention date bucketing.                     |
 | `BACKUP_TIMEOUT_MINUTES`               | Number  |        `180`         |    No     | Maximum execution duration before timing out and aborting backup (minutes).                   |
 | `BACKUP_ON_START`                      | Boolean |       `false`        |    No     | Triggers an immediate backup run upon daemon startup.                                         |
-| `WORK_DIR`                             |  Path   |    `os.tmpdir()`     |    No     | Local directory for PID lockfiles and temporary PITR slice replay staging.                    |
+| `WORK_DIR`                             |  Path   |    `os.tmpdir()`     |    No     | Local directory for PID lockfiles, `0o600` URI configs, and >8 MiB single-txn spill files.    |
 | **Retention Policy (GFS)**             |         |                      |           |                                                                                               |
 | `RETENTION_KEEP_LAST`                  | Number  |        _None_        |    No     | Keep the $N$ most recent complete backups unconditionally.                                    |
 | `RETENTION_KEEP_DAILY`                 | Number  |        _None_        |    No     | Keep 1 backup per day for $N$ days.                                                           |
@@ -1812,11 +1825,16 @@ src/
 │   ├── crypto.ts         # Encryption envelope and stream types
 │   ├── oplog.ts          # PITR oplog structures and timestamp types
 │   └── ...
+├── archive-stream.ts     # Zero-allocation mongodump --archive tap & collection streamer
 ├── backup.ts             # Logical backup pipeline
-├── restore.ts            # Restore pipeline and verification
-├── physical.ts           # WiredTiger $backupCursor implementation
-├── sharding.ts           # Coordinated multi-shard cluster engine
-├── oplog.ts              # PITR archiver, tailer, and replay logic
+├── restore.ts            # Restore pipeline, selective filters, recursive verification
+├── physical.ts           # WiredTiger $backupCursor / fsyncLock & PBM 3/4-step recovery
+├── sharding.ts           # Coordinated multi-shard engine, CsrsRestorer & dist-txn sync
+├── oplog.ts              # PITR archiver, tailer, streaming slice reader, plan resolver
+├── oplog-applier.ts      # Stateful streaming OplogApplier, OplogFilter, IndexCatalog & TxnBuffer
+├── check.ts              # System preflight verification across all engines
+├── status.ts             # Real-time topology, storage, lock, and PITR contiguity inspector
+├── diagnostic.ts         # Sanitized diagnostic bundle exporter
 ├── crypto.ts             # AEAD 64 KiB chunked cipher and key wrapping
 ├── storage.ts            # S3 client and filesystem client
 ├── lock.ts               # Local PID lockfile and distributed S3 lease
@@ -1842,8 +1860,11 @@ npm run build
 # Run type checking without code generation
 npm run typecheck
 
-# Execute Vitest test suite
+# Execute Vitest unit test suite
 npm test
+
+# Execute live MongoDB 8.0 End-to-End tests (Logical, Physical, Sharded + PITR)
+npm run test:e2e
 
 # Run tests in watch mode
 npm run test:watch
@@ -1862,20 +1883,26 @@ npm run check
 
 ### Testing and Verification
 
-MongoVault maintains an extensive automated test suite covering all subsystems:
+MongoVault maintains both a fast unit test suite (`tests/*.test.js`) and a real MongoDB 8.0 End-to-End integration suite (`tests/e2e/engines.e2e.test.js`):
 
-- `tests/crypto.test.js`: Validates 64 KiB AEAD chunk framing, key wrapping roundtrips, tampered tag rejection, and truncation detection.
-- `tests/pipeline.test.js`: Verifies end-to-end zero-disk streaming pipelines and backpressure propagation.
-- `tests/pitr.test.js`: Verifies oplog timestamp parsing, slice chunking, and multi-slice continuity validation.
-- `tests/lock.test.js`: Tests local PID creation, stale lock detection, atomic rename takeovers, and S3 conditional lease acquisition.
-- `tests/retention.test.js`: Tests timezone-aware Grandfather-Father-Son bucketing, orphan pruning, and PITR anchor deletion protection.
-- `tests/physical.test.js`: Tests WiredTiger cursor retries on checkpoint conflicts (code `50915`), POSIX UStar tar streaming, and `fsyncLock` fallbacks.
-- `tests/sharding.test.js`: Verifies topology inspection, balancer stopping/draining, and shard URI building.
+- **Unit Tests (`npm test`):**
+  - `tests/archive-stream.test.js`: Verifies zero-allocation `ArchiveOplogTap`, fragmented BSON streaming, and `streamArchiveCollections`.
+  - `tests/oplog-applier.test.js`: Verifies `OplogFilter`, multi-slice transaction buffering, >8 MiB disk-spilling `TxnBuffer`, cross-shard distributed transaction reconciliation, and `IndexCatalog` DDL tracking.
+  - `tests/correctness.test.js`: Verifies S3 multipart auto-scaling (`computeS3UploadParams`), AEAD trailing-byte rejection, `FilesystemStorageClient` path-traversal guards, PAX extended TAR headers (>255 UTF-8 bytes), live `mongod.lock` guard, cascade deletion, and recursive sharded verification.
+  - `tests/crypto.test.js`, `tests/pipeline.test.js`, `tests/pitr.test.js`, `tests/lock.test.js`, `tests/retention.test.js`, `tests/physical.test.js`, `tests/sharding.test.js`, `tests/selective-restore.test.js`, `tests/drill.test.js`, `tests/status.test.js`, `tests/check.test.js`, and more.
+- **Live MongoDB 8.0 E2E Tests (`npm run test:e2e`):**
+  - **Logical Engine + PITR:** Encrypted full-cluster backup with `ArchiveOplogTap`, `verifyBackup`, automated restore drill, multi-document ACID transaction + post-backup unique index DDL, zero-disk streaming PITR recovery undoing post-target disaster, and selective namespace-filtered PITR.
+  - **Physical Engine + Recovery + PITR:** Encrypted physical hot backup, live `mongod.lock` guard, full `PhysicalRecoveryCoordinator` with streaming physical PITR, index build in standalone mode, `local.system.replset` cleanup, and clean `mongod` boot verification.
+  - **Sharded Cluster Engine + PITR:** Real CSRS + 2 shards + `mongos`, encrypted `.cluster.enc` backup, recursive `verifyBackup`, real cross-shard distributed ACID transaction, programmatic `CsrsRestorer`, sharded PITR with cross-shard transaction reconciliation, and intact `mongos` routing & sessions verification.
 
-To run the full test suite:
+To run the test suites:
 
 ```bash
+# Fast unit tests
 npm test
+
+# Full live MongoDB 8.0 E2E verification (requires local mongod, mongos, mongodump, mongorestore in PATH)
+npm run test:e2e
 ```
 
 ---
