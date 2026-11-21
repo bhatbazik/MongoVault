@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { MongoClient } from "mongodb";
 import { createDecryptor, createEncryptor, keyId } from "./crypto.js";
-import { checkDatabaseTools } from "./tools.js";
+import { checkDatabaseTools, checkTool } from "./tools.js";
 import type { AppConfig } from "./types/config.js";
 import type { StorageClient } from "./types/storage.js";
 
@@ -94,6 +94,52 @@ async function checkMongo(
           passed: false,
           message: `Cannot access local.oplog.rs: ${(err as Error).message}`,
         });
+      }
+    }
+
+    if (config.pitr?.enabled) {
+      try {
+        await client.db("config").collection("transactions").findOne({});
+        checks.push({
+          name: "PITR Transactions Access",
+          passed: true,
+          message: "config.transactions accessible for active transaction boundary clamping",
+        });
+      } catch (err) {
+        checks.push({
+          name: "PITR Transactions Access",
+          passed: false,
+          message: `Cannot read config.transactions: ${(err as Error).message}`,
+        });
+      }
+    }
+
+    if (config.sharding?.enabled) {
+      const isMongos = hello?.msg === "isdbgrid";
+      if (!isMongos) {
+        checks.push({
+          name: "Sharded Cluster (mongos)",
+          passed: false,
+          message: "SHARDING_ENABLED is true, but MONGODB_URI is not connected to a mongos router",
+        });
+      } else {
+        try {
+          const shards = await client.db("config").collection("shards").find({}).toArray();
+          checks.push({
+            name: "Sharded Cluster (mongos)",
+            passed: shards.length > 0,
+            message:
+              shards.length > 0
+                ? `Connected to mongos (${shards.length} shard(s) discovered)`
+                : "Connected to mongos, but no shards found in config.shards",
+          });
+        } catch (err) {
+          checks.push({
+            name: "Sharded Cluster (mongos)",
+            passed: false,
+            message: `Cannot read config.shards: ${(err as Error).message}`,
+          });
+        }
       }
     }
   } catch (error) {
@@ -193,6 +239,36 @@ async function checkScratchDir(config: AppConfig): Promise<CheckItem> {
   }
 }
 
+async function checkPhysicalPrerequisites(config: AppConfig): Promise<CheckItem[]> {
+  if (config.engine !== "physical") return [];
+  const checks: CheckItem[] = [];
+  const mongodStatus = await checkTool("mongod");
+  checks.push({
+    name: "Physical Engine: mongod",
+    passed: mongodStatus.available,
+    message: mongodStatus.available
+      ? `Installed (${mongodStatus.version})`
+      : mongodStatus.error || "mongod binary not found in PATH (required for physical recovery)",
+  });
+  if (config.physical?.dbPath) {
+    try {
+      await fs.access(config.physical.dbPath);
+      checks.push({
+        name: "Physical Engine: dbPath",
+        passed: true,
+        message: `Accessible (${config.physical.dbPath})`,
+      });
+    } catch (err) {
+      checks.push({
+        name: "Physical Engine: dbPath",
+        passed: false,
+        message: `Cannot access dbPath ${config.physical.dbPath}: ${(err as Error).message}`,
+      });
+    }
+  }
+  return checks;
+}
+
 /**
  * Executes system preflight checks in parallel.
  */
@@ -201,9 +277,10 @@ export async function runPreflightCheck({
   storage,
   createMongoClient = (u) => new MongoClient(u),
 }: PreflightCheckContext): Promise<PreflightCheckResult> {
-  const [toolsChecks, mongoChecks, storageCheck, scratchCheck] = await Promise.all([
+  const [toolsChecks, mongoChecks, physicalChecks, storageCheck, scratchCheck] = await Promise.all([
     checkTools(),
     checkMongo(config, createMongoClient),
+    checkPhysicalPrerequisites(config),
     checkStorage(config, storage),
     checkScratchDir(config),
   ]);
@@ -213,6 +290,7 @@ export async function runPreflightCheck({
   const checks: CheckItem[] = [
     ...toolsChecks,
     ...mongoChecks,
+    ...physicalChecks,
     storageCheck,
     encryptionCheck,
     scratchCheck,

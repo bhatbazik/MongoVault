@@ -4,6 +4,9 @@ import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
+import type { Readable } from "node:stream";
+import { createGzip } from "node:zlib";
+import { ArchiveOplogTap } from "./archive-stream.js";
 import { formatDuration } from "./format.js";
 import type {
   DatabaseToolsStatus,
@@ -116,6 +119,20 @@ export function runTool(
   return { child, done };
 }
 
+function uriHasReadPreference(uri: string): boolean {
+  const queryIdx = uri.indexOf("?");
+  if (queryIdx === -1) return false;
+  return /(?:^|&)readPreference=/i.test(uri.slice(queryIdx + 1));
+}
+
+function splitNamespacePatterns(raw?: string): string[] {
+  if (!raw) return [];
+  return raw
+    .split(",")
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0);
+}
+
 export async function mongodump({
   uri,
   database,
@@ -149,14 +166,17 @@ export async function mongodump({
   if (parallelCollections && parallelCollections > 0) {
     args.push(`--numParallelCollections=${parallelCollections}`);
   }
-  if (readPreference) {
+  if (readPreference && !uriHasReadPreference(uri)) {
     args.push(`--readPreference=${readPreference}`);
   }
   if (oplog) {
-    args.push("--oplog");
+    // Emit an uncompressed archive from mongodump so ArchiveOplogTap can inspect the
+    // exact embedded oplog bounds in O(1) RAM before gzipping the stream for upload.
+    args.push("--oplog", "--archive");
+  } else {
+    args.push("--archive", "--gzip");
   }
 
-  args.push("--archive", "--gzip");
   const collections: Record<string, number> = {};
 
   const { child, done } = runTool(command, args, {
@@ -173,9 +193,50 @@ export async function mongodump({
     },
   });
 
+  if (!oplog) {
+    return {
+      stdout: child.stdout!,
+      done: done.finally(cleanupConfig).then(() => ({ collections })),
+    };
+  }
+
+  const tap = new ArchiveOplogTap();
+  const gzip = createGzip();
+  const rawOut = child.stdout!;
+
+  rawOut.on("error", (err) => tap.destroy(err));
+  tap.on("error", (err) => gzip.destroy(err));
+  gzip.on("close", () => {
+    if (!tap.readableEnded && !tap.destroyed) {
+      tap.destroy();
+    }
+    if (!rawOut.readableEnded && !rawOut.destroyed) {
+      rawOut.destroy();
+    }
+  });
+  rawOut.pipe(tap).pipe(gzip);
+
+  const tapFinished = new Promise<void>((resolve) => {
+    if (tap.readableEnded || tap.destroyed) {
+      resolve();
+      return;
+    }
+    tap.once("end", resolve);
+    tap.once("close", resolve);
+  });
+
   return {
-    stdout: child.stdout!,
-    done: done.finally(cleanupConfig).then(() => ({ collections })),
+    stdout: gzip as Readable,
+    done: done.finally(cleanupConfig).then(async () => {
+      await tapFinished;
+      const bounds = tap.bounds;
+      return {
+        collections,
+        oplogStartTs: bounds.firstTs,
+        oplogEndTs: bounds.lastTs,
+        oplogEntries: bounds.entries,
+      };
+    }),
   };
 }
 
@@ -184,9 +245,12 @@ export async function mongorestore({
   workDir,
   nsInclude,
   nsExclude,
+  systemNsExclude = [],
   nsFrom,
   nsTo,
   drop = false,
+  preserveUUID,
+  bypassDocumentValidation = true,
   oplogReplay = false,
   oplogLimit,
   parallelCollections,
@@ -204,10 +268,25 @@ export async function mongorestore({
 
   const { file: configFile, cleanup: cleanupConfig } = await writeUriConfig(workDir, uri);
   const args = [`--config=${configFile}`, "--archive", "--gzip", "--stopOnError"];
-  if (nsInclude) args.push(`--nsInclude=${nsInclude}`);
-  if (nsExclude) args.push(`--nsExclude=${nsExclude}`);
+  for (const pattern of splitNamespacePatterns(nsInclude)) {
+    args.push(`--nsInclude=${pattern}`);
+  }
+  for (const pattern of splitNamespacePatterns(nsExclude)) {
+    args.push(`--nsExclude=${pattern}`);
+  }
+  for (const pattern of systemNsExclude) {
+    if (pattern.trim().length > 0) {
+      args.push(`--nsExclude=${pattern.trim()}`);
+    }
+  }
   if (nsFrom && nsTo) args.push(`--nsFrom=${nsFrom}`, `--nsTo=${nsTo}`);
   if (drop) args.push("--drop");
+  if (drop && !(nsFrom && nsTo) && preserveUUID !== false) {
+    args.push("--preserveUUID");
+  }
+  if (bypassDocumentValidation !== false) {
+    args.push("--bypassDocumentValidation");
+  }
   if (oplogReplay) args.push("--oplogReplay");
   if (oplogLimit) args.push(`--oplogLimit=${oplogLimit}`);
   if (parallelCollections && parallelCollections > 0) {

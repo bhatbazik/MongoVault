@@ -1,6 +1,8 @@
-import { isClusterScope } from "../catalog.js";
+import path from "node:path";
+import { databasePrefix, isClusterScope, scopeOf } from "../catalog.js";
 import { EngineRegistry } from "../engines.js";
 import { formatBytes, formatDuration } from "../format.js";
+import { acquireHybridLock } from "../lock.js";
 import type { AppConfig } from "../types/config.js";
 import type { CliCommandContext, CommandHandler } from "./types.js";
 
@@ -39,17 +41,36 @@ export class BackupCommand implements CommandHandler {
       },
     };
 
+    const controller = new AbortController();
+    const releaseLock = await acquireHybridLock({
+      file: path.join(config.workDir, ".backup.lock"),
+      storage,
+      lockKey: `${databasePrefix(scopeOf(backupConfig))}.locks/backup.lock.json`,
+      staleAfterMs: Math.max(config.timeoutMs + 60_000, 120_000),
+      logger,
+      onLost: () => {
+        logger.error("Lost distributed backup lock during CLI backup; aborting");
+        controller.abort(new Error("Lost distributed backup lock"));
+      },
+    });
+
+    if (!releaseLock) {
+      console.error("Error: Another backup is already in progress (failed to acquire backup lock)");
+      process.exit(1);
+    }
+
     try {
       const engine = EngineRegistry.resolveForBackup({
         engine: values.engine,
         sharding: values.sharding,
-        config,
+        config: backupConfig,
       });
 
       const manifest = await engine.backup({
         config: backupConfig,
         storage,
         logger,
+        signal: controller.signal,
         dbPath: values["db-path"],
       });
 
@@ -73,6 +94,8 @@ export class BackupCommand implements CommandHandler {
       );
       logger.error({ err: error }, "Manual backup execution failed");
       process.exit(1);
+    } finally {
+      await releaseLock();
     }
   }
 }

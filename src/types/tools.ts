@@ -42,7 +42,12 @@ export interface MongodumpOptions {
 
 export interface MongodumpResult {
   stdout: Readable;
-  done: Promise<{ collections: Record<string, number> }>;
+  done: Promise<{
+    collections: Record<string, number>;
+    oplogStartTs?: { t: number; i: number } | null;
+    oplogEndTs?: { t: number; i: number } | null;
+    oplogEntries?: number;
+  }>;
 }
 
 export interface MongorestoreOptions {
@@ -50,9 +55,13 @@ export interface MongorestoreOptions {
   workDir: string;
   nsInclude?: string;
   nsExclude?: string;
+  /** Internal system namespaces excluded automatically on full-cluster restores (allowed alongside --oplogReplay). */
+  systemNsExclude?: string[];
   nsFrom?: string;
   nsTo?: string;
   drop?: boolean;
+  preserveUUID?: boolean;
+  bypassDocumentValidation?: boolean;
   oplogReplay?: boolean;
   oplogLimit?: string;
   parallelCollections?: number;
