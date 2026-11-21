@@ -80,30 +80,40 @@ export class ChunkedAeadEncryptStream extends Transform {
   }
 
   override _transform(chunk: Buffer, _encoding: BufferEncoding, callback: TransformCallback): void {
-    this.#buffer.push(chunk);
-    this.#bufferedBytes += chunk.length;
+    try {
+      this.#buffer.push(chunk);
+      this.#bufferedBytes += chunk.length;
 
-    while (this.#bufferedBytes >= this.#chunkSize) {
-      const combined =
-        this.#buffer.length === 1 && this.#buffer[0]
-          ? this.#buffer[0]
-          : Buffer.concat(this.#buffer);
-      const slice = combined.subarray(0, this.#chunkSize);
-      const remainder = combined.subarray(this.#chunkSize);
+      while (this.#bufferedBytes >= this.#chunkSize) {
+        const combined =
+          this.#buffer.length === 1 && this.#buffer[0]
+            ? this.#buffer[0]
+            : Buffer.concat(this.#buffer);
+        const slice = combined.subarray(0, this.#chunkSize);
+        const remainder = combined.subarray(this.#chunkSize);
 
-      this.#buffer = remainder.length ? [remainder] : [];
-      this.#bufferedBytes = remainder.length;
+        this.#buffer = remainder.length ? [remainder] : [];
+        this.#bufferedBytes = remainder.length;
 
-      this.#encryptAndEmit(slice, false);
+        this.#encryptAndEmit(slice, false);
+      }
+      callback();
+    } catch (err) {
+      callback(err as Error);
     }
-    callback();
   }
 
   override _flush(callback: TransformCallback): void {
-    const remaining =
-      this.#buffer.length === 1 && this.#buffer[0] ? this.#buffer[0] : Buffer.concat(this.#buffer);
-    this.#encryptAndEmit(remaining, true);
-    callback();
+    try {
+      const remaining =
+        this.#buffer.length === 1 && this.#buffer[0]
+          ? this.#buffer[0]
+          : Buffer.concat(this.#buffer);
+      this.#encryptAndEmit(remaining, true);
+      callback();
+    } catch (err) {
+      callback(err as Error);
+    }
   }
 
   #encryptAndEmit(plaintext: Buffer, isFinal: boolean): void {
@@ -140,11 +150,17 @@ export class ChunkedAeadDecryptStream extends Transform {
   }
 
   override _transform(chunk: Buffer, _encoding: BufferEncoding, callback: TransformCallback): void {
-    this.#buffer.push(chunk);
-    this.#bufferedBytes += chunk.length;
-
     try {
+      if (this.#seenFinal && chunk.length > 0) {
+        throw new Error("Unexpected trailing bytes after final AEAD frame");
+      }
+      this.#buffer.push(chunk);
+      this.#bufferedBytes += chunk.length;
+
       while (this.#bufferedBytes >= 5 + IV_LENGTH + TAG_LENGTH) {
+        if (this.#seenFinal) {
+          throw new Error("Unexpected trailing frame after final AEAD frame");
+        }
         const combined =
           this.#buffer.length === 1 && this.#buffer[0]
             ? this.#buffer[0]
@@ -185,6 +201,11 @@ export class ChunkedAeadDecryptStream extends Transform {
         }
 
         const remainder = combined.subarray(totalFrameSize);
+        if (this.#seenFinal && remainder.length > 0) {
+          throw new Error(
+            `Unexpected trailing data after final AEAD frame (${remainder.length} bytes)`,
+          );
+        }
         this.#buffer = remainder.length ? [remainder] : [];
         this.#bufferedBytes = remainder.length;
 
