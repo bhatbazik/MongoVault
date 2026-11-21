@@ -1,8 +1,9 @@
+import type { MongoClient } from "mongodb";
 import type { BackupManifest } from "./catalog.js";
 import type { AppConfig } from "./config.js";
 import type { Logger } from "./logger.js";
+import type { PitrPlan } from "./oplog.js";
 import type { StorageClient } from "./storage.js";
-import type { MongoClient } from "mongodb";
 
 export interface BackupCursorMetadata {
   backupId: string;
@@ -34,6 +35,16 @@ export interface PhysicalBackupResult {
   totalBytes: number;
 }
 
+export interface PhysicalRecoveryContext {
+  config: AppConfig;
+  storage: StorageClient;
+  logger: Logger;
+  targetDbPath: string;
+  manifest: BackupManifest | null;
+  pitrPlan: PitrPlan | null;
+  signal?: AbortSignal;
+}
+
 export interface PhysicalRestoreOptions {
   config: AppConfig;
   storage: StorageClient;
@@ -42,6 +53,15 @@ export interface PhysicalRestoreOptions {
   ref?: string;
   pitr?: string;
   signal?: AbortSignal;
+  /**
+   * Test-only hook to bypass booting an ephemeral `mongod` for WiredTiger/RS recovery.
+   * Defaults to `false` (full PBM 3/4-step recovery always runs in production).
+   */
+  skipRecovery?: boolean;
+  /**
+   * Optional dependency-injected recovery coordinator for testing.
+   */
+  recoveryRunner?: (ctx: PhysicalRecoveryContext) => Promise<{ replayedEntries: number }>;
 }
 
 export interface PhysicalRestoreResult {

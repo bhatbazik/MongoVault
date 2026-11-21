@@ -14,26 +14,66 @@ export interface TarExtractResult {
   totalBytes: number;
 }
 
-/**
- * Creates a standard 512-byte POSIX UStar tar file header, supporting paths up to 255 bytes via UStar prefix.
- */
-export function createTarHeader(name: string, size: number, mtime: number = Date.now()): Buffer {
+const MAX_PAX_PAYLOAD_BYTES = 1024 * 1024; // 1 MiB defensive cap
+
+function makeAbortError(reason?: unknown): Error {
+  if (reason instanceof Error) {
+    if (reason.name === "AbortError") return reason;
+    const err = new Error(reason.message);
+    err.name = "AbortError";
+    return err;
+  }
+  const err = new Error(reason ? String(reason) : "The operation was aborted");
+  err.name = "AbortError";
+  return err;
+}
+
+function splitUstarPath(cleanName: string): { prefix: string; base: string } | null {
+  if (Buffer.byteLength(cleanName, "utf8") <= 100) {
+    return { prefix: "", base: cleanName };
+  }
+  // Find a '/' split where prefix <= 155 UTF-8 bytes and base <= 100 UTF-8 bytes
+  let searchFrom = cleanName.length;
+  while (searchFrom > 0) {
+    const slashIdx = cleanName.lastIndexOf("/", searchFrom - 1);
+    if (slashIdx <= 0) break;
+    const prefix = cleanName.slice(0, slashIdx);
+    const base = cleanName.slice(slashIdx + 1);
+    if (
+      base.length > 0 &&
+      Buffer.byteLength(base, "utf8") <= 100 &&
+      Buffer.byteLength(prefix, "utf8") <= 155
+    ) {
+      return { prefix, base };
+    }
+    searchFrom = slashIdx;
+  }
+  return null;
+}
+
+function truncateUtf8(str: string, maxBytes: number): string {
+  const buf = Buffer.from(str, "utf8");
+  if (buf.length <= maxBytes) return str;
+  // Walk back from maxBytes so we don't split a multi-byte UTF-8 sequence
+  let end = maxBytes;
+  while (end > 0 && (buf[end]! & 0xc0) === 0x80) {
+    end--;
+  }
+  return buf.subarray(0, end).toString("utf8");
+}
+
+function buildRawTarHeader(
+  baseName: string,
+  prefix: string,
+  size: number,
+  mtime: number,
+  typeflag: string,
+): Buffer {
   const buf = Buffer.alloc(512, 0);
 
-  const cleanName = name.replace(/\\/g, "/").replace(/^\/+/, "");
-  if (Buffer.byteLength(cleanName, "utf8") <= 100) {
-    buf.write(cleanName, 0, 100, "utf8");
-  } else {
-    // Split into UStar prefix (up to 155 bytes at offset 345) and basename (up to 100 bytes at offset 0)
-    const slashIdx = cleanName.lastIndexOf("/");
-    if (slashIdx > 0) {
-      const prefix = cleanName.slice(0, slashIdx).slice(0, 155);
-      const base = cleanName.slice(slashIdx + 1).slice(0, 100);
-      buf.write(base, 0, 100, "utf8");
-      buf.write(prefix, 345, 155, "utf8");
-    } else {
-      buf.write(cleanName.slice(0, 100), 0, 100, "utf8");
-    }
+  buf.write(truncateUtf8(baseName, 100), 0, 100, "utf8");
+  if (prefix) {
+    buf.write(truncateUtf8(prefix, 155), 345, 155, "utf8");
   }
 
   // mode: 100..108 (0644)
@@ -63,8 +103,8 @@ export function createTarHeader(name: string, size: number, mtime: number = Date
       .padStart(11, "0") + "\0";
   buf.write(mtimeOctal, 136, "ascii");
 
-  // typeflag: 156 ('0' = regular file)
-  buf.write("0", 156, "ascii");
+  // typeflag: 156 ('0' = regular file, 'x' = PAX extended header)
+  buf.write(typeflag, 156, "ascii");
 
   // magic: 257..263 ('ustar\0')
   buf.write("ustar\0", 257, "ascii");
@@ -83,6 +123,90 @@ export function createTarHeader(name: string, size: number, mtime: number = Date
   return buf;
 }
 
+function buildPaxExtendedHeader(cleanName: string, mtime: number): Buffer {
+  // Format: "<len> path=<cleanName>\n" where <len> includes its own decimal digits
+  const tail = ` path=${cleanName}\n`;
+  const tailBytes = Buffer.byteLength(tail, "utf8");
+  let totalLen = tailBytes + String(tailBytes).length;
+  while (String(totalLen).length + tailBytes !== totalLen) {
+    totalLen = String(totalLen).length + tailBytes;
+  }
+  const payload = Buffer.from(`${totalLen}${tail}`, "utf8");
+  const paxHeader = buildRawTarHeader("PaxHeaders/entry", "", payload.length, mtime, "x");
+  const padLen = payload.length % 512 === 0 ? 0 : 512 - (payload.length % 512);
+  return padLen > 0
+    ? Buffer.concat([paxHeader, payload, Buffer.alloc(padLen, 0)])
+    : Buffer.concat([paxHeader, payload]);
+}
+
+function parsePaxPath(payload: Buffer): string | null {
+  let offset = 0;
+  while (offset < payload.length) {
+    const spaceIdx = payload.indexOf(0x20, offset);
+    if (spaceIdx === -1) break;
+    const recLen = parseInt(payload.toString("ascii", offset, spaceIdx), 10);
+    if (!Number.isFinite(recLen) || recLen <= 0 || offset + recLen > payload.length) {
+      break;
+    }
+    const record = payload.toString("utf8", spaceIdx + 1, offset + recLen - 1);
+    const eqIdx = record.indexOf("=");
+    if (eqIdx > 0) {
+      const key = record.slice(0, eqIdx);
+      const value = record.slice(eqIdx + 1);
+      if (key === "path") {
+        return value;
+      }
+    }
+    offset += recLen;
+  }
+  return null;
+}
+
+/**
+ * Creates a standard 512-byte POSIX UStar tar file header, supporting paths up to 255 UTF-8 bytes via UStar prefix.
+ */
+export function createTarHeader(name: string, size: number, mtime: number = Date.now()): Buffer {
+  const cleanName = name.replace(/\\/g, "/").replace(/^\/+/, "");
+  const split = splitUstarPath(cleanName);
+  if (split) {
+    return buildRawTarHeader(split.base, split.prefix, size, mtime, "0");
+  }
+  const slashIdx = cleanName.lastIndexOf("/");
+  const base = slashIdx >= 0 ? cleanName.slice(slashIdx + 1) : cleanName;
+  const prefix = slashIdx > 0 ? cleanName.slice(0, slashIdx) : "";
+  return buildRawTarHeader(base, prefix, size, mtime, "0");
+}
+
+/**
+ * Creates either a 512-byte UStar header or a PAX extended header + UStar header
+ * when the UTF-8 path exceeds UStar limits (100-byte name / 155-byte prefix).
+ */
+export function createTarHeaderBlock(
+  name: string,
+  size: number,
+  mtime: number = Date.now(),
+): Buffer {
+  const cleanName = name.replace(/\\/g, "/").replace(/^\/+/, "");
+  const split = splitUstarPath(cleanName);
+  if (split) {
+    return buildRawTarHeader(split.base, split.prefix, size, mtime, "0");
+  }
+  const paxBlock = buildPaxExtendedHeader(cleanName, mtime);
+  const fallbackHeader = createTarHeader(cleanName, size, mtime);
+  return Buffer.concat([paxBlock, fallbackHeader]);
+}
+
+async function writeAll(fh: fs.FileHandle, data: Buffer): Promise<void> {
+  let offset = 0;
+  while (offset < data.length) {
+    const { bytesWritten } = await fh.write(data, offset, data.length - offset);
+    if (bytesWritten <= 0) {
+      throw new Error("Short write: 0 bytes written to target file");
+    }
+    offset += bytesWritten;
+  }
+}
+
 /**
  * Generates an async stream of tar-encoded byte chunks from an array of files.
  */
@@ -93,7 +217,9 @@ export async function* generateTarStream(
 ): AsyncGenerator<Buffer, void, unknown> {
   const { includeEof = true } = options;
   for (const file of files) {
-    if (signal?.aborted) return;
+    if (signal?.aborted) {
+      throw makeAbortError(signal.reason);
+    }
     let stat;
     try {
       stat = await fs.stat(file.fullPath);
@@ -101,18 +227,18 @@ export async function* generateTarStream(
       continue;
     }
     const expectedSize = stat.size;
-    const header = createTarHeader(file.name, expectedSize, stat.mtimeMs);
-    yield header;
+    const headerBlock = createTarHeaderBlock(file.name, expectedSize, stat.mtimeMs);
+    yield headerBlock;
 
     // Stream file contents in 64KB chunks, strictly bounded to expectedSize
-    // so live WiredTiger writes (file growth or truncation) never shift TAR headers.
+    // so live WiredTiger file growth never shifts TAR headers.
     let bytesEmitted = 0;
     if (expectedSize > 0) {
       const stream = fsSync.createReadStream(file.fullPath, { highWaterMark: 64 * 1024 });
       for await (const rawChunk of stream) {
         if (signal?.aborted) {
           stream.destroy();
-          return;
+          throw makeAbortError(signal.reason);
         }
         const chunk = Buffer.isBuffer(rawChunk) ? rawChunk : Buffer.from(rawChunk);
         const remaining = expectedSize - bytesEmitted;
@@ -129,15 +255,12 @@ export async function* generateTarStream(
       }
     }
 
-    // Zero-pad if the file shrank or truncated while being read during hot backup
+    // Fail loudly if a file shrank/truncated during backup instead of silently zero-padding
+    // corrupted WiredTiger B-tree pages.
     if (bytesEmitted < expectedSize) {
-      let missing = expectedSize - bytesEmitted;
-      const zeroChunkSize = 64 * 1024;
-      while (missing > 0) {
-        const n = Math.min(missing, zeroChunkSize);
-        yield Buffer.alloc(n, 0);
-        missing -= n;
-      }
+      throw new Error(
+        `File ${file.name} shrank during physical backup (expected ${expectedSize} bytes, read ${bytesEmitted} bytes); refusing to zero-pad corrupted data`,
+      );
     }
 
     // Pad file data to 512-byte block boundary
@@ -145,6 +268,10 @@ export async function* generateTarStream(
     if (remainder > 0) {
       yield Buffer.alloc(512 - remainder, 0);
     }
+  }
+
+  if (signal?.aborted) {
+    throw makeAbortError(signal.reason);
   }
 
   // End of archive marker: two 512-byte zero blocks (1024 bytes)
@@ -161,7 +288,8 @@ export function createTarPackStream(files: TarEntry[], signal?: AbortSignal): Re
 }
 
 /**
- * Extracts a streaming POSIX tar archive safely to targetDir with path traversal guards.
+ * Extracts a streaming POSIX tar archive safely to targetDir with path traversal guards,
+ * PAX extended path support, full short-write handling, and truncation detection.
  */
 export async function extractTarStream(
   stream: Readable,
@@ -169,109 +297,164 @@ export async function extractTarStream(
   signal?: AbortSignal,
 ): Promise<TarExtractResult> {
   await fs.mkdir(targetDir, { recursive: true });
+  const resolvedRoot = path.resolve(targetDir);
 
   let buffer = Buffer.alloc(0);
-  let currentHeader: { name: string; size: number } | null = null;
+  let currentHeader: { name: string; size: number; isPax: boolean } | null = null;
   let remainingBytes = 0;
   let remainingPad = 0;
   let currentFileHandle: fs.FileHandle | null = null;
+  let paxChunks: Buffer[] = [];
+  let pendingPaxPath: string | null = null;
   let extractedCount = 0;
   let totalBytes = 0;
+  let sawEof = false;
 
-  for await (const chunk of stream) {
-    if (signal?.aborted) break;
-    buffer = Buffer.concat([buffer, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)]);
-
-    while (buffer.length > 0) {
-      if (remainingPad > 0) {
-        const toDiscard = Math.min(buffer.length, remainingPad);
-        buffer = buffer.subarray(toDiscard);
-        remainingPad -= toDiscard;
-        if (remainingPad > 0) break;
+  try {
+    for await (const chunk of stream) {
+      if (signal?.aborted) {
+        throw makeAbortError(signal.reason);
       }
+      buffer = Buffer.concat([buffer, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)]);
 
-      if (!currentHeader) {
-        if (buffer.length < 512) break; // Need full 512-byte header block
-
-        const headerBuf = buffer.subarray(0, 512);
-        buffer = buffer.subarray(512);
-
-        // Check for 512-byte zero block (end-of-archive indicator)
-        const isZero = headerBuf.every((b) => b === 0);
-        if (isZero) continue;
-
-        // Verify tar header checksum (bytes 148..156 treated as ASCII spaces)
-        const rawChksum = headerBuf
-          .toString("ascii", 148, 156)
-          .replace(/[\0 ]+$/, "")
-          .trim();
-        const expectedChksum = parseInt(rawChksum, 8);
-        let computedChksum = 0;
-        for (let i = 0; i < 512; i++) {
-          computedChksum += i >= 148 && i < 156 ? 32 : headerBuf[i]!;
-        }
-        if (Number.isNaN(expectedChksum) || expectedChksum !== computedChksum) {
-          throw new Error("Corrupted tar header: checksum mismatch");
+      while (buffer.length > 0) {
+        if (remainingPad > 0) {
+          const toDiscard = Math.min(buffer.length, remainingPad);
+          buffer = buffer.subarray(toDiscard);
+          remainingPad -= toDiscard;
+          if (remainingPad > 0) break;
         }
 
-        const baseName = headerBuf.toString("utf8", 0, 100).replace(/\0.*$/, "").trim();
-        const ustarPrefix = headerBuf.toString("utf8", 345, 500).replace(/\0.*$/, "").trim();
-        const rawName = ustarPrefix ? `${ustarPrefix}/${baseName}` : baseName;
-        if (!rawName) continue;
+        if (!currentHeader) {
+          if (buffer.length < 512) break; // Need full 512-byte header block
 
-        // Path traversal sanitization
-        const safeName = path.posix
-          .normalize(rawName.replace(/\\/g, "/"))
-          .replace(/^(\.\.\/)+/, "")
-          .replace(/^\/+/, "");
-        let size: number;
-        if ((headerBuf[124]! & 0x80) !== 0) {
-          // GNU base-256 encoded size
-          let bigSize = BigInt(headerBuf[124]! & 0x7f);
-          for (let i = 125; i < 136; i++) {
-            bigSize = (bigSize << 8n) | BigInt(headerBuf[i]!);
+          const headerBuf = buffer.subarray(0, 512);
+          buffer = buffer.subarray(512);
+
+          // Check for 512-byte zero block (end-of-archive indicator)
+          const isZero = headerBuf.every((b) => b === 0);
+          if (isZero) {
+            sawEof = true;
+            continue;
           }
-          size = Number(bigSize);
-        } else {
-          const rawSize = headerBuf.toString("ascii", 124, 136).replace(/\0.*$/, "").trim();
-          size = parseInt(rawSize, 8) || 0;
+
+          // Verify tar header checksum (bytes 148..156 treated as ASCII spaces)
+          const rawChksum = headerBuf
+            .toString("ascii", 148, 156)
+            .replace(/[\0 ]+$/, "")
+            .trim();
+          const expectedChksum = parseInt(rawChksum, 8);
+          let computedChksum = 0;
+          for (let i = 0; i < 512; i++) {
+            computedChksum += i >= 148 && i < 156 ? 32 : headerBuf[i]!;
+          }
+          if (Number.isNaN(expectedChksum) || expectedChksum !== computedChksum) {
+            throw new Error("Corrupted tar header: checksum mismatch");
+          }
+
+          const typeflag = headerBuf.toString("ascii", 156, 157);
+          let size: number;
+          if ((headerBuf[124]! & 0x80) !== 0) {
+            // GNU base-256 encoded size
+            let bigSize = BigInt(headerBuf[124]! & 0x7f);
+            for (let i = 125; i < 136; i++) {
+              bigSize = (bigSize << 8n) | BigInt(headerBuf[i]!);
+            }
+            size = Number(bigSize);
+          } else {
+            const rawSize = headerBuf.toString("ascii", 124, 136).replace(/\0.*$/, "").trim();
+            size = parseInt(rawSize, 8) || 0;
+          }
+
+          if (typeflag === "x") {
+            if (size > MAX_PAX_PAYLOAD_BYTES) {
+              throw new Error(`PAX extended header exceeds safety limit (${size} bytes)`);
+            }
+            currentHeader = { name: "", size, isPax: true };
+            remainingBytes = size;
+            paxChunks = [];
+            continue;
+          }
+
+          const baseName = headerBuf.toString("utf8", 0, 100).replace(/\0.*$/, "").trim();
+          const ustarPrefix = headerBuf.toString("utf8", 345, 500).replace(/\0.*$/, "").trim();
+          const rawName = pendingPaxPath ?? (ustarPrefix ? `${ustarPrefix}/${baseName}` : baseName);
+          pendingPaxPath = null;
+          if (!rawName) continue;
+
+          // Path traversal sanitization
+          const safeName = path.posix
+            .normalize(rawName.replace(/\\/g, "/"))
+            .replace(/^(\.\.\/)+/, "")
+            .replace(/^\/+/, "");
+          if (!safeName || safeName === "." || safeName === "..") continue;
+
+          const fullPath = path.resolve(resolvedRoot, safeName);
+          if (fullPath !== resolvedRoot && !fullPath.startsWith(`${resolvedRoot}${path.sep}`)) {
+            throw new Error(`Tar entry escapes target directory: ${rawName}`);
+          }
+
+          if (typeflag === "5") {
+            await fs.mkdir(fullPath, { recursive: true });
+            const remainder = size % 512;
+            remainingPad = size + (remainder > 0 ? 512 - remainder : 0);
+            continue;
+          }
+
+          currentHeader = { name: safeName, size, isPax: false };
+          remainingBytes = size;
+
+          await fs.mkdir(path.dirname(fullPath), { recursive: true });
+          currentFileHandle = await fs.open(fullPath, "w", 0o600);
         }
 
-        currentHeader = { name: safeName, size };
-        remainingBytes = size;
+        if (currentHeader) {
+          if (remainingBytes > 0) {
+            const toWrite = Math.min(buffer.length, remainingBytes);
+            const slice = buffer.subarray(0, toWrite);
+            if (currentHeader.isPax) {
+              paxChunks.push(Buffer.from(slice));
+            } else if (currentFileHandle) {
+              await writeAll(currentFileHandle, slice);
+              totalBytes += toWrite;
+            }
+            buffer = buffer.subarray(toWrite);
+            remainingBytes -= toWrite;
+          }
 
-        const fullPath = path.join(targetDir, safeName);
-        await fs.mkdir(path.dirname(fullPath), { recursive: true });
-        currentFileHandle = await fs.open(fullPath, "w", 0o600);
-      }
+          if (remainingBytes === 0) {
+            if (currentHeader.isPax) {
+              pendingPaxPath = parsePaxPath(Buffer.concat(paxChunks));
+              paxChunks = [];
+            } else if (currentFileHandle) {
+              await currentFileHandle.close();
+              currentFileHandle = null;
+              extractedCount++;
+            }
 
-      if (currentHeader && currentFileHandle) {
-        if (remainingBytes > 0) {
-          const toWrite = Math.min(buffer.length, remainingBytes);
-          const slice = buffer.subarray(0, toWrite);
-          await currentFileHandle.writeFile(slice);
-          buffer = buffer.subarray(toWrite);
-          remainingBytes -= toWrite;
-          totalBytes += toWrite;
-        }
-
-        if (remainingBytes === 0) {
-          await currentFileHandle.close();
-          currentFileHandle = null;
-          extractedCount++;
-
-          const remainder = currentHeader.size % 512;
-          remainingPad = remainder > 0 ? 512 - remainder : 0;
-          currentHeader = null;
-        } else {
-          break; // Await more chunks for the current file
+            const remainder = currentHeader.size % 512;
+            remainingPad = remainder > 0 ? 512 - remainder : 0;
+            currentHeader = null;
+          } else {
+            break; // Await more chunks for the current entry
+          }
         }
       }
     }
-  }
 
-  if (currentFileHandle) {
-    await currentFileHandle.close().catch(() => {});
+    if (signal?.aborted) {
+      throw makeAbortError(signal.reason);
+    }
+    if (remainingBytes > 0 || currentHeader !== null) {
+      throw new Error("Truncated tar archive: unexpected end of stream mid-entry");
+    }
+    if (!sawEof && (extractedCount > 0 || buffer.length > 0)) {
+      throw new Error("Truncated tar archive: missing end-of-archive zero blocks");
+    }
+  } finally {
+    if (currentFileHandle) {
+      await currentFileHandle.close().catch(() => {});
+    }
   }
 
   return { extractedCount, totalBytes };

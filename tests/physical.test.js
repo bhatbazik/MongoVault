@@ -237,6 +237,7 @@ describe("physical backup engine", () => {
       logger: mockLogger,
       targetDbPath: restoreDbPath,
       ref: "latest",
+      skipRecovery: true,
     });
 
     expect(restoreRes.restoredFiles).toBe(2);
@@ -251,7 +252,7 @@ describe("physical backup engine", () => {
     await fs.rm(tempRoot, { recursive: true, force: true });
   });
 
-  it("bounds TAR stream output when live WiredTiger files grow or shrink during hot backup", async () => {
+  it("bounds growing TAR stream files and fails loudly when live WiredTiger files shrink during hot backup", async () => {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mv-tar-live-"));
     const destDir = await fs.mkdtemp(path.join(os.tmpdir(), "mv-tar-dest-"));
     try {
@@ -263,41 +264,43 @@ describe("physical backup engine", () => {
       await fs.writeFile(shrinkingFile, Buffer.alloc(200, 0x42));
       await fs.writeFile(tailFile, Buffer.from("TAIL_OK"));
 
-      const entries = [
+      // 1. Growing file should be strictly bounded to stat size so subsequent TAR headers stay aligned
+      const growGen = generateTarStream([
         { name: "collection-grow.wt", fullPath: growingFile, size: 100 },
-        { name: "collection-shrink.wt", fullPath: shrinkingFile, size: 200 },
         { name: "WiredTiger.wt", fullPath: tailFile, size: 7 },
-      ];
-
-      // Mutate files after stat/header creation by intercepting generator steps
-      const gen = generateTarStream(entries);
+      ]);
       const chunks = [];
       let step = 0;
-      for await (const chunk of gen) {
+      for await (const chunk of growGen) {
         step++;
         if (step === 1) {
-          // Right after header for growingFile is emitted (100 bytes), append 500 extra bytes on disk!
           await fs.appendFile(growingFile, Buffer.alloc(500, 0x58));
-          // And truncate shrinkingFile from 200 bytes down to 50 bytes before its header/read!
-        }
-        if (step === 4) {
-          // Right after header for shrinkingFile is emitted (after step 1=hdr1, 2=data1, 3=pad1, 4=hdr2),
-          // truncate shrinkingFile on disk from 200 down to 50 bytes before its stream is read!
-          await fs.truncate(shrinkingFile, 50);
         }
         chunks.push(chunk);
       }
 
       const result = await extractTarStream(Readable.from(Buffer.concat(chunks)), destDir);
-      expect(result.extractedCount).toBe(3);
-
+      expect(result.extractedCount).toBe(2);
       const extractedGrow = await fs.readFile(path.join(destDir, "collection-grow.wt"));
-      const extractedShrink = await fs.readFile(path.join(destDir, "collection-shrink.wt"));
       const extractedTail = await fs.readFile(path.join(destDir, "WiredTiger.wt"), "utf8");
-
       expect(extractedGrow.length).toBe(100);
-      expect(extractedShrink.length).toBe(200);
       expect(extractedTail).toBe("TAIL_OK");
+
+      // 2. Shrinking file MUST throw instead of silently zero-padding corrupted WiredTiger B-tree pages
+      const shrinkGen = generateTarStream([
+        { name: "collection-shrink.wt", fullPath: shrinkingFile, size: 200 },
+      ]);
+      await expect(
+        (async () => {
+          let sStep = 0;
+          for await (const _chunk of shrinkGen) {
+            sStep++;
+            if (sStep === 1) {
+              await fs.truncate(shrinkingFile, 50);
+            }
+          }
+        })(),
+      ).rejects.toThrow(/shrank during physical backup/i);
     } finally {
       await fs.rm(tempDir, { recursive: true, force: true });
       await fs.rm(tempDestDirIfAny(destDir), { recursive: true, force: true });
@@ -327,6 +330,84 @@ describe("physical backup engine", () => {
       );
     } finally {
       await fs.rm(destDir, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves existing targetDbPath files when physical restore checksum verification fails", async () => {
+    const { restorePhysicalBackup } = await import("../src/physical.js");
+    const { gzipSync } = await import("node:zlib");
+    const { Readable } = await import("node:stream");
+
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "mv-phys-safe-"));
+    const targetDbPath = path.join(tempRoot, "db");
+    await fs.mkdir(path.join(targetDbPath, "journal"), { recursive: true });
+    await fs.writeFile(path.join(targetDbPath, "WiredTiger.wt"), "ORIGINAL_WT_DATA");
+    await fs.writeFile(
+      path.join(targetDbPath, "journal", "WiredTigerLog.0000000001"),
+      "ORIGINAL_JOURNAL",
+    );
+
+    const srcFile = path.join(tempRoot, "new.wt");
+    await fs.writeFile(srcFile, "NEW_WT_DATA");
+    const tarChunks = [];
+    for await (const chunk of generateTarStream([
+      { name: "WiredTiger.wt", fullPath: srcFile, size: 11 },
+    ])) {
+      tarChunks.push(chunk);
+    }
+    const gzPayload = gzipSync(Buffer.concat(tarChunks));
+
+    const manifest = {
+      version: 2,
+      engine: "physical",
+      key: "phys/2026-03-10/backup.tar.gz",
+      database: "*",
+      size: gzPayload.length,
+      sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+      encryption: null,
+    };
+
+    const mockStorage = {
+      async getJson() {
+        return { data: manifest };
+      },
+      async download() {
+        return Readable.from([gzPayload]);
+      },
+    };
+    const mockLogger = {
+      child() {
+        return this;
+      },
+      info() {},
+      warn() {},
+      error() {},
+      debug() {},
+    };
+
+    try {
+      await expect(
+        restorePhysicalBackup({
+          config: {
+            mongo: { uri: "mongodb://localhost:27017", database: "*" },
+            storage: { prefix: "phys" },
+            workDir: tempRoot,
+          },
+          storage: mockStorage,
+          logger: mockLogger,
+          targetDbPath,
+          ref: manifest.key,
+        }),
+      ).rejects.toThrow(/Checksum mismatch/);
+
+      expect(await fs.readFile(path.join(targetDbPath, "WiredTiger.wt"), "utf8")).toBe(
+        "ORIGINAL_WT_DATA",
+      );
+      expect(
+        await fs.readFile(path.join(targetDbPath, "journal", "WiredTigerLog.0000000001"), "utf8"),
+      ).toBe("ORIGINAL_JOURNAL");
+    } finally {
+      await fs.rm(tempRoot, { recursive: true, force: true });
     }
   });
 });

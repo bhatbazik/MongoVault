@@ -3,9 +3,9 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
-import { PassThrough, Readable } from "node:stream";
+import { PassThrough, Readable, Writable } from "node:stream";
 import { createGunzip, createGzip } from "node:zlib";
-import { MongoClient } from "mongodb";
+import { MongoClient, ObjectId, Timestamp } from "mongodb";
 import { linkedController, settleAll } from "./abort.js";
 import {
   MANIFEST_VERSION,
@@ -19,13 +19,14 @@ import {
 import { createDecryptor, createEncryptor, verifyManifest } from "./crypto.js";
 import { DigestStream } from "./digest.js";
 import { formatBytes, formatDuration } from "./format.js";
+import { MongoOplogTargetClient, OplogApplier } from "./oplog-applier.js";
 import {
-  downloadAndExtractOplogSlice,
-  filterOplogSliceFile,
+  compareTimestamps,
   formatOplogTimestamp,
   fromBsonTimestamp,
-  incrementOplogTimestamp,
+  parseOplogTimestamp,
   resolvePitrPlan,
+  streamOplogSlice,
 } from "./oplog.js";
 import { runStreamPipeline } from "./stream.js";
 import {
@@ -34,13 +35,19 @@ import {
   extractTarStream,
   generateTarStream,
 } from "./tar.js";
-import { replayOplogFile } from "./tools.js";
-import type { BackupManifest, PhysicalBackupMeta } from "./types/catalog.js";
+import type {
+  BackupManifest,
+  PhysicalBackupMeta,
+  PhysicalStorageOptions,
+} from "./types/catalog.js";
+import type { AppConfig } from "./types/config.js";
+import type { OplogTimestamp } from "./types/oplog.js";
 import type {
   BackupCursorFile,
   BackupCursorMetadata,
   PhysicalBackupOptions,
   PhysicalBackupResult,
+  PhysicalRecoveryContext,
   PhysicalRestoreOptions,
   PhysicalRestoreResult,
 } from "./types/physical.js";
@@ -51,6 +58,71 @@ export { createTarHeader, createTarPackStream, generateTarStream, extractTarStre
 const CURSOR_CREATE_RETRIES = 10;
 const OPEN_CONFLICT_WITH_CHECKPOINT_ERR_CODE = 50915;
 const OPLOG_ROLLED_OVER_ERR_CODE = 50917;
+const DISK_HEADROOM_MULTIPLIER = 1.1;
+
+/**
+ * Safely extracts `--dbpath` from MongoDB `getCmdLineOpts` output, avoiding the
+ * `argv.indexOf("--dbpath") === -1 => argv[0]` bug.
+ */
+export function extractDbPathFromCmdOpts(
+  cmdOpts: Record<string, unknown> | null,
+): string | undefined {
+  if (!cmdOpts) return undefined;
+  const parsed = cmdOpts.parsed as { storage?: { dbPath?: string } } | undefined;
+  if (parsed?.storage?.dbPath && typeof parsed.storage.dbPath === "string") {
+    return parsed.storage.dbPath;
+  }
+  const argv = cmdOpts.argv;
+  if (Array.isArray(argv)) {
+    for (let i = 0; i < argv.length; i++) {
+      const arg = String(argv[i]);
+      if (arg.startsWith("--dbpath=")) {
+        const value = arg.slice("--dbpath=".length);
+        if (value) return value;
+      } else if (arg === "--dbpath" && i + 1 < argv.length) {
+        const next = String(argv[i + 1]);
+        if (next && !next.startsWith("-")) return next;
+      }
+    }
+  }
+  return undefined;
+}
+
+function extractStorageOptionsFromCmdOpts(
+  cmdOpts: Record<string, unknown> | null,
+): PhysicalStorageOptions | undefined {
+  if (!cmdOpts) return undefined;
+  const parsed = cmdOpts.parsed as
+    | {
+        storage?: {
+          directoryPerDB?: boolean;
+          wiredTiger?: {
+            engineConfig?: {
+              directoryForIndexes?: boolean;
+              journalCompressor?: string;
+            };
+            collectionConfig?: {
+              blockCompressor?: string;
+            };
+          };
+        };
+      }
+    | undefined;
+  const storage = parsed?.storage;
+  if (!storage) return undefined;
+  const opts: PhysicalStorageOptions = {};
+  if (typeof storage.directoryPerDB === "boolean") opts.directoryPerDB = storage.directoryPerDB;
+  if (typeof storage.wiredTiger?.engineConfig?.directoryForIndexes === "boolean") {
+    opts.directoryForIndexes = storage.wiredTiger.engineConfig.directoryForIndexes;
+  }
+  if (typeof storage.wiredTiger?.engineConfig?.journalCompressor === "string") {
+    opts.journalCompressor = storage.wiredTiger.engineConfig.journalCompressor;
+  }
+  if (typeof storage.wiredTiger?.collectionConfig?.blockCompressor === "string") {
+    opts.blockCompressor = storage.wiredTiger.collectionConfig.blockCompressor;
+  }
+  return Object.keys(opts).length > 0 ? opts : undefined;
+}
 
 /**
  * Strips dbPath prefix from a file path returned by $backupCursor / $backupCursorExtend
@@ -132,9 +204,8 @@ export async function probePhysicalCapability(
   // 2. Discover dbPath from getCmdLineOpts if not already known
   if (!dbPath) {
     try {
-      const cmdOpts = await admin.command({ getCmdLineOpts: 1 });
-      dbPath =
-        cmdOpts?.parsed?.storage?.dbPath || cmdOpts?.argv?.[cmdOpts.argv.indexOf("--dbpath") + 1];
+      const cmdOpts = (await admin.command({ getCmdLineOpts: 1 })) as Record<string, unknown>;
+      dbPath = extractDbPathFromCmdOpts(cmdOpts);
     } catch {
       // Ignore
     }
@@ -174,7 +245,6 @@ export async function scanWiredTigerFiles(
       }
 
       if (entry.isDirectory()) {
-        // Include journal, diagnostic.data
         await walk(fullPath, relName);
       } else if (entry.isFile()) {
         const stat = await fs.stat(fullPath);
@@ -203,7 +273,6 @@ async function drainCursorDocs(cursor: unknown): Promise<Record<string, unknown>
       docs.push(c.__firstDoc);
     }
     delete c.__firstDoc;
-    // If firstDoc was null, the cursor is already exhausted.
     if (docs.length === 0) return docs;
   }
 
@@ -234,6 +303,25 @@ async function drainCursorDocs(cursor: unknown): Promise<Record<string, unknown>
   return docs;
 }
 
+async function getMajorityCommittedTs(client: MongoClient): Promise<OplogTimestamp | null> {
+  try {
+    const status = (await client.db("admin").command({ replSetGetStatus: 1 })) as {
+      optimes?: {
+        lastCommittedOpTime?: { ts?: unknown };
+        appliedOpTime?: { ts?: unknown };
+      };
+    };
+    const committed = fromBsonTimestamp(status?.optimes?.lastCommittedOpTime?.ts);
+    const applied = fromBsonTimestamp(status?.optimes?.appliedOpTime?.ts);
+    if (committed && applied) {
+      return compareTimestamps(committed, applied) <= 0 ? committed : applied;
+    }
+    return committed ?? applied;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Executes a Physical Hot Backup of MongoDB WiredTiger files straight to S3/Storage.
  */
@@ -262,18 +350,30 @@ export async function runPhysicalBackup({
   let locked = false;
   let cursor: ReturnType<ReturnType<MongoClient["db"]>["aggregate"]> | null = null;
   let keepAliveTimer: NodeJS.Timeout | null = null;
+  let uploadCompleted = false;
 
   try {
     await client.connect();
     const admin = client.db("admin");
     let resolvedDbPath = overrideDbPath || config.physical?.dbPath;
 
+    // Gather MongoDB version & WiredTiger storage options (non-fatal)
+    const [buildInfo, cmdOpts] = await Promise.all([
+      admin.command({ buildInfo: 1 }).catch(() => null) as Promise<{ version?: string } | null>,
+      admin.command({ getCmdLineOpts: 1 }).catch(() => null) as Promise<Record<
+        string,
+        unknown
+      > | null>,
+    ]);
+    const mongoVersion = typeof buildInfo?.version === "string" ? buildInfo.version : undefined;
+    const storageOptions = extractStorageOptionsFromCmdOpts(cmdOpts);
+
     let cursorMeta: BackupCursorMetadata | null = null;
     const dataFiles: Array<{ name: string; fullPath: string; size: number }> = [];
     const journalFiles: Array<{ name: string; fullPath: string; size: number }> = [];
     let filesToArchive: Array<{ name: string; fullPath: string; size: number }> = [];
 
-    // 1. Open $backupCursor directly (single open — never open twice via probePhysicalCapability)
+    // 1. Open $backupCursor directly (single open — never open twice)
     try {
       cursor = await createBackupCursorWithRetries(admin, CURSOR_CREATE_RETRIES);
       const initialDocs = await drainCursorDocs(cursor);
@@ -287,12 +387,7 @@ export async function runPhysicalBackup({
       }
 
       if (!resolvedDbPath) {
-        try {
-          const cmdOpts = await admin.command({ getCmdLineOpts: 1 });
-          resolvedDbPath =
-            cmdOpts?.parsed?.storage?.dbPath ||
-            cmdOpts?.argv?.[cmdOpts.argv.indexOf("--dbpath") + 1];
-        } catch {}
+        resolvedDbPath = extractDbPathFromCmdOpts(cmdOpts);
       }
 
       if (resolvedDbPath) {
@@ -328,21 +423,27 @@ export async function runPhysicalBackup({
         } catch {}
       }
 
-      // Keep cursor alive during long uploads using non-blocking tryNext poll
-      keepAliveTimer = setInterval(async () => {
-        try {
-          if (cursor && !(cursor as { closed?: boolean }).closed) {
-            const c = cursor as {
-              tryNext?: () => Promise<unknown>;
-              hasNext?: () => Promise<boolean>;
-            };
-            if (typeof c.tryNext === "function") {
-              await c.tryNext().catch(() => {});
-            } else if (typeof c.hasNext === "function") {
-              await c.hasNext().catch(() => {});
-            }
-          }
-        } catch {}
+      // Keep cursor alive during long uploads; if keep-alive fails, abort backup immediately
+      // so we never upload torn/unpinned WiredTiger files.
+      keepAliveTimer = setInterval(() => {
+        if (uploadCompleted || !cursor || (cursor as { closed?: boolean }).closed) return;
+        const c = cursor as {
+          tryNext?: () => Promise<unknown>;
+          hasNext?: () => Promise<boolean>;
+        };
+        const ping =
+          typeof c.tryNext === "function"
+            ? c.tryNext()
+            : typeof c.hasNext === "function"
+              ? c.hasNext()
+              : null;
+        if (!ping) return;
+        ping.catch((err) => {
+          if (uploadCompleted) return;
+          const msg = err instanceof Error ? err.message : String(err);
+          log.error({ err }, "$backupCursor keep-alive failed; aborting physical backup");
+          controller.abort(new Error(`$backupCursor keep-alive failed: ${msg}`));
+        });
       }, 45_000);
       keepAliveTimer.unref();
     } catch (cursorErr) {
@@ -355,11 +456,7 @@ export async function runPhysicalBackup({
     }
 
     if (!resolvedDbPath) {
-      try {
-        const cmdOpts = await admin.command({ getCmdLineOpts: 1 });
-        resolvedDbPath =
-          cmdOpts?.parsed?.storage?.dbPath || cmdOpts?.argv?.[cmdOpts.argv.indexOf("--dbpath") + 1];
-      } catch {}
+      resolvedDbPath = extractDbPathFromCmdOpts(cmdOpts);
     }
 
     if (!resolvedDbPath) {
@@ -396,6 +493,22 @@ export async function runPhysicalBackup({
       await admin.command({ fsync: 1, lock: true });
       locked = true;
 
+      // Warn if any in-progress/prepared multi-document transactions exist under fsyncLock
+      try {
+        const activeTxns = await client
+          .db("config")
+          .collection("transactions")
+          .countDocuments({ state: { $in: ["inProgress", "prepared"] } });
+        if (activeTxns > 0) {
+          log.warn(
+            { activeTxns },
+            "Detected in-progress/prepared distributed transactions during fsyncLock backup; those transactions will be rolled back on restore",
+          );
+        }
+      } catch {
+        // Standalone or no config.transactions
+      }
+
       // Capture exact oplog position while write-locked so fsyncLock backups support PITR
       try {
         const newestDoc = await client
@@ -431,19 +544,31 @@ export async function runPhysicalBackup({
       throw new Error(`No WiredTiger files found under dbPath: ${activeDbPath}`);
     }
 
-    // Helper to collect extended journal files AFTER all .wt data files have been copied
-    // (Percona PBM pattern: data files first, then $backupCursorExtend & journal files last).
-    let extendedToOplogEnd = false;
+    // Percona PBM pattern: stream .wt data files first, then call $backupCursorExtend
+    // to extend the pinned journal set up to majority committed opTime, and stream
+    // ONLY the cursor-pinned journal files (never blind fs.readdir when extended).
+    let extendedToTs: OplogTimestamp | null = null;
     const collectJournalFilesAfterDataCopy = async () => {
       if (cursorMeta) {
-        const extendTargetTs = cursorMeta.oplogEnd?.ts || cursorMeta.checkpointTimestamp;
+        const cursorEndTs =
+          fromBsonTimestamp(cursorMeta.oplogEnd?.ts) ??
+          fromBsonTimestamp(cursorMeta.checkpointTimestamp);
+        const majorityTs = await getMajorityCommittedTs(client);
+        let extendTargetTs = cursorEndTs;
+        if (majorityTs && cursorEndTs && compareTimestamps(majorityTs, cursorEndTs) > 0) {
+          extendTargetTs = majorityTs;
+        } else if (majorityTs && !extendTargetTs) {
+          extendTargetTs = majorityTs;
+        }
+
         if (cursorMeta.backupId && extendTargetTs) {
           try {
+            const bsonTarget = new Timestamp({ t: extendTargetTs.t, i: extendTargetTs.i });
             const extCursor = admin.aggregate([
               {
                 $backupCursorExtend: {
                   backupId: cursorMeta.backupId,
-                  timestamp: extendTargetTs,
+                  timestamp: bsonTarget,
                 },
               },
             ]);
@@ -468,7 +593,7 @@ export async function runPhysicalBackup({
               }
             }
             await extCursor.close().catch(() => {});
-            extendedToOplogEnd = true;
+            extendedToTs = extendTargetTs;
           } catch (extErr) {
             log.warn(
               { err: extErr },
@@ -476,24 +601,8 @@ export async function runPhysicalBackup({
             );
           }
         } else if (!cursorMeta.oplogEnd?.ts) {
-          extendedToOplogEnd = true;
+          extendedToTs = fromBsonTimestamp(cursorMeta.checkpointTimestamp);
         }
-
-        // Also scan journal directory for any WiredTigerLog* files created during data copy
-        const journalDir = path.join(activeDbPath, "journal");
-        try {
-          const jEntries = await fs.readdir(journalDir, { withFileTypes: true });
-          for (const jEntry of jEntries) {
-            if (jEntry.isFile() && jEntry.name.startsWith("WiredTigerLog")) {
-              const relName = `journal/${jEntry.name}`;
-              if (!journalFiles.some((f) => f.name === relName)) {
-                const fullJPath = path.join(journalDir, jEntry.name);
-                const stat = await fs.stat(fullJPath);
-                journalFiles.push({ name: relName, fullPath: fullJPath, size: stat.size });
-              }
-            }
-          }
-        } catch {}
       }
       filesToArchive = [...dataFiles, ...journalFiles];
     };
@@ -501,7 +610,7 @@ export async function runPhysicalBackup({
     async function* generateOrderedPhysicalTar(): AsyncGenerator<Buffer, void, unknown> {
       // Phase 1: Stream all .wt data files first (without EOF marker)
       yield* generateTarStream(dataFiles, controller.signal, { includeEof: false });
-      // Phase 2: Extend backup cursor and stream journal files last (with EOF marker)
+      // Phase 2: Extend backup cursor and stream pinned journal files last (with EOF marker)
       await collectJournalFilesAfterDataCopy();
       yield* generateTarStream(journalFiles, controller.signal, { includeEof: true });
     }
@@ -524,12 +633,15 @@ export async function runPhysicalBackup({
     await settleAll(controller, [
       storage.upload(key, body, {
         contentType: encrypted ? "application/octet-stream" : "application/gzip",
+        expectedSizeBytes: initialRawBytes > 0 ? initialRawBytes : undefined,
         signal: controller.signal,
         onProgress: ({ loaded }) =>
           log.debug({ uploadedBytes: loaded }, "Physical upload progress"),
       }),
       runStreamPipeline(stages, { signal: controller.signal }),
     ]);
+
+    uploadCompleted = true;
 
     if (typeof storage.head === "function") {
       const stored = await storage.head(key);
@@ -540,12 +652,18 @@ export async function runPhysicalBackup({
       }
     }
 
-    // Unlock MongoDB write lock if acquired
+    // Unlock MongoDB write lock if acquired and verify unlock succeeded
     if (locked) {
-      await client
+      const unlockRes = await client
         .db("admin")
         .command({ fsyncUnlock: 1 })
-        .catch(() => {});
+        .catch((err) => {
+          log.error({ err }, "CRITICAL: Failed to release MongoDB fsyncLock");
+          return null;
+        });
+      if (unlockRes && unlockRes.ok !== 1 && unlockRes.lockCount !== 0) {
+        log.warn({ unlockRes }, "Unexpected response from fsyncUnlock");
+      }
       locked = false;
       log.info("Released MongoDB fsyncLock");
     }
@@ -556,6 +674,8 @@ export async function runPhysicalBackup({
     const physicalMeta: PhysicalBackupMeta = {
       dbPath: resolvedDbPath,
       cursorType: cursorMeta ? "$backupCursor" : "fsyncLock",
+      ...(mongoVersion ? { mongoVersion } : {}),
+      ...(storageOptions ? { storageOptions } : {}),
       filesCount: filesToArchive.length,
       files: filesToArchive.map((f) => ({ name: f.name, size: f.size })),
       checkpointTimestamp: cursorMeta?.checkpointTimestamp
@@ -564,13 +684,17 @@ export async function runPhysicalBackup({
       oplogStart: cursorMeta?.oplogStart?.ts
         ? formatOplogTimestamp(cursorMeta.oplogStart.ts)
         : undefined,
-      oplogEnd: cursorMeta?.oplogEnd?.ts ? formatOplogTimestamp(cursorMeta.oplogEnd.ts) : undefined,
+      oplogEnd: extendedToTs
+        ? formatOplogTimestamp(extendedToTs)
+        : cursorMeta?.oplogEnd?.ts
+          ? formatOplogTimestamp(cursorMeta.oplogEnd.ts)
+          : undefined,
     };
 
     const effectiveStartTs =
       physicalMeta.oplogStart || physicalMeta.checkpointTimestamp || fsyncOplogTs;
     const effectiveEndTs =
-      (extendedToOplogEnd ? physicalMeta.oplogEnd : undefined) ||
+      (extendedToTs ? formatOplogTimestamp(extendedToTs) : undefined) ||
       physicalMeta.checkpointTimestamp ||
       fsyncOplogTs;
 
@@ -619,6 +743,7 @@ export async function runPhysicalBackup({
     }
     throw error;
   } finally {
+    uploadCompleted = true;
     if (keepAliveTimer) clearInterval(keepAliveTimer);
     if (cursor) {
       await cursor.close().catch(() => {});
@@ -646,9 +771,54 @@ async function findFreePort(): Promise<number> {
   });
 }
 
+async function probeLocalMongodVersion(): Promise<string | null> {
+  return new Promise((resolve) => {
+    const child = spawn("mongod", ["--version"], { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    child.stdout?.on("data", (d) => {
+      out += String(d);
+    });
+    child.once("error", () => resolve(null));
+    child.once("close", (code) => {
+      if (code !== 0) return resolve(null);
+      const match = /db version\s+v?([\d.]+)/i.exec(out);
+      resolve(match ? match[1]! : null);
+    });
+  });
+}
+
+function assertCompatibleMongoVersion(backupVersion: string, localVersion: string): void {
+  const bParts = backupVersion.split(".").map((n) => parseInt(n, 10));
+  const lParts = localVersion.split(".").map((n) => parseInt(n, 10));
+  if (bParts[0] !== lParts[0] || bParts[1] !== lParts[1]) {
+    throw new Error(
+      `MongoDB major.minor version mismatch for physical restore: backup was taken on ${backupVersion}, local mongod is ${localVersion}`,
+    );
+  }
+}
+
+async function computeDirectoryBytes(dir: string): Promise<number> {
+  let total = 0;
+  try {
+    const entries = await fs.readdir(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        total += await computeDirectoryBytes(fullPath);
+      } else if (entry.isFile()) {
+        const stat = await fs.stat(fullPath).catch(() => null);
+        if (stat) total += stat.size;
+      }
+    }
+  } catch {
+    return 0;
+  }
+  return total;
+}
+
 async function waitForMongodReady(
   uri: string,
-  timeoutMs = 30_000,
+  timeoutMs = 60_000,
   hasExited?: () => boolean,
   logPath?: string,
 ): Promise<MongoClient> {
@@ -660,7 +830,7 @@ async function waitForMongodReady(
       if (logPath) {
         try {
           const raw = await fs.readFile(logPath, "utf8");
-          logTail = raw.trim().split("\n").slice(-10).join("\n");
+          logTail = raw.trim().split("\n").slice(-15).join("\n");
         } catch {}
       }
       throw new Error(
@@ -683,9 +853,319 @@ async function waitForMongodReady(
   );
 }
 
+async function waitForLockFileCleared(dbPath: string, timeoutMs = 15_000): Promise<void> {
+  const lockPath = path.join(dbPath, "mongod.lock");
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const stat = await fs.stat(lockPath);
+      if (stat.size === 0) return;
+    } catch {
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+}
+
+/**
+ * Coordinates Percona-PBM-grade 3/4-step WiredTiger & Replica Set physical recovery:
+ * 1. Prepare `local.replset.minvalid` & `local.replset.oplogTruncateAfterPoint` (for `$backupCursor` snapshots).
+ * 2. Boot with `recoverFromOplogAsStandalone=true` + `takeUnstableCheckpointOnShutdown=true` so WiredTiger
+ *    replays the pinned journal + oplog to the exact consistent point.
+ * 3. Replay PITR oplog slices via streaming `OplogApplier` + `buildPendingIndexes({ standalone: true })`.
+ * 4. Clean stale RS/cluster state (`local.system.replset`, `config.cache.*`, `config.system.sessions`,
+ *    `config.transactions`, `config.rangeDeletions`), `fsync`, and gracefully shut down (`force: false`).
+ */
+export class PhysicalRecoveryCoordinator {
+  async run(ctx: PhysicalRecoveryContext): Promise<{ replayedEntries: number }> {
+    const { config, storage, logger, targetDbPath, manifest, pitrPlan, signal } = ctx;
+    const isBackupCursor = manifest?.physical?.cursorType === "$backupCursor";
+    const restoreToStr =
+      manifest?.oplogWindow?.endTs ??
+      manifest?.physical?.oplogEnd ??
+      manifest?.physical?.checkpointTimestamp;
+    const restoreToTs = restoreToStr ? parseOplogTimestamp(restoreToStr) : null;
+
+    const baseArgs = this.buildBaseMongodArgs(config, manifest, targetDbPath);
+    let replayedEntries = 0;
+
+    if (isBackupCursor && restoreToTs) {
+      // Step 1: Prepare recovery markers (minvalid + oplogTruncateAfterPoint)
+      logger.info(
+        { restoreToTs: formatOplogTimestamp(restoreToTs) },
+        "Physical recovery step 1/3: writing WiredTiger recovery markers",
+      );
+      await this.runWithEphemeralMongod(config.workDir, targetDbPath, baseArgs, async (client) => {
+        const localDb = client.db("local");
+        await localDb
+          .collection("system.replset")
+          .deleteMany({})
+          .catch(() => {});
+        await localDb
+          .collection("replset.minvalid")
+          .deleteMany({})
+          .catch(() => {});
+        await localDb
+          .collection("replset.oplogTruncateAfterPoint")
+          .deleteMany({})
+          .catch(() => {});
+
+        const bsonTarget = new Timestamp({ t: restoreToTs.t, i: restoreToTs.i });
+        await localDb.collection("replset.minvalid").insertOne({
+          _id: new ObjectId(),
+          t: -1,
+          ts: bsonTarget,
+          oplogDeleteFromPoint: new Timestamp({ t: 0, i: 0 }),
+        });
+        await localDb.collection("replset.oplogTruncateAfterPoint").insertOne({
+          _id: "oplogTruncateAfterPoint" as unknown as ObjectId,
+          oplogTruncateAfterPoint: bsonTarget,
+        });
+        await client
+          .db("admin")
+          .command({ fsync: 1 })
+          .catch(() => {});
+      });
+
+      // Step 2: Recover from oplog as standalone (replays journal + oplog to restoreToTs)
+      logger.info(
+        { restoreToTs: formatOplogTimestamp(restoreToTs) },
+        "Physical recovery step 2/3: running recoverFromOplogAsStandalone",
+      );
+      await this.runWithEphemeralMongod(
+        config.workDir,
+        targetDbPath,
+        [...baseArgs, "--setParameter=recoverFromOplogAsStandalone=true"],
+        async (client) => {
+          await client
+            .db("admin")
+            .command({ fsync: 1 })
+            .catch(() => {});
+        },
+      );
+    }
+
+    // Step 3 (+ 4): Replay PITR slices (if any) via streaming OplogApplier, then reset RS state
+    logger.info(
+      { slices: pitrPlan?.slices.length ?? 0 },
+      pitrPlan
+        ? "Physical recovery final step: replaying PITR oplog slices and resetting replica set state"
+        : "Physical recovery final step: resetting replica set state and flushing clean checkpoint",
+    );
+    await this.runWithEphemeralMongod(config.workDir, targetDbPath, baseArgs, async (client) => {
+      if (pitrPlan && pitrPlan.slices.length > 0) {
+        const applier = new OplogApplier({
+          target: new MongoOplogTargetClient(client),
+          workDir: config.workDir,
+          logger,
+          startExclusiveTs: pitrPlan.baseEndTs,
+          endTs: pitrPlan.targetTs,
+          backupType: "physical",
+          unsafe: true,
+        });
+
+        try {
+          for (const slice of pitrPlan.slices) {
+            await streamOplogSlice({ config, storage, signal }, slice.key, (stream) =>
+              applier.applyStream(stream, signal),
+            );
+          }
+          await applier.buildPendingIndexes({ standalone: true });
+          replayedEntries = applier.getStats().appliedEntries;
+        } finally {
+          await applier.dispose();
+        }
+      }
+
+      await this.resetReplicaSetState(client);
+      await client
+        .db("admin")
+        .command({ fsync: 1 })
+        .catch(() => {});
+    });
+
+    return { replayedEntries };
+  }
+
+  private buildBaseMongodArgs(
+    config: AppConfig,
+    manifest: BackupManifest | null,
+    targetDbPath: string,
+  ): string[] {
+    const storageOpts = manifest?.physical?.storageOptions;
+    const args = [
+      `--dbpath=${targetDbPath}`,
+      "--bind_ip=127.0.0.1",
+      "--setParameter=ttlMonitorEnabled=false",
+      "--setParameter=disableLogicalSessionCacheRefresh=true",
+      "--setParameter=takeUnstableCheckpointOnShutdown=true",
+    ];
+    if (storageOpts?.directoryPerDB || config.physical?.directoryPerDb) {
+      args.push("--directoryperdb");
+    }
+    if (storageOpts?.directoryForIndexes) {
+      args.push("--wiredTigerDirectoryForIndexes");
+    }
+    if (config.physical?.encryptionKeyFile) {
+      args.push("--enableEncryption", `--encryptionKeyFile=${config.physical.encryptionKeyFile}`);
+    }
+    return args;
+  }
+
+  private async resetReplicaSetState(client: MongoClient): Promise<void> {
+    const localDb = client.db("local");
+    const configDb = client.db("config");
+
+    // Note: MongoDB forbids dropping `local.system.replset` directly, so clear it via `deleteMany({})`
+    await Promise.all([
+      localDb
+        .collection("system.replset")
+        .deleteMany({})
+        .catch(() => {}),
+      localDb
+        .collection("replset.minvalid")
+        .deleteMany({})
+        .catch(() => {}),
+      localDb
+        .collection("replset.oplogTruncateAfterPoint")
+        .deleteMany({})
+        .catch(() => {}),
+      localDb
+        .collection("replset.election")
+        .deleteMany({})
+        .catch(() => {}),
+      configDb
+        .collection("transactions")
+        .drop()
+        .catch(() => {}),
+      configDb
+        .collection("rangeDeletions")
+        .drop()
+        .catch(() => {}),
+    ]);
+
+    // Drop config.cache.* metadata collections (matching PBM)
+    try {
+      const cacheColls = await configDb
+        .listCollections({ name: /^cache\./ }, { nameOnly: true })
+        .toArray();
+      for (const coll of cacheColls) {
+        await configDb
+          .collection(coll.name)
+          .drop()
+          .catch(() => {});
+      }
+    } catch {
+      // Ignore if config db has no cache collections
+    }
+
+    // Retry dropping config.system.sessions (session reaper may briefly hold a lock)
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        await configDb.collection("system.sessions").drop();
+        break;
+      } catch (err: unknown) {
+        const code = (err as { code?: number })?.code;
+        if (code === 26) break; // NamespaceNotFound
+        if (attempt < 4) {
+          await new Promise((r) => setTimeout(r, 500));
+        }
+      }
+    }
+  }
+
+  private async runWithEphemeralMongod(
+    workDir: string,
+    targetDbPath: string,
+    baseArgs: string[],
+    fn: (client: MongoClient) => Promise<void>,
+  ): Promise<void> {
+    await fs.mkdir(workDir, { recursive: true });
+    const port = await findFreePort();
+    const ephemeralUri = `mongodb://127.0.0.1:${port}`;
+    const mongodLog = path.join(workDir, `.pitr-mongod-${randomUUID()}.log`);
+
+    const proc = spawn("mongod", [...baseArgs, `--port=${port}`, `--logpath=${mongodLog}`], {
+      stdio: "ignore",
+    });
+
+    const procExit = new Promise<void>((resolve) => {
+      proc.once("close", () => resolve());
+      proc.once("error", () => resolve());
+    });
+
+    let tmpClient: MongoClient | null = null;
+    try {
+      tmpClient = await waitForMongodReady(
+        ephemeralUri,
+        60_000,
+        () => proc.exitCode !== null || proc.signalCode !== null,
+        mongodLog,
+      );
+
+      await fn(tmpClient);
+
+      // Graceful shutdown (force: false) so WiredTiger writes a clean stable checkpoint
+      await tmpClient
+        .db("admin")
+        .command({ shutdown: 1, force: false, timeoutSecs: 30 })
+        .catch(() => {});
+      await tmpClient.close().catch(() => {});
+      tmpClient = null;
+      await Promise.race([procExit, new Promise((r) => setTimeout(r, 35_000))]);
+      await waitForLockFileCleared(targetDbPath);
+    } finally {
+      if (tmpClient) {
+        await tmpClient
+          .db("admin")
+          .command({ shutdown: 1, force: true })
+          .catch(() => {});
+        await tmpClient.close().catch(() => {});
+      }
+      if (proc.exitCode === null && proc.signalCode === null) {
+        proc.kill("SIGTERM");
+        await Promise.race([procExit, new Promise((r) => setTimeout(r, 10_000))]);
+        if (proc.exitCode === null && proc.signalCode === null) {
+          proc.kill("SIGKILL");
+        }
+      }
+      await fs.rm(mongodLog, { force: true }).catch(() => {});
+    }
+  }
+}
+
+async function verifyPhysicalArchiveZeroDisk(
+  storage: PhysicalRestoreOptions["storage"],
+  backupKey: string,
+  manifestData: BackupManifest | null,
+  keyRing: Buffer[],
+  signal?: AbortSignal,
+): Promise<void> {
+  const digest = new DigestStream();
+  const decryptStage = manifestData?.encryption
+    ? [createDecryptor(keyRing, manifestData.encryption)]
+    : [];
+  const gunzip = createGunzip();
+  const discard = new Writable({ write: (_c, _e, cb) => cb() });
+  const downloadStream = await storage.download(backupKey, { signal });
+  await runStreamPipeline([downloadStream, digest, ...decryptStage, gunzip, discard], { signal });
+  const actualSha256 = digest.digest();
+  if (manifestData?.sha256 && manifestData.sha256 !== actualSha256) {
+    throw new Error(
+      `Pre-verification checksum mismatch for ${backupKey}: expected ${manifestData.sha256}, got ${actualSha256}`,
+    );
+  }
+  if (manifestData?.size !== undefined && manifestData.size !== digest.bytes) {
+    throw new Error(
+      `Pre-verification size mismatch for ${backupKey}: expected ${manifestData.size}, got ${digest.bytes}`,
+    );
+  }
+}
+
 /**
  * Restores a physical WiredTiger hot backup directly into a target dbPath,
- * with optional Point-in-Time Recovery (PITR) oplog replay via an ephemeral local mongod.
+ * with small-disk awareness (1x-disk direct mode after zero-disk pre-verification),
+ * PBM 3/4-step WiredTiger/RS recovery, and optional streaming PITR oplog replay.
  */
 export async function restorePhysicalBackup({
   config,
@@ -695,6 +1175,8 @@ export async function restorePhysicalBackup({
   ref = "latest",
   pitr,
   signal,
+  skipRecovery = false,
+  recoveryRunner,
 }: PhysicalRestoreOptions): Promise<PhysicalRestoreResult> {
   const log = logger.child({ targetDbPath });
   log.info({ ref, pitr }, "Starting physical backup restore");
@@ -726,59 +1208,180 @@ export async function restorePhysicalBackup({
     }
   }
 
-  // Clean existing WiredTiger data and journal files in targetDbPath before extracting
-  // so no leftover orphan .wt or journal files from a prior database corrupt recovery.
+  await fs.mkdir(targetDbPath, { recursive: true });
+
+  // Live mongod guard: refuse to overwrite a dbPath currently held by a running mongod
   try {
-    const existingEntries = await fs.readdir(targetDbPath, { withFileTypes: true });
-    for (const entry of existingEntries) {
-      if (
-        entry.name.endsWith(".wt") ||
-        entry.name.endsWith(".turtle") ||
-        entry.name.startsWith("WiredTiger") ||
-        entry.name === "storage.bson" ||
-        entry.name === "journal" ||
-        entry.name === "mongod.lock" ||
-        entry.name === "ongoingBackup.lock"
-      ) {
-        await fs
-          .rm(path.join(targetDbPath, entry.name), { recursive: true, force: true })
-          .catch(() => {});
+    const lockStat = await fs.stat(path.join(targetDbPath, "mongod.lock"));
+    if (lockStat.size > 0) {
+      throw new Error(
+        `Target dbPath ${targetDbPath} appears to be in use by a running mongod process (non-empty mongod.lock). Stop mongod before physical restore.`,
+      );
+    }
+  } catch (err) {
+    if (err instanceof Error && err.message.includes("running mongod")) throw err;
+  }
+
+  // MongoDB version compatibility check when recovery will run
+  if (!skipRecovery && !recoveryRunner && manifestData?.physical?.mongoVersion) {
+    const localVersion = await probeLocalMongodVersion();
+    if (localVersion) {
+      assertCompatibleMongoVersion(manifestData.physical.mongoVersion, localVersion);
+    }
+  }
+
+  // Disk space strategy for small-storage instances (e.g. 20-30 GB disks):
+  // - >= 1.1x free: safe staged extraction + full-directory rollback swap
+  // - < 1.1x free but free + existing >= 1.1x: zero-disk pre-verify first, then clear old files & direct 1x-disk extract
+  // - < 1.1x even after clearing: fail fast before touching disk
+  const requiredBytes =
+    manifestData?.physical?.files?.reduce((sum, f) => sum + (f.size || 0), 0) ?? 0;
+  let useDirectMode = false;
+  if (requiredBytes > 0 && typeof fs.statfs === "function") {
+    try {
+      const stats = await fs.statfs(targetDbPath);
+      const freeBytes = Number(stats.bavail) * Number(stats.bsize);
+      const needed = Math.ceil(requiredBytes * DISK_HEADROOM_MULTIPLIER);
+      if (freeBytes < needed) {
+        const existingBytes = await computeDirectoryBytes(targetDbPath);
+        if (freeBytes + existingBytes >= needed) {
+          useDirectMode = true;
+          log.warn(
+            {
+              freeBytes: formatBytes(freeBytes),
+              existingBytes: formatBytes(existingBytes),
+              requiredBytes: formatBytes(requiredBytes),
+            },
+            "Insufficient free space for 2x staged physical restore; switching to pre-verified 1x-disk direct extraction mode",
+          );
+        } else {
+          throw new Error(
+            `Insufficient disk space on ${targetDbPath}: need ${formatBytes(needed)}, available ${formatBytes(freeBytes)} (reclaimable ${formatBytes(existingBytes)})`,
+          );
+        }
+      }
+    } catch (err) {
+      if (err instanceof Error && err.message.startsWith("Insufficient disk space")) {
+        throw err;
       }
     }
-  } catch {
-    // targetDbPath may not exist yet
   }
 
-  const digest = new DigestStream();
-  const decryptStage = manifestData?.encryption
-    ? [createDecryptor(keyRing, manifestData.encryption)]
-    : [];
-  const gunzip = createGunzip();
+  const controller = linkedController(signal);
+  let extractedCount: number;
+  let totalBytes: number;
 
-  const downloadStream = await storage.download(backupKey, { signal });
-  const unpackPass = new PassThrough();
+  const extractToDir = async (
+    destDir: string,
+  ): Promise<{ extractedCount: number; totalBytes: number }> => {
+    const digest = new DigestStream();
+    const decryptStage = manifestData?.encryption
+      ? [createDecryptor(keyRing, manifestData.encryption)]
+      : [];
+    const gunzip = createGunzip();
 
-  const stages = [downloadStream, digest, ...decryptStage, gunzip, unpackPass];
+    const downloadStream = await storage.download(backupKey, { signal: controller.signal });
+    const unpackPass = new PassThrough();
+    const stages = [downloadStream, digest, ...decryptStage, gunzip, unpackPass];
 
-  const [_, { extractedCount, totalBytes }] = await Promise.all([
-    runStreamPipeline(stages, { signal }),
-    extractTarStream(unpackPass, targetDbPath, signal),
-  ]);
+    const [, extractResult] = await settleAll(controller, [
+      runStreamPipeline(stages, { signal: controller.signal }),
+      extractTarStream(unpackPass, destDir, controller.signal),
+    ]);
 
-  if (manifestData?.sha256 && manifestData.sha256 !== digest.digest()) {
-    throw new Error(`Checksum mismatch: expected ${manifestData.sha256}, got ${digest.digest()}`);
+    const actualSha256 = digest.digest();
+    if (manifestData?.sha256 && manifestData.sha256 !== actualSha256) {
+      throw new Error(`Checksum mismatch: expected ${manifestData.sha256}, got ${actualSha256}`);
+    }
+    if (manifestData?.size !== undefined && manifestData.size !== digest.bytes) {
+      throw new Error(
+        `Size mismatch for ${backupKey}: expected ${manifestData.size}, got ${digest.bytes}`,
+      );
+    }
+    return extractResult;
+  };
+
+  try {
+    if (useDirectMode) {
+      // Zero-disk streaming pre-verification before clearing existing dbPath
+      log.info({ backupKey }, "Pre-verifying physical backup archive before clearing targetDbPath");
+      await verifyPhysicalArchiveZeroDisk(
+        storage,
+        backupKey,
+        manifestData,
+        keyRing,
+        controller.signal,
+      );
+
+      const existingEntries = await fs.readdir(targetDbPath);
+      for (const name of existingEntries) {
+        await fs.rm(path.join(targetDbPath, name), { recursive: true, force: true });
+      }
+
+      const result = await extractToDir(targetDbPath);
+      extractedCount = result.extractedCount;
+      totalBytes = result.totalBytes;
+
+      // Remove ONLY lock markers — preserve WiredTiger.backup for WT $backupCursor recovery!
+      await fs.rm(path.join(targetDbPath, "mongod.lock"), { force: true }).catch(() => {});
+      await fs.rm(path.join(targetDbPath, "WiredTiger.lock"), { force: true }).catch(() => {});
+      await fs.rm(path.join(targetDbPath, "ongoingBackup.lock"), { force: true }).catch(() => {});
+    } else {
+      const stagingName = `.mongovault-staging-${randomUUID()}`;
+      const rollbackName = `.mongovault-rollback-${randomUUID()}`;
+      const stagingDir = path.join(targetDbPath, stagingName);
+      const rollbackDir = path.join(targetDbPath, rollbackName);
+      await fs.mkdir(stagingDir, { recursive: true });
+
+      try {
+        const result = await extractToDir(stagingDir);
+        extractedCount = result.extractedCount;
+        totalBytes = result.totalBytes;
+
+        // Remove ONLY stale lock markers — preserve WiredTiger.backup for WT recovery!
+        await fs.rm(path.join(stagingDir, "mongod.lock"), { force: true }).catch(() => {});
+        await fs.rm(path.join(stagingDir, "WiredTiger.lock"), { force: true }).catch(() => {});
+        await fs.rm(path.join(stagingDir, "ongoingBackup.lock"), { force: true }).catch(() => {});
+
+        // Move ALL existing entries (handles directoryPerDB & directoryForIndexes subdirs too)
+        // into rollbackDir, then promote staged entries atomically with rollback on failure.
+        await fs.mkdir(rollbackDir, { recursive: true });
+        const movedToRollback: string[] = [];
+        const existingEntries = await fs.readdir(targetDbPath);
+        for (const name of existingEntries) {
+          if (name === stagingName || name === rollbackName) continue;
+          await fs.rename(path.join(targetDbPath, name), path.join(rollbackDir, name));
+          movedToRollback.push(name);
+        }
+
+        const stagedEntries = await fs.readdir(stagingDir);
+        const promoted: string[] = [];
+        try {
+          for (const name of stagedEntries) {
+            await fs.rename(path.join(stagingDir, name), path.join(targetDbPath, name));
+            promoted.push(name);
+          }
+        } catch (swapError) {
+          for (const name of promoted) {
+            await fs
+              .rm(path.join(targetDbPath, name), { recursive: true, force: true })
+              .catch(() => {});
+          }
+          for (const name of movedToRollback) {
+            await fs
+              .rename(path.join(rollbackDir, name), path.join(targetDbPath, name))
+              .catch(() => {});
+          }
+          throw swapError;
+        }
+      } finally {
+        await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => {});
+        await fs.rm(rollbackDir, { recursive: true, force: true }).catch(() => {});
+      }
+    }
+  } finally {
+    controller.dispose();
   }
-  if (manifestData?.size !== undefined && manifestData.size !== digest.bytes) {
-    throw new Error(
-      `Size mismatch for ${backupKey}: expected ${manifestData.size}, got ${digest.bytes}`,
-    );
-  }
-
-  // Remove any stale lock/backup marker files in target dbPath
-  await fs.rm(path.join(targetDbPath, "mongod.lock"), { force: true }).catch(() => {});
-  await fs.rm(path.join(targetDbPath, "WiredTiger.lock"), { force: true }).catch(() => {});
-  await fs.rm(path.join(targetDbPath, "WiredTiger.backup"), { force: true }).catch(() => {});
-  await fs.rm(path.join(targetDbPath, "ongoingBackup.lock"), { force: true }).catch(() => {});
 
   log.info(
     {
@@ -789,6 +1392,24 @@ export async function restorePhysicalBackup({
     "Physical restore extracted successfully",
   );
 
+  // Run PBM 3/4-step WiredTiger recovery + optional PITR replay + RS state cleanup
+  let replayedEntries = 0;
+  if (!skipRecovery) {
+    const recoveryCtx: PhysicalRecoveryContext = {
+      config,
+      storage,
+      logger: log,
+      targetDbPath,
+      manifest: manifestData,
+      pitrPlan,
+      signal,
+    };
+    const runner =
+      recoveryRunner ?? ((c: PhysicalRecoveryContext) => new PhysicalRecoveryCoordinator().run(c));
+    const recResult = await runner(recoveryCtx);
+    replayedEntries = recResult.replayedEntries;
+  }
+
   if (!pitrPlan) {
     return {
       key: backupKey,
@@ -798,145 +1419,12 @@ export async function restorePhysicalBackup({
     };
   }
 
-  // Stage 2 (PITR): Boot ephemeral standalone mongod on targetDbPath, replay oplog slices, and shut down cleanly
-  const port = await findFreePort();
-  const ephemeralUri = `mongodb://127.0.0.1:${port}`;
-  const targetLimit = formatOplogTimestamp(pitrPlan.targetTs);
-  const exclusiveLimit = formatOplogTimestamp(incrementOplogTimestamp(pitrPlan.targetTs));
-  const mongodLog = path.join(config.workDir, `.pitr-mongod-${randomUUID()}.log`);
-
-  await fs.mkdir(config.workDir, { recursive: true });
-  log.info(
-    { port, slices: pitrPlan.slices.length, targetLimit },
-    "Starting temporary mongod for physical PITR oplog replay",
-  );
-
-  const recoveryArgs = [
-    `--dbpath=${targetDbPath}`,
-    `--port=${port}`,
-    "--bind_ip=127.0.0.1",
-    `--logpath=${mongodLog}`,
-    "--setParameter=ttlMonitorEnabled=false",
-    "--setParameter=disableLogicalSessionCacheRefresh=true",
-    "--setParameter=takeUnstableCheckpointOnShutdown=true",
-  ];
-  if (config.physical?.directoryPerDb) {
-    recoveryArgs.push("--directoryperdb");
-  }
-  if (config.physical?.encryptionKeyFile) {
-    recoveryArgs.push(
-      "--enableEncryption",
-      `--encryptionKeyFile=${config.physical.encryptionKeyFile}`,
-    );
-  }
-
-  const proc = spawn("mongod", recoveryArgs, { stdio: "ignore" });
-
-  const procExit = new Promise<void>((resolve) => {
-    proc.once("close", () => resolve());
-    proc.once("error", () => resolve());
-  });
-
-  let tmpClient: MongoClient | null = null;
-  let replayedEntries = 0;
-
-  try {
-    tmpClient = await waitForMongodReady(
-      ephemeralUri,
-      30_000,
-      () => proc.exitCode !== null || proc.signalCode !== null,
-      mongodLog,
-    );
-    // Clear stale replica-set coordination state and sessions on recovery instance
-    // so it starts cleanly as a standalone or newly initialized replica set.
-    const localDb = tmpClient.db("local");
-    await Promise.all([
-      localDb
-        .collection("system.replset")
-        .drop()
-        .catch(() => {}),
-      localDb
-        .collection("replset.minvalid")
-        .drop()
-        .catch(() => {}),
-      localDb
-        .collection("replset.oplogTruncateAfterPoint")
-        .drop()
-        .catch(() => {}),
-      localDb
-        .collection("replset.election")
-        .drop()
-        .catch(() => {}),
-      tmpClient
-        .db("config")
-        .collection("system.sessions")
-        .drop()
-        .catch(() => {}),
-    ]);
-
-    for (const slice of pitrPlan.slices) {
-      const rawSlice = path.join(config.workDir, `.phys-pitr-${randomUUID()}.oplog.bson`);
-      const filteredSlice = path.join(config.workDir, `.phys-pitr-f-${randomUUID()}.oplog.bson`);
-      try {
-        await downloadAndExtractOplogSlice({ config, storage, signal }, slice.key, rawSlice);
-        const { keptEntries } = await filterOplogSliceFile(rawSlice, filteredSlice, {
-          targetTs: pitrPlan.targetTs,
-        });
-        if (keptEntries === 0) continue;
-
-        await replayOplogFile({
-          uri: ephemeralUri,
-          workDir: config.workDir,
-          oplogFile: filteredSlice,
-          oplogLimit: exclusiveLimit,
-          timeoutMs: config.timeoutMs,
-          signal,
-          logger: log,
-        });
-        replayedEntries += keptEntries;
-      } finally {
-        await Promise.allSettled([
-          fs.rm(rawSlice, { force: true }),
-          fs.rm(filteredSlice, { force: true }),
-        ]);
-      }
-    }
-
-    await tmpClient
-      .db("admin")
-      .command({ fsync: 1 })
-      .catch(() => {});
-    await tmpClient
-      .db("admin")
-      .command({ shutdown: 1, force: true })
-      .catch(() => {});
-    await tmpClient.close().catch(() => {});
-    tmpClient = null;
-    await procExit;
-  } finally {
-    if (tmpClient) {
-      await tmpClient
-        .db("admin")
-        .command({ shutdown: 1, force: true })
-        .catch(() => {});
-      await tmpClient.close().catch(() => {});
-    }
-    if (proc.exitCode === null && proc.signalCode === null) {
-      proc.kill("SIGTERM");
-      await Promise.race([procExit, new Promise((r) => setTimeout(r, 5_000))]);
-      if (proc.exitCode === null && proc.signalCode === null) {
-        proc.kill("SIGKILL");
-      }
-    }
-    await fs.rm(mongodLog, { force: true }).catch(() => {});
-  }
-
   return {
     key: backupKey,
     restoredFiles: extractedCount,
     totalBytes,
     targetDbPath,
-    pitrTarget: targetLimit,
+    pitrTarget: formatOplogTimestamp(pitrPlan.targetTs),
     replayedSlices: pitrPlan.slices.length,
     replayedEntries,
   };
