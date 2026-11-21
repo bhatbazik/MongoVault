@@ -37,7 +37,7 @@ Options:
   --key <string>            Target backup key (default: latest)
   --engine <string>         Backup engine: logical or physical (default: logical)
   --db-path <path>          WiredTiger database path for physical backup or restore
-  --sharding                Execute synchronized multi-shard cluster backup (experimental)
+  --sharding                Execute synchronized multi-shard cluster backup/restore via mongos
   --uri <string>            Target MongoDB URI for restore (default: MONGODB_URI)
   --database <string>       Target database name for restore (default: original database)
   --ns-include <string>     Selective restore collection pattern (e.g. "mydb.users,mydb.orders*")
@@ -92,8 +92,9 @@ export async function runCli(
       output: { type: "string" },
       force: { type: "boolean", default: false },
       drop: { type: "boolean", default: false },
+      "pre-verify": { type: "boolean" },
       oplog: { type: "boolean", default: false },
-      "oplog-replay": { type: "boolean", default: false },
+      "oplog-replay": { type: "boolean" },
       "oplog-limit": { type: "string" },
       pitr: { type: "string" },
       parallel: { type: "string" },

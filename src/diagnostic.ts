@@ -1,4 +1,5 @@
 import os from "node:os";
+import path from "node:path";
 import { MongoClient } from "mongodb";
 import { databasePrefix, listBackups, readManifest, scopeOf } from "./catalog.js";
 import { readLock } from "./lock.js";
@@ -6,6 +7,25 @@ import { maskMongoUri } from "./mongo.js";
 import { checkDatabaseTools } from "./tools.js";
 import type { AppConfig } from "./types/config.js";
 import type { StorageClient } from "./types/storage.js";
+
+const MONGO_URI_RE = /mongodb(?:\+srv)?:\/\/[^\s"'`]+/gi;
+
+function sanitizeValue<T>(value: T): T {
+  if (typeof value === "string") {
+    return value.replace(MONGO_URI_RE, (match) => maskMongoUri(match)) as unknown as T;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeValue(item)) as unknown as T;
+  }
+  if (value && typeof value === "object" && !(value instanceof Date)) {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = sanitizeValue(v);
+    }
+    return out as T;
+  }
+  return value;
+}
 
 export interface DiagnosticBundleContext {
   config: AppConfig;
@@ -89,8 +109,8 @@ export async function generateDiagnosticBundle({
       maskedUri: maskMongoUri(config.mongo.uri),
       targetDatabase: config.mongo.database,
       readPreference: config.mongo.readPreference,
-      buildInfo,
-      hello,
+      buildInfo: sanitizeValue(buildInfo),
+      hello: sanitizeValue(hello),
     };
   } catch (error) {
     database = {
@@ -131,7 +151,7 @@ export async function generateDiagnosticBundle({
   let localLock: Record<string, unknown> | null = null;
   let distributedLock: Record<string, unknown> | null = null;
   try {
-    const lockFile = `${config.workDir}/.backup.lock`;
+    const lockFile = path.join(config.workDir, ".backup.lock");
     localLock = (await readLock(lockFile)) as Record<string, unknown> | null;
     if (typeof storage.getJson === "function") {
       const primaryLockKey = `${databasePrefix(scope)}.locks/backup.lock.json`;

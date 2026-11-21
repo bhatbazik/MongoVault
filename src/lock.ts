@@ -34,8 +34,10 @@ export async function acquireLock(
 
   const setupHeartbeat = (): NodeJS.Timeout => {
     let lost = false;
+    let inFlight = false;
     const timer = setInterval(async () => {
-      if (lost) return;
+      if (lost || inFlight) return;
+      inFlight = true;
       try {
         const owner = await readLock(file);
         if (!owner || owner.token !== token) {
@@ -52,6 +54,8 @@ export async function acquireLock(
         await fs.utimes(file, now, now);
       } catch (err: unknown) {
         logger?.warn({ err, file }, "Failed to update local lock heartbeat timestamp");
+      } finally {
+        inFlight = false;
       }
     }, heartbeatIntervalMs);
     timer.unref();
@@ -165,9 +169,11 @@ export async function acquireDistributedLock(
 
   let lastSuccessfulHeartbeat = Date.now();
   let lost = false;
+  let inFlight = false;
 
   const timer = setInterval(async () => {
-    if (lost) return;
+    if (lost || inFlight) return;
+    inFlight = true;
     try {
       const refreshed = await storage.refreshLock!(lockKey, token, ttlMs);
       if (!refreshed) {
@@ -196,6 +202,8 @@ export async function acquireDistributedLock(
         logger?.error({ lockKey }, expiredErr.message);
         onLost?.(expiredErr);
       }
+    } finally {
+      inFlight = false;
     }
   }, heartbeatIntervalMs);
   timer.unref();

@@ -112,13 +112,20 @@ export function startHttpServer({
     }
   });
 
+  server.on("error", (error) => {
+    logger.error({ err: error, port }, "HTTP metrics and health server error");
+  });
+
   server.listen(port, () => {
     logger.info({ port }, "HTTP metrics and health server listening");
   });
 
   return {
     close(): Promise<void> {
-      return new Promise((resolve) => server.close(() => resolve()));
+      return new Promise((resolve) => {
+        server.close(() => resolve());
+        server.closeAllConnections?.();
+      });
     },
   };
 }

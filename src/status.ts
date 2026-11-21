@@ -4,7 +4,13 @@ import { databasePrefix, listBackups, readManifest, scopeOf } from "./catalog.js
 import { formatBytes, formatDate } from "./format.js";
 import { readLock } from "./lock.js";
 import { inspectMongoCluster } from "./mongo.js";
-import { formatOplogTimestamp, listOplogSlices, pitrStateKey } from "./oplog.js";
+import {
+  compareTimestamps,
+  formatOplogTimestamp,
+  listOplogSlices,
+  parseOplogTimestamp,
+  pitrStateKey,
+} from "./oplog.js";
 import type { AppConfig } from "./types/config.js";
 import type { Logger } from "./types/logger.js";
 import type {
@@ -112,11 +118,32 @@ export async function getStatus({
         latestTs = formatOplogTimestamp(last.endTs);
       }
 
-      for (const slice of slices) {
-        if (slice?.manifest?.oplogWindow?.gapDetected) {
+      for (let i = 0; i < slices.length; i++) {
+        const slice = slices[i]!;
+        const sliceManifest =
+          slice.manifest ??
+          (typeof storage.getJson === "function"
+            ? await readManifest(storage, slice.key).catch(() => null)
+            : null);
+
+        if (sliceManifest?.oplogWindow?.gapDetected) {
           timelineContinuous = false;
           gapWarning = `Gap flagged in slice ${slice.key}`;
           break;
+        }
+
+        if (i > 0 && sliceManifest?.oplogWindow?.previousEndTs) {
+          const prevEndTs = parseOplogTimestamp(sliceManifest.oplogWindow.previousEndTs);
+          const prevSlice = slices[i - 1]!;
+          if (
+            prevEndTs &&
+            compareTimestamps(prevEndTs, prevSlice.endTs) !== 0 &&
+            compareTimestamps(slice.startTs, prevSlice.endTs) > 0
+          ) {
+            timelineContinuous = false;
+            gapWarning = `Discontinuity detected between ${prevSlice.key} (end ${formatOplogTimestamp(prevSlice.endTs)}) and ${slice.key} (expected previousEndTs ${sliceManifest.oplogWindow.previousEndTs})`;
+            break;
+          }
         }
       }
 

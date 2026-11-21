@@ -58,6 +58,7 @@ const schema = z
     S3_SECRET_ACCESS_KEY: z.string().default(""),
     S3_ENDPOINT: z.string().url().optional(),
     S3_REGION: z.string().optional(),
+    AWS_REGION: z.string().optional(),
     S3_FORCE_PATH_STYLE: flag(false),
     S3_PREFIX: z.string().default("mongodb"),
     S3_PART_SIZE_MB: z.coerce.number().int().min(5).max(512).default(32),
@@ -264,7 +265,7 @@ function toConfig(env: z.infer<typeof schema>): AppConfig {
       bucket:
         env.STORAGE_TYPE === "filesystem" ? (env.STORAGE_PATH ?? "filesystem") : env.S3_BUCKET,
       endpoint: env.S3_ENDPOINT,
-      region: env.S3_REGION ?? (process.env.AWS_REGION || "ap-south-1"),
+      region: env.S3_REGION ?? env.AWS_REGION ?? "ap-south-1",
       forcePathStyle: env.S3_FORCE_PATH_STYLE,
       accessKeyId: env.S3_ACCESS_KEY_ID,
       secretAccessKey: env.S3_SECRET_ACCESS_KEY,

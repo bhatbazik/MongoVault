@@ -18,6 +18,7 @@ export interface CliParsedValues {
   output?: string;
   force?: boolean;
   drop?: boolean;
+  "pre-verify"?: boolean;
   oplog?: boolean;
   "oplog-replay"?: boolean;
   "oplog-limit"?: string;

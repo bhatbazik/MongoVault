@@ -1,5 +1,5 @@
 import { type Db, MongoClient } from "mongodb";
-import { isClusterScope, readManifest, resolveBackup, scopeOf } from "./catalog.js";
+import { isClusterScope, listBackups, readManifest, scopeOf } from "./catalog.js";
 import { restoreBackup } from "./restore.js";
 import type { BackupManifest } from "./types/catalog.js";
 import type { DrillContext, DrillMismatch, DrillResult, DrillVariance } from "./types/drill.js";
@@ -77,7 +77,14 @@ export async function runDrill(ctx: DrillContext): Promise<DrillResult> {
   }
 
   const startedAt = Date.now();
-  const key = await resolveBackup(storage, scopeOf(config), "latest");
+  const backups = await listBackups(storage, scopeOf(config));
+  const logicalBackups = backups.filter(
+    (b) => !/\.physical\.tar\.gz(\.enc)?$/.test(b.key) && !/\.cluster(\.enc)?$/.test(b.key),
+  );
+  if (logicalBackups.length === 0) {
+    throw new Error("No logical backups found to run restore drill");
+  }
+  const key = logicalBackups[0]!.key;
   const manifest = await readManifest(storage, key);
   if (!manifest) {
     throw new Error(`Manifest not found for ${key}`);

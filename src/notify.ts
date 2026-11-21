@@ -5,6 +5,8 @@ import type { AppConfig, SmtpConfig } from "./types/config.js";
 import type { Logger } from "./types/logger.js";
 import type { EmailOptions, NotificationFailureContext, Notifier } from "./types/notify.js";
 
+const HTTP_NOTIFICATION_TIMEOUT_MS = 15_000;
+
 /**
  * Interface for notification delivery channels.
  */
@@ -81,6 +83,7 @@ export class HeartbeatChannel implements NotificationChannel {
         method: "POST",
         headers: { "Content-Type": "text/plain" },
         body: `${event} succeeded`,
+        signal: AbortSignal.timeout(HTTP_NOTIFICATION_TIMEOUT_MS),
       });
     } catch (error) {
       this.logger?.error({ err: error, url }, "Failed to ping heartbeat endpoint");
@@ -100,6 +103,7 @@ export class HeartbeatChannel implements NotificationChannel {
         method: "POST",
         headers: { "Content-Type": "text/plain" },
         body: error.message,
+        signal: AbortSignal.timeout(HTTP_NOTIFICATION_TIMEOUT_MS),
       });
     } catch (err) {
       this.logger?.error({ err, url }, "Failed to ping heartbeat endpoint");
@@ -124,6 +128,9 @@ export class EmailNotificationChannel implements NotificationChannel {
         host: emailConfig.host,
         port: emailConfig.port,
         secure: emailConfig.secure,
+        connectionTimeout: HTTP_NOTIFICATION_TIMEOUT_MS,
+        greetingTimeout: HTTP_NOTIFICATION_TIMEOUT_MS,
+        socketTimeout: HTTP_NOTIFICATION_TIMEOUT_MS * 2,
         auth:
           emailConfig.user && emailConfig.password
             ? { user: emailConfig.user, pass: emailConfig.password }
@@ -185,6 +192,7 @@ export class SlackNotificationChannel implements NotificationChannel {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(HTTP_NOTIFICATION_TIMEOUT_MS),
       });
       if (!response.ok) {
         this.logger?.warn(
@@ -238,6 +246,7 @@ export class WebhookNotificationChannel implements NotificationChannel {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(HTTP_NOTIFICATION_TIMEOUT_MS),
       });
       if (!response.ok) {
         this.logger?.warn(
