@@ -26,9 +26,16 @@ export interface UploadOptions {
   contentType?: string;
   signal?: AbortSignal;
   onProgress?: (progress: { loaded?: number; total?: number }) => void;
+  /** Expected total byte size hint used to auto-scale S3 multipart `partSize` under the 10,000-part limit. */
+  expectedSizeBytes?: number;
   objectLockMode?: "GOVERNANCE" | "COMPLIANCE";
   objectLockRetainUntilDate?: Date;
   objectLockLegalHoldStatus?: "ON" | "OFF";
+}
+
+export interface PutJsonOptions {
+  /** Apply WORM Object Lock headers only when true (manifests/immutable markers). Never set for mutable state/locks/probes. */
+  immutable?: boolean;
 }
 
 export interface StorageHeadResult {
@@ -57,7 +64,7 @@ export interface StorageClient {
   ) => Promise<void>;
   head: (key: string) => Promise<StorageHeadResult | null>;
   download: (key: string, options?: { signal?: AbortSignal }) => Promise<Readable>;
-  putJson: (key: string, value: unknown) => Promise<void>;
+  putJson: (key: string, value: unknown, options?: PutJsonOptions) => Promise<void>;
   getJson: <T = unknown>(key: string) => Promise<GetJsonResult<T> | null>;
   list: (prefix: string) => AsyncGenerator<StorageObject, void, unknown>;
   remove: (key: string) => Promise<void>;
