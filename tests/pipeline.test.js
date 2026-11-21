@@ -255,4 +255,33 @@ describe("backup and restore pipeline", () => {
     expect(manifest.collections["db1.users"]).toBe(100);
     expect(manifest.collections["db2.orders"]).toBe(200);
   });
+
+  it("fails PITR-enabled backup when oplog boundary discovery fails", async () => {
+    const rawGzip = gzipSync(Buffer.from("pitr-payload"));
+    const { tools } = createMockTools(rawGzip);
+
+    const config = {
+      mongo: { uri: "mongodb://localhost", database: "*", excludeCollections: [], oplog: true },
+      storage: { prefix: "backups" },
+      pitr: { enabled: true },
+      workDir: tmpDir,
+      timeoutMs: 5000,
+      encryptionKey: null,
+      schedule: { timezone: "UTC" },
+    };
+
+    await expect(
+      runBackup({
+        config,
+        storage: mockStorage,
+        logger,
+        tools: {
+          ...tools,
+          getOplogBounds: async () => {
+            throw new Error("oplog query failed");
+          },
+        },
+      }),
+    ).rejects.toThrow(/Failed to determine pre-backup oplog boundary/);
+  });
 });
