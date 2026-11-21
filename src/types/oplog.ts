@@ -46,8 +46,11 @@ export interface UploadOplogSliceOptions {
   rawDocs: Buffer[];
   startTs: OplogTimestamp;
   endTs: OplogTimestamp;
+  coverageStartTs?: OplogTimestamp | null;
+  coverageEndTs?: OplogTimestamp | null;
   previousEndTs?: OplogTimestamp | null;
   gapDetected?: boolean;
+  keyPrefix?: string;
   signal?: AbortSignal;
 }
 
@@ -57,6 +60,11 @@ export interface CaptureOplogSliceOptions {
   logger: Logger;
   signal?: AbortSignal;
   sinceTs?: string | OplogTimestamp;
+  untilTs?: string | OplogTimestamp;
+  /** Optional custom storage prefix (e.g. backup-scoped bridging slices outside `_pitr/`). */
+  keyPrefix?: string;
+  /** If false, does not read or update `_pitr/state.json` (used for backup-scoped bridging slices). */
+  updateState?: boolean;
   createMongoClient?: (uri: string) => MongoClient;
 }
 

@@ -1,14 +1,15 @@
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { PassThrough, Readable } from "node:stream";
 import { createGunzip, createGzip } from "node:zlib";
 import { BSON, MongoClient, Timestamp } from "mongodb";
 import { linkedController, settleAll } from "./abort.js";
+import { readBsonDocumentsFromStream } from "./archive-stream.js";
 import {
   MANIFEST_SUFFIX,
   MANIFEST_VERSION,
   databasePrefix,
-  isClusterScope,
   listBackups,
   readManifest,
   resolveKeyRing,
@@ -18,6 +19,12 @@ import {
 import { createDecryptor, createEncryptor, verifyManifest } from "./crypto.js";
 import { DigestStream } from "./digest.js";
 import { acquireHybridLock } from "./lock.js";
+import {
+  OplogFilter,
+  type OplogDoc,
+  type OplogFilterOptions,
+  matchesNamespacePattern,
+} from "./oplog-applier.js";
 import { runStreamPipeline } from "./stream.js";
 import type { BackupManifest, BackupScope, BackupSummary } from "./types/catalog.js";
 import type { AppConfig } from "./types/config.js";
@@ -125,204 +132,80 @@ export function incrementOplogTimestamp(ts: OplogTimestamp): OplogTimestamp {
   return { t: (t + 1) >>> 0, i: 0 };
 }
 
-const EXCLUDED_OPLOG_NS = new Set([
-  "config.system.sessions",
-  "config.rangeDeletions",
-  "config.transactions",
-]);
-
-function isSystemExcludedNs(ns: string): boolean {
-  return EXCLUDED_OPLOG_NS.has(ns) || ns.startsWith("local.") || ns.startsWith("admin.mongovault");
-}
-
-function nsMatchesPattern(ns: string, pattern: string): boolean {
-  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
-  return new RegExp(`^${escaped}$`).test(ns);
-}
-
-function isNsIncluded(
-  ns: string,
-  { database, nsInclude, nsExclude }: { database?: string; nsInclude?: string; nsExclude?: string },
-): boolean {
-  if (isSystemExcludedNs(ns)) return false;
-  if (database && !isClusterScope(database)) {
-    if (ns !== `${database}.$cmd` && !ns.startsWith(`${database}.`)) {
-      return false;
-    }
-  }
-  if (nsInclude && !nsMatchesPattern(ns, nsInclude)) return false;
-  if (nsExclude && nsMatchesPattern(ns, nsExclude)) return false;
-  return true;
-}
-
-function isCmdTargetIncluded(
-  ns: string,
-  o: Record<string, unknown> | undefined,
-  options: { database?: string; nsInclude?: string; nsExclude?: string },
-): boolean {
-  if (ns === "admin.$cmd" && o && typeof o.renameCollection === "string") {
-    const fromNs = o.renameCollection;
-    const toNs = typeof o.to === "string" ? o.to : "";
-    return isNsIncluded(fromNs, options) && (!toNs || isNsIncluded(toNs, options));
-  }
-
-  if (ns.endsWith(".$cmd") && o) {
-    const dbName = ns.slice(0, -".$cmd".length);
-    const targetColl =
-      o.create ??
-      o.drop ??
-      o.createIndexes ??
-      o.commitIndexBuild ??
-      o.collMod ??
-      o.deleteIndexes ??
-      o.dropIndexes;
-    if (typeof targetColl === "string" && targetColl.length > 0) {
-      return isNsIncluded(`${dbName}.${targetColl}`, options);
-    }
-  }
-
-  return isNsIncluded(ns, options);
-}
-
-const DONT_PRESERVE_UUID_EXACT = new Set([
-  "admin.system.users",
-  "admin.system.roles",
-  "admin.system.keys",
-  "config.databases",
-  "config.collections",
-  "config.chunks",
-]);
-
-function shouldStripUuid(ns: string): boolean {
-  return (
-    DONT_PRESERVE_UUID_EXACT.has(ns) ||
-    ns.includes(".system.buckets.") ||
-    ns.endsWith(".system.views")
-  );
-}
-
-function isDisallowedConfigSetting(doc: {
-  ns?: string;
-  o?: Record<string, unknown>;
-  o2?: Record<string, unknown>;
-}): boolean {
-  if (doc.ns !== "config.settings") return false;
-  const id = doc.o2?._id ?? doc.o?._id;
-  return id === "balancer" || id === "automerge";
-}
-
-function sanitizeOplogEntry(doc: Record<string, unknown>): boolean {
-  let modified = false;
-  const ns = String(doc.ns || "");
-  if (doc.ui !== undefined && shouldStripUuid(ns)) {
-    delete doc.ui;
-    modified = true;
-  }
-  if (doc.op === "c" && doc.o && typeof doc.o === "object" && "create" in doc.o && doc.o2) {
-    delete doc.o2;
-    modified = true;
-  }
-  return modified;
-}
+export { matchesNamespacePattern };
 
 /**
- * Filters a raw BSON oplog file to remove system/no-op entries, enforce namespace filters,
- * sanitize UUID/DDL metadata, and cap entries at `targetTs` (inclusive). Returns the number of kept entries.
+ * Streaming filter over a raw BSON oplog file (O(1) RAM — never loads whole file into memory).
+ * Removes system/no-op entries, enforces timeframe `[startTs, startExclusiveTs, targetTs]`
+ * and PBM namespace/config/sessions/UUID rules. Returns the number of kept entries.
  */
 export async function filterOplogSliceFile(
   srcBsonFile: string,
   destBsonFile: string,
-  options: {
+  options: OplogFilterOptions & {
+    startTs?: OplogTimestamp;
+    startExclusiveTs?: OplogTimestamp;
     targetTs?: OplogTimestamp;
-    database?: string;
-    nsInclude?: string;
-    nsExclude?: string;
   } = {},
 ): Promise<{ keptEntries: number }> {
-  const raw = await fs.readFile(srcBsonFile);
-  const chunks: Buffer[] = [];
-  let offset = 0;
+  const filter = new OplogFilter(options);
+  await fs.mkdir(path.dirname(destBsonFile), { recursive: true });
+  const outHandle = await fs.open(destBsonFile, "w", 0o600);
   let keptEntries = 0;
 
-  while (offset + 4 <= raw.length) {
-    const docLen = raw.readInt32LE(offset);
-    if (docLen <= 0 || offset + docLen > raw.length) {
-      throw new Error(`Corrupted BSON document in oplog slice at offset ${offset}`);
+  async function writeBuf(buf: Buffer): Promise<void> {
+    let written = 0;
+    while (written < buf.length) {
+      const res = await outHandle.write(buf, written, buf.length - written);
+      written += res.bytesWritten;
     }
-    const rawSlice = raw.subarray(offset, offset + docLen);
-    offset += docLen;
-
-    const doc = BSON.deserialize(rawSlice, { promoteValues: false }) as {
-      ts?: unknown;
-      op?: string;
-      ns?: string;
-      ui?: unknown;
-      o?: {
-        applyOps?: Array<{ op?: string; ns?: string; [k: string]: unknown }>;
-        [k: string]: unknown;
-      };
-      o2?: Record<string, unknown>;
-    };
-
-    if (doc.op === "n") continue;
-    if (
-      doc.op === "c" &&
-      (doc.o?.startIndexBuild !== undefined || doc.o?.abortIndexBuild !== undefined)
-    ) {
-      continue;
-    }
-    if (isDisallowedConfigSetting(doc)) continue;
-
-    const docTs = fromBsonTimestamp(doc.ts);
-    if (options.targetTs && docTs && compareTimestamps(docTs, options.targetTs) > 0) {
-      continue;
-    }
-
-    if (doc.op === "c" && Array.isArray(doc.o?.applyOps)) {
-      let innerModified = false;
-      const filteredOps = doc.o.applyOps.filter((inner) => {
-        if (inner.op === "n") return false;
-        if (
-          isDisallowedConfigSetting(
-            inner as { ns?: string; o?: Record<string, unknown>; o2?: Record<string, unknown> },
-          )
-        ) {
-          return false;
-        }
-        if (
-          !isCmdTargetIncluded(
-            String(inner.ns || ""),
-            inner.o as Record<string, unknown> | undefined,
-            options,
-          )
-        ) {
-          return false;
-        }
-        if (sanitizeOplogEntry(inner)) {
-          innerModified = true;
-        }
-        return true;
-      });
-      if (filteredOps.length === 0) continue;
-      if (innerModified || filteredOps.length !== doc.o.applyOps.length) {
-        doc.o.applyOps = filteredOps;
-        chunks.push(Buffer.from(BSON.serialize(doc)));
-        keptEntries++;
-        continue;
-      }
-    } else if (!isCmdTargetIncluded(String(doc.ns || ""), doc.o, options)) {
-      continue;
-    }
-
-    if (sanitizeOplogEntry(doc as Record<string, unknown>)) {
-      chunks.push(Buffer.from(BSON.serialize(doc)));
-    } else {
-      chunks.push(rawSlice);
-    }
-    keptEntries++;
   }
 
-  await fs.writeFile(destBsonFile, Buffer.concat(chunks), { mode: 0o600 });
+  const readStream = fsSync.createReadStream(srcBsonFile);
+  try {
+    await readBsonDocumentsFromStream(readStream, async (rawSlice) => {
+      const doc = BSON.deserialize(rawSlice, { promoteValues: false }) as OplogDoc;
+
+      const docTs = fromBsonTimestamp(doc.ts);
+      if (docTs) {
+        if (options.startTs && compareTimestamps(docTs, options.startTs) < 0) return;
+        if (options.startExclusiveTs && compareTimestamps(docTs, options.startExclusiveTs) <= 0) {
+          return;
+        }
+        if (options.targetTs && compareTimestamps(docTs, options.targetTs) > 0) return;
+      }
+
+      if (!filter.isIncluded(doc)) return;
+
+      if (doc.op === "c" && doc.o && Array.isArray(doc.o.applyOps)) {
+        let innerModified = false;
+        const origOps = doc.o.applyOps as OplogDoc[];
+        const filteredOps = origOps.filter((inner) => {
+          if (!filter.isIncluded(inner)) return false;
+          if (filter.sanitizeAndClone(inner)) innerModified = true;
+          return true;
+        });
+        if (filteredOps.length === 0) return;
+        if (innerModified || filteredOps.length !== origOps.length) {
+          doc.o.applyOps = filteredOps;
+          await writeBuf(Buffer.from(BSON.serialize(doc)));
+          keptEntries++;
+          return;
+        }
+      }
+
+      if (filter.sanitizeAndClone(doc)) {
+        await writeBuf(Buffer.from(BSON.serialize(doc)));
+      } else {
+        await writeBuf(rawSlice);
+      }
+      keptEntries++;
+    });
+  } finally {
+    readStream.destroy();
+    await outHandle.close().catch(() => {});
+  }
+
   return { keptEntries };
 }
 
@@ -362,7 +245,7 @@ export function oplogSliceKey(
   scope: BackupScope,
   startTs: OplogTimestamp,
   endTs: OplogTimestamp,
-  { encrypted = false }: { encrypted?: boolean } = {},
+  { encrypted = false, keyPrefix }: { encrypted?: boolean; keyPrefix?: string } = {},
 ): string {
   const date = new Date((endTs.t >>> 0) * 1000);
   const day = date.toISOString().slice(0, 10);
@@ -370,7 +253,12 @@ export function oplogSliceKey(
   const sI = String(startTs.i >>> 0).padStart(8, "0");
   const eT = String(endTs.t >>> 0).padStart(10, "0");
   const eI = String(endTs.i >>> 0).padStart(8, "0");
-  return `${pitrPrefix(scope)}${day}/${sT}_${sI}__${eT}_${eI}.oplog.bson.gz${encrypted ? ".enc" : ""}`;
+  const basePrefix = keyPrefix
+    ? keyPrefix.endsWith("/")
+      ? keyPrefix
+      : `${keyPrefix}/`
+    : `${pitrPrefix(scope)}${day}/`;
+  return `${basePrefix}${sT}_${sI}__${eT}_${eI}.oplog.bson.gz${encrypted ? ".enc" : ""}`;
 }
 
 export function parseSliceKeyTimestamps(key: string): OplogSliceKeyTimestamps | null {
@@ -416,6 +304,32 @@ export async function listOplogSlices(
     .sort((a, b) => compareTimestamps(a.startTs, b.startTs) || compareTimestamps(a.endTs, b.endTs));
 }
 
+function extractReplSetUpperBound(
+  replStatus: Record<string, unknown> | null,
+): OplogTimestamp | null {
+  if (!replStatus) return null;
+  const optimes = replStatus.optimes as
+    | {
+        lastCommittedOpTime?: { ts?: unknown };
+        readConcernMajorityOpTime?: { ts?: unknown };
+        appliedOpTime?: { ts?: unknown };
+      }
+    | undefined;
+  const majorityTs = optimes?.lastCommittedOpTime?.ts
+    ? fromBsonTimestamp(optimes.lastCommittedOpTime.ts)
+    : optimes?.readConcernMajorityOpTime?.ts
+      ? fromBsonTimestamp(optimes.readConcernMajorityOpTime.ts)
+      : null;
+  if (!majorityTs) return null;
+
+  const appliedTs = optimes?.appliedOpTime?.ts ? fromBsonTimestamp(optimes.appliedOpTime.ts) : null;
+  // Clamp to node's appliedOpTime if available so reads never outrun the queried node's oplog
+  if (appliedTs && compareTimestamps(appliedTs, majorityTs) < 0) {
+    return appliedTs;
+  }
+  return majorityTs;
+}
+
 export async function getOplogBounds(
   uri: string,
   {
@@ -448,13 +362,12 @@ export async function getOplogBounds(
       const adminDb = typeof client.db === "function" ? client.db("admin") : null;
       const replStatus =
         adminDb && typeof adminDb.command === "function"
-          ? await adminDb.command({ replSetGetStatus: 1 }).catch(() => null)
+          ? ((await adminDb.command({ replSetGetStatus: 1 }).catch(() => null)) as Record<
+              string,
+              unknown
+            > | null)
           : null;
-      const majorityTs = replStatus?.optimes?.lastCommittedOpTime?.ts
-        ? fromBsonTimestamp(replStatus.optimes.lastCommittedOpTime.ts)
-        : replStatus?.optimes?.readConcernMajorityOpTime?.ts
-          ? fromBsonTimestamp(replStatus.optimes.readConcernMajorityOpTime.ts)
-          : null;
+      const majorityTs = extractReplSetUpperBound(replStatus);
       if (majorityTs) {
         newestTs = majorityTs;
       }
@@ -464,27 +377,29 @@ export async function getOplogBounds(
 
     // On pre-backup boundary discovery, check config.transactions for uncommitted/prepared
     // transactions so long-running transactions started before the snapshot aren't missed.
-    // Never pull back the post-backup endTs to an older transaction's startOpTime.
     if (phase === "pre") {
-      try {
-        const configDb = client.db("config");
-        const txCol =
-          configDb && typeof configDb.collection === "function"
-            ? configDb.collection("transactions")
-            : null;
-        if (txCol && typeof txCol.find === "function") {
+      const configDb = client.db("config");
+      const txCol =
+        configDb && typeof configDb.collection === "function"
+          ? configDb.collection("transactions")
+          : null;
+      if (txCol && typeof txCol.find === "function") {
+        try {
           const activeTx = await txCol
             .find({ state: { $in: ["prepared", "inProgress"] } })
-            .sort({ startOpTime: 1 })
+            .sort({ "startOpTime.ts": 1 })
             .limit(1)
             .next();
           const txTs = fromBsonTimestamp(activeTx?.startOpTime?.ts);
           if (txTs && newestTs && compareTimestamps(txTs, newestTs) < 0) {
             newestTs = txTs;
           }
+        } catch (err) {
+          throw new Error(
+            `Failed to verify transaction boundaries in config.transactions during pre-backup boundary discovery: ${err instanceof Error ? err.message : String(err)}`,
+            { cause: err },
+          );
         }
-      } catch {
-        // Ignore if config.transactions is inaccessible or mocked
       }
     }
 
@@ -504,8 +419,11 @@ export async function uploadOplogSlice({
   rawDocs,
   startTs,
   endTs,
+  coverageStartTs = null,
+  coverageEndTs = null,
   previousEndTs = null,
   gapDetected = false,
+  keyPrefix,
   signal,
 }: UploadOplogSliceOptions): Promise<BackupManifest | null> {
   if (!rawDocs || rawDocs.length === 0) return null;
@@ -513,7 +431,7 @@ export async function uploadOplogSlice({
   const startedAt = new Date();
   const encrypted = Boolean(config.encryptionKey);
   const scope = scopeOf(config);
-  const key = oplogSliceKey(scope, startTs, endTs, { encrypted });
+  const key = oplogSliceKey(scope, startTs, endTs, { encrypted, keyPrefix });
   const log = logger.child({ key });
   const controller = linkedController(signal);
 
@@ -558,6 +476,8 @@ export async function uploadOplogSlice({
         previousEndTs: previousEndTs ? formatOplogTimestamp(previousEndTs) : null,
         startTs: formatOplogTimestamp(startTs),
         endTs: formatOplogTimestamp(endTs),
+        ...(coverageStartTs ? { coverageStartTs: formatOplogTimestamp(coverageStartTs) } : {}),
+        ...(coverageEndTs ? { coverageEndTs: formatOplogTimestamp(coverageEndTs) } : {}),
         entries: rawDocs.length,
         gapDetected: Boolean(gapDetected),
       },
@@ -585,17 +505,55 @@ export async function uploadOplogSlice({
   }
 }
 
+interface PitrStateRecord {
+  lastTs?: string;
+  coverageEndTs?: string;
+  lastSliceKey?: string;
+  updatedAt?: string;
+  gapDetected?: boolean;
+}
+
+function inspectRawOrObjectOplogDoc(doc: unknown): {
+  ts: OplogTimestamp | null;
+  rawBuf: Buffer;
+  isPartialTxn: boolean;
+} {
+  if (Buffer.isBuffer(doc) || doc instanceof Uint8Array) {
+    const rawBuf = Buffer.isBuffer(doc) ? doc : Buffer.from(doc);
+    // Cheap partial decode ONLY for `ts` and `o.partialTxn` without re-serializing `rawBuf`
+    const parsed = BSON.deserialize(rawBuf, { promoteValues: false }) as {
+      ts?: unknown;
+      o?: { partialTxn?: unknown };
+    };
+    return {
+      ts: fromBsonTimestamp(parsed.ts),
+      rawBuf,
+      isPartialTxn: Boolean(parsed.o?.partialTxn),
+    };
+  }
+  const obj = doc as { ts?: unknown; o?: { partialTxn?: unknown } };
+  return {
+    ts: fromBsonTimestamp(obj.ts),
+    rawBuf: Buffer.from(BSON.serialize(obj as Record<string, unknown>)),
+    isPartialTxn: Boolean(obj.o?.partialTxn),
+  };
+}
+
 export async function captureOplogSlice({
   config,
   storage,
   logger,
   signal,
   sinceTs,
+  untilTs,
+  keyPrefix,
+  updateState = true,
   createMongoClient = (u) => new MongoClient(u),
 }: CaptureOplogSliceOptions): Promise<BackupManifest | null> {
   const scope = scopeOf(config);
-  const stateObj = await storage.getJson<{ lastTs?: string }>(pitrStateKey(scope));
-  const state = stateObj && "data" in stateObj ? stateObj.data : stateObj;
+  const stateObj = updateState ? await storage.getJson<PitrStateRecord>(pitrStateKey(scope)) : null;
+  const state =
+    stateObj && "data" in stateObj ? stateObj.data : (stateObj as PitrStateRecord | null);
 
   let cursorStartTs = sinceTs ? parseOplogTimestamp(sinceTs) : null;
   if (!cursorStartTs && state?.lastTs) {
@@ -606,8 +564,7 @@ export async function captureOplogSlice({
     const firstBackup = backups[0];
     if (firstBackup) {
       const latestManifest = await readManifest(storage, firstBackup.key);
-      // Anchor initial slice to startTs (or endTs) so any writes between mongodump closing
-      // its internal oplog cursor and post-backup boundary recording are overlapped, never lost.
+      // Anchor initial slice to startTs (or endTs) so any writes during base dump are covered
       const anchorStr = latestManifest?.oplogWindow?.startTs ?? latestManifest?.oplogWindow?.endTs;
       if (anchorStr) {
         cursorStartTs = parseOplogTimestamp(anchorStr);
@@ -643,20 +600,16 @@ export async function captureOplogSlice({
       );
     }
 
-    // Query replica set status to identify majority commit point
+    // Query replica set status to identify majority commit point (clamped to appliedOpTime)
     const adminDb = typeof client.db === "function" ? client.db("admin") : null;
     const replStatus =
       adminDb && typeof adminDb.command === "function"
-        ? await adminDb.command({ replSetGetStatus: 1 }).catch((err) => {
+        ? ((await adminDb.command({ replSetGetStatus: 1 }).catch((err) => {
             logger.warn({ err }, "replSetGetStatus command failed");
             return null;
-          })
+          })) as Record<string, unknown> | null)
         : null;
-    const majorityTs = replStatus?.optimes?.lastCommittedOpTime?.ts
-      ? fromBsonTimestamp(replStatus.optimes.lastCommittedOpTime.ts)
-      : replStatus?.optimes?.readConcernMajorityOpTime?.ts
-        ? fromBsonTimestamp(replStatus.optimes.readConcernMajorityOpTime.ts)
-        : null;
+    const majorityTs = extractReplSetUpperBound(replStatus);
 
     if (!majorityTs) {
       throw new Error(
@@ -664,10 +617,16 @@ export async function captureOplogSlice({
       );
     }
 
-    // Inspect config.transactions for active or prepared distributed transactions.
-    // The slice upper boundary must not advance past the start of an in-progress transaction,
-    // ensuring multi-document transactions are not torn across slices before commitment.
     let effectiveUpperTs = majorityTs;
+    const explicitUntil = untilTs ? parseOplogTimestamp(untilTs) : null;
+    if (explicitUntil && compareTimestamps(explicitUntil, effectiveUpperTs) < 0) {
+      effectiveUpperTs = explicitUntil;
+    }
+
+    // Inspect config.transactions for active or prepared distributed transactions.
+    // The slice upper boundary must stop STRICTLY BEFORE ($lt) an in-progress transaction's
+    // startOpTime so uncommitted transaction ops are never split across slices.
+    let cappedByActiveTx = false;
     try {
       const configDb = typeof client.db === "function" ? client.db("config") : null;
       const txCol =
@@ -677,19 +636,20 @@ export async function captureOplogSlice({
       if (txCol && typeof txCol.find === "function") {
         const activeTx = await txCol
           .find({ state: { $in: ["prepared", "inProgress"] } }, { readConcern: { level: "local" } })
-          .sort({ startOpTime: 1 })
+          .sort({ "startOpTime.ts": 1 })
           .limit(1)
           .next();
         const txTs = fromBsonTimestamp(activeTx?.startOpTime?.ts);
-        if (txTs && compareTimestamps(txTs, effectiveUpperTs) < 0) {
+        if (txTs && compareTimestamps(txTs, effectiveUpperTs) <= 0) {
           logger.info(
             {
               activeTxStartTs: formatOplogTimestamp(txTs),
               majorityTs: formatOplogTimestamp(majorityTs),
             },
-            "Active transaction in progress; capping oplog slice upper boundary at transaction startOpTime",
+            "Active transaction in progress; capping oplog slice strictly before transaction startOpTime",
           );
           effectiveUpperTs = txTs;
+          cappedByActiveTx = true;
         }
       }
     } catch (err: unknown) {
@@ -703,39 +663,73 @@ export async function captureOplogSlice({
       );
     }
 
-    if (cursorStartTs && compareTimestamps(cursorStartTs, effectiveUpperTs) >= 0) {
-      logger.debug(
-        {
-          cursorStartTs: formatOplogTimestamp(cursorStartTs),
-          effectiveUpperTs: formatOplogTimestamp(effectiveUpperTs),
-        },
-        "No new majority-committed, transaction-consistent oplog entries",
+    // Detect post-restore timeline divergence: if persisted state.lastTs is strictly ahead
+    // of the cluster's majority commit point (not merely capped by an active txn), refuse to silently stall.
+    if (
+      updateState &&
+      !sinceTs &&
+      !cappedByActiveTx &&
+      cursorStartTs &&
+      compareTimestamps(cursorStartTs, majorityTs) > 0
+    ) {
+      throw new Error(
+        `PITR state cursor (${formatOplogTimestamp(cursorStartTs)}) is ahead of cluster majority oplog (${formatOplogTimestamp(majorityTs)}). Timeline diverged (e.g. after restore); take a new base backup to re-anchor PITR.`,
       );
-      return null;
+    }
+
+    if (cursorStartTs) {
+      const cmp = compareTimestamps(cursorStartTs, effectiveUpperTs);
+      if (cmp >= 0) {
+        // On a quiet cluster (cmp === 0 and not capped), advance coverageEndTs in state.json
+        if (updateState && !cappedByActiveTx && cmp === 0) {
+          await storage.putJson(pitrStateKey(scope), {
+            ...state,
+            lastTs: formatOplogTimestamp(cursorStartTs),
+            coverageEndTs: formatOplogTimestamp(effectiveUpperTs),
+            updatedAt: new Date().toISOString(),
+            gapDetected: Boolean(state?.gapDetected),
+          });
+        }
+        logger.debug(
+          {
+            cursorStartTs: formatOplogTimestamp(cursorStartTs),
+            effectiveUpperTs: formatOplogTimestamp(effectiveUpperTs),
+          },
+          "No new majority-committed, transaction-consistent oplog entries",
+        );
+        return null;
+      }
     }
 
     const query: Record<string, unknown> = {
       ts: {
         ...(cursorStartTs ? { $gt: toBsonTimestamp(cursorStartTs) } : {}),
-        $lte: toBsonTimestamp(effectiveUpperTs),
+        ...(cappedByActiveTx
+          ? { $lt: toBsonTimestamp(effectiveUpperTs) }
+          : { $lte: toBsonTimestamp(effectiveUpperTs) }),
       },
     };
 
     const maxBytes = (config.pitr?.maxSliceMb ?? 16) * 1024 * 1024;
-    // promoteValues: false preserves exact BSON types (Double, Long, Int32) upon serialization
-    const cursor = oplog.find(query, { promoteValues: false }).sort({ $natural: 1 });
+    // Use `raw: true` so MongoDB driver returns raw wire BSON bytes directly without JS decode/re-encode
+    const cursor = oplog.find(query, { raw: true, promoteValues: false }).sort({ $natural: 1 });
 
     const rawDocs: Buffer[] = [];
     let accumulatedBytes = 0;
     let firstTs: OplogTimestamp | null = null;
     let lastTs: OplogTimestamp | null = null;
+    let hitMaxBytes = false;
 
     try {
       for await (const doc of cursor) {
         if (signal?.aborted) break;
-        const docTs = fromBsonTimestamp(doc.ts);
+        const { ts: docTs, rawBuf, isPartialTxn } = inspectRawOrObjectOplogDoc(doc);
         if (!docTs) continue;
-        const rawBuf = Buffer.isBuffer(doc) ? doc : Buffer.from(BSON.serialize(doc));
+
+        // Defensive client-side enforcement in case a mock or driver ignores $lt
+        if (cappedByActiveTx && compareTimestamps(docTs, effectiveUpperTs) >= 0) {
+          break;
+        }
 
         if (!firstTs) {
           firstTs = docTs;
@@ -765,8 +759,8 @@ export async function captureOplogSlice({
         accumulatedBytes += rawBuf.length;
 
         // Never split an in-flight chained multi-document transaction (partialTxn: true) across slices
-        const isPartialTxn = Boolean((doc as { o?: { partialTxn?: boolean } }).o?.partialTxn);
         if (accumulatedBytes >= maxBytes && !isPartialTxn) {
+          hitMaxBytes = true;
           break;
         }
       }
@@ -782,7 +776,7 @@ export async function captureOplogSlice({
           .toLowerCase()
           .includes("oplog rolled over");
 
-      if (isRollover) {
+      if (isRollover && updateState) {
         logger.error(
           {
             err: cursorError,
@@ -800,9 +794,25 @@ export async function captureOplogSlice({
     }
 
     if (rawDocs.length === 0 || !firstTs || !lastTs) {
+      // Quiet window: no docs in (cursorStartTs, effectiveUpperTs], record observed coverage
+      if (updateState && !cappedByActiveTx) {
+        await storage.putJson(pitrStateKey(scope), {
+          ...state,
+          ...(cursorStartTs ? { lastTs: formatOplogTimestamp(cursorStartTs) } : {}),
+          coverageEndTs: formatOplogTimestamp(effectiveUpperTs),
+          updatedAt: new Date().toISOString(),
+          gapDetected: Boolean(gapDetected || state?.gapDetected),
+        });
+      }
       logger.debug("No new oplog entries since last checkpoint");
       return null;
     }
+
+    // Observed coverage reaches `effectiveUpperTs` when we drained the full window (not capped/truncated)
+    const sliceCoverageEndTs =
+      !hitMaxBytes && !cappedByActiveTx && compareTimestamps(effectiveUpperTs, lastTs) >= 0
+        ? effectiveUpperTs
+        : lastTs;
 
     const manifest = await uploadOplogSlice({
       config,
@@ -811,14 +821,18 @@ export async function captureOplogSlice({
       rawDocs,
       startTs: firstTs,
       endTs: lastTs,
+      coverageStartTs: cursorStartTs ?? firstTs,
+      coverageEndTs: sliceCoverageEndTs,
       previousEndTs: gapDetected ? null : cursorStartTs,
       gapDetected,
+      keyPrefix,
       signal,
     });
 
-    if (manifest) {
+    if (manifest && updateState) {
       await storage.putJson(pitrStateKey(scope), {
         lastTs: formatOplogTimestamp(lastTs),
+        coverageEndTs: formatOplogTimestamp(sliceCoverageEndTs),
         lastSliceKey: manifest.key,
         updatedAt: new Date().toISOString(),
         gapDetected,
@@ -835,38 +849,25 @@ export async function resolvePitrPlan(
   storage: StorageClient,
   scope: BackupScope,
   targetInput: string | OplogTimestamp,
-  options: { engine?: "logical" | "physical"; includeBaseWindow?: boolean } = {},
+  options: {
+    engine?: "logical" | "physical";
+    includeBaseWindow?: boolean;
+    /** Force anchoring to a specific base backup key (used by sharded PITR). */
+    baseKey?: string;
+  } = {},
 ): Promise<PitrPlan> {
   const targetEngine = options.engine ?? "logical";
   const includeBaseWindow = Boolean(options.includeBaseWindow);
   const targetTs = parsePitrTarget(targetInput);
-  const backups = (await listBackups(storage, scope)).filter((b) => {
-    if (!b.complete) return false;
-    const isPhysical = /\.physical\.tar\.gz(\.enc)?$/.test(b.key);
-    const isSharded = /\.cluster(\.enc)?$/.test(b.key);
-    return targetEngine === "physical" ? isPhysical : !isPhysical && !isSharded;
-  });
-  if (backups.length === 0) {
-    throw new Error(
-      `No complete ${targetEngine} base backups found under ${databasePrefix(scope)}`,
-    );
-  }
 
   let selectedBackup: BackupSummary | null = null;
   let selectedManifest: BackupManifest | null = null;
   let baseEndTs: OplogTimestamp | null = null;
 
-  for (const backup of backups) {
-    const manifest = await readManifest(storage, backup.key);
-    if (!manifest) continue;
-    if (
-      targetEngine === "logical" &&
-      (manifest.engine === "physical" || manifest.type === "sharded-cluster-backup")
-    ) {
-      continue;
-    }
-    if (targetEngine === "physical" && manifest.engine !== "physical") {
-      continue;
+  if (options.baseKey) {
+    const manifest = await readManifest(storage, options.baseKey);
+    if (!manifest) {
+      throw new Error(`Base backup manifest not found for anchored key: ${options.baseKey}`);
     }
     const endTs: OplogTimestamp = manifest.oplogWindow?.endTs
       ? parseOplogTimestamp(manifest.oplogWindow.endTs)!
@@ -875,12 +876,60 @@ export async function resolvePitrPlan(
             Math.floor(new Date(manifest.completedAt || manifest.createdAt).getTime() / 1000) >>> 0,
           i: 0,
         };
+    if (compareTimestamps(endTs, targetTs) > 0) {
+      throw new Error(
+        `Anchored base backup ${options.baseKey} (${formatOplogTimestamp(endTs)}) is newer than target PITR timestamp ${formatOplogTimestamp(targetTs)}`,
+      );
+    }
+    selectedBackup = {
+      key: options.baseKey,
+      size: manifest.size,
+      createdAt: new Date(manifest.createdAt),
+      encrypted: Boolean(manifest.encryption),
+      complete: true,
+    };
+    selectedManifest = manifest;
+    baseEndTs = endTs;
+  } else {
+    const backups = (await listBackups(storage, scope)).filter((b) => {
+      if (!b.complete) return false;
+      const isPhysical = /\.physical\.tar\.gz(\.enc)?$/.test(b.key);
+      const isSharded = /\.cluster(\.enc)?$/.test(b.key);
+      return targetEngine === "physical" ? isPhysical : !isPhysical && !isSharded;
+    });
+    if (backups.length === 0) {
+      throw new Error(
+        `No complete ${targetEngine} base backups found under ${databasePrefix(scope)}`,
+      );
+    }
 
-    if (compareTimestamps(endTs, targetTs) <= 0) {
-      selectedBackup = backup;
-      selectedManifest = manifest;
-      baseEndTs = endTs;
-      break;
+    for (const backup of backups) {
+      const manifest = await readManifest(storage, backup.key);
+      if (!manifest) continue;
+      if (
+        targetEngine === "logical" &&
+        (manifest.engine === "physical" || manifest.type === "sharded-cluster-backup")
+      ) {
+        continue;
+      }
+      if (targetEngine === "physical" && manifest.engine !== "physical") {
+        continue;
+      }
+      const endTs: OplogTimestamp = manifest.oplogWindow?.endTs
+        ? parseOplogTimestamp(manifest.oplogWindow.endTs)!
+        : {
+            t:
+              Math.floor(new Date(manifest.completedAt || manifest.createdAt).getTime() / 1000) >>>
+              0,
+            i: 0,
+          };
+
+      if (compareTimestamps(endTs, targetTs) <= 0) {
+        selectedBackup = backup;
+        selectedManifest = manifest;
+        baseEndTs = endTs;
+        break;
+      }
     }
   }
 
@@ -901,9 +950,10 @@ export async function resolvePitrPlan(
       compareTimestamps(s.endTs, baseAnchorTs) >= 0 && compareTimestamps(s.startTs, targetTs) <= 0,
   );
 
-  // Read manifests and verify contiguity of the oplog chain
+  // Read manifests and verify contiguity of the oplog chain starting strictly from `baseAnchorTs`
   const verifiedSlices: OplogSlice[] = [];
   let expectedPrevEndTs = baseAnchorTs;
+  let lastCoveredTs = baseAnchorTs;
 
   for (const slice of candidateSlices) {
     const sliceManifest = await readManifest(storage, slice.key);
@@ -916,21 +966,18 @@ export async function resolvePitrPlan(
     const prevEndStr = sliceManifest?.oplogWindow?.previousEndTs;
     const prevEndTs = prevEndStr ? parseOplogTimestamp(prevEndStr) : null;
 
-    const effectiveExpectedPrevEndTs =
-      verifiedSlices.length === 0 && includeBaseWindow ? baseEndTs : expectedPrevEndTs;
-
     if (prevEndTs) {
-      if (compareTimestamps(prevEndTs, effectiveExpectedPrevEndTs) > 0) {
+      if (compareTimestamps(prevEndTs, expectedPrevEndTs) > 0) {
         throw new Error(
-          `PITR timeline gap detected between ${formatOplogTimestamp(effectiveExpectedPrevEndTs)} and slice ${slice.key} (starts after ${formatOplogTimestamp(prevEndTs)})`,
+          `PITR timeline gap detected between ${formatOplogTimestamp(expectedPrevEndTs)} and slice ${slice.key} (starts after ${formatOplogTimestamp(prevEndTs)})`,
         );
       }
     } else if (
       sliceManifest?.oplogWindow &&
-      compareTimestamps(slice.startTs, effectiveExpectedPrevEndTs) > 0
+      compareTimestamps(slice.startTs, expectedPrevEndTs) > 0
     ) {
       throw new Error(
-        `PITR timeline gap detected before slice ${slice.key} (oplog rolled over after ${formatOplogTimestamp(effectiveExpectedPrevEndTs)})`,
+        `PITR timeline gap detected before slice ${slice.key} (oplog rolled over after ${formatOplogTimestamp(expectedPrevEndTs)})`,
       );
     }
 
@@ -941,9 +988,58 @@ export async function resolvePitrPlan(
     if (compareTimestamps(slice.endTs, expectedPrevEndTs) > 0) {
       expectedPrevEndTs = slice.endTs;
     }
+    const sliceCovEnd = sliceManifest?.oplogWindow?.coverageEndTs
+      ? parseOplogTimestamp(sliceManifest.oplogWindow.coverageEndTs)
+      : null;
+    const bestEnd =
+      sliceCovEnd && compareTimestamps(sliceCovEnd, slice.endTs) > 0 ? sliceCovEnd : slice.endTs;
+    if (compareTimestamps(bestEnd, lastCoveredTs) > 0) {
+      lastCoveredTs = bestEnd;
+    }
   }
 
-  if (compareTimestamps(targetTs, baseEndTs) > 0 && verifiedSlices.length === 0) {
+  // Quiet-cluster coverage proof:
+  // 1. A subsequent contiguous slice starting after `targetTs` whose `previousEndTs <= expectedPrevEndTs`
+  //    proves zero writes occurred in `(expectedPrevEndTs, nextSlice.startTs)`.
+  // 2. Or `state.json.coverageEndTs >= targetTs` (when `!gapDetected` and `state.lastTs <= expectedPrevEndTs`).
+  if (compareTimestamps(lastCoveredTs, targetTs) < 0) {
+    const nextSlice = allSlices.find((s) => compareTimestamps(s.startTs, targetTs) > 0);
+    if (nextSlice) {
+      const nextManifest = await readManifest(storage, nextSlice.key);
+      const nextPrevEnd = nextManifest?.oplogWindow?.previousEndTs
+        ? parseOplogTimestamp(nextManifest.oplogWindow.previousEndTs)
+        : null;
+      if (
+        !nextManifest?.oplogWindow?.gapDetected &&
+        nextPrevEnd &&
+        compareTimestamps(nextPrevEnd, expectedPrevEndTs) <= 0
+      ) {
+        lastCoveredTs = targetTs;
+      }
+    }
+  }
+
+  if (compareTimestamps(lastCoveredTs, targetTs) < 0 && typeof storage.getJson === "function") {
+    const stateObj = await storage.getJson<PitrStateRecord>(pitrStateKey(scope)).catch(() => null);
+    const state =
+      stateObj && "data" in stateObj ? stateObj.data : (stateObj as PitrStateRecord | null);
+    const stateCov = state?.coverageEndTs ? parseOplogTimestamp(state.coverageEndTs) : null;
+    const stateLast = state?.lastTs ? parseOplogTimestamp(state.lastTs) : null;
+    if (
+      !state?.gapDetected &&
+      stateCov &&
+      (!stateLast || compareTimestamps(stateLast, expectedPrevEndTs) <= 0) &&
+      compareTimestamps(stateCov, lastCoveredTs) > 0
+    ) {
+      lastCoveredTs = stateCov;
+    }
+  }
+
+  if (
+    compareTimestamps(targetTs, baseEndTs) > 0 &&
+    verifiedSlices.length === 0 &&
+    compareTimestamps(lastCoveredTs, targetTs) < 0
+  ) {
     throw new Error(
       `Target timestamp ${formatOplogTimestamp(targetTs)} is newer than base backup (${formatOplogTimestamp(baseEndTs)}), but no oplog slices are available to bridge the window`,
     );
@@ -951,12 +1047,12 @@ export async function resolvePitrPlan(
 
   const isInsufficientCoverage =
     targetTs.i === 0xffffffff
-      ? expectedPrevEndTs.t < targetTs.t
-      : compareTimestamps(expectedPrevEndTs, targetTs) < 0;
+      ? lastCoveredTs.t < targetTs.t
+      : compareTimestamps(lastCoveredTs, targetTs) < 0;
 
   if (isInsufficientCoverage) {
     throw new Error(
-      `PITR oplog coverage ends at ${formatOplogTimestamp(expectedPrevEndTs)}, which is before target ${formatOplogTimestamp(targetTs)}`,
+      `PITR oplog coverage ends at ${formatOplogTimestamp(lastCoveredTs)}, which is before target ${formatOplogTimestamp(targetTs)}`,
     );
   }
 
@@ -965,9 +1061,78 @@ export async function resolvePitrPlan(
     baseManifest: selectedManifest,
     baseEndTs,
     slices: verifiedSlices,
-    lastCoveredTs: expectedPrevEndTs,
+    lastCoveredTs,
     targetTs,
   };
+}
+
+function verifySliceManifest(
+  config: AppConfig,
+  sliceKey: string,
+  manifest: BackupManifest | null,
+): Buffer[] {
+  const keyRing = resolveKeyRing(config);
+  const isSigned = Boolean(manifest?.signature?.hmac || manifest?.encryption?.manifestHmac);
+
+  if (isSigned && manifest) {
+    if (keyRing.length === 0) {
+      throw new Error(
+        `Oplog slice manifest for ${sliceKey} is signed with HMAC, but ENCRYPTION_KEY / key ring is not configured`,
+      );
+    }
+    verifyManifest(keyRing, manifest);
+  } else if (manifest?.encryption) {
+    if (keyRing.length === 0) {
+      throw new Error(`Oplog slice ${sliceKey} is encrypted, but ENCRYPTION_KEY is not set`);
+    }
+  }
+
+  return keyRing;
+}
+
+/**
+ * Zero-disk streaming reader for an archived oplog slice.
+ * Verifies manifest HMAC upfront, decrypts/gunzips on the fly into `consumer(bsonStream)`,
+ * and verifies SHA-256 + byte size on completion.
+ */
+export async function streamOplogSlice(
+  { config, storage, signal }: { config: AppConfig; storage: StorageClient; signal?: AbortSignal },
+  sliceKey: string,
+  consumer: (gunzippedBsonStream: Readable) => Promise<void>,
+): Promise<ExtractOplogSliceResult> {
+  const manifest = await readManifest(storage, sliceKey);
+  const keyRing = verifySliceManifest(config, sliceKey, manifest);
+
+  const digest = new DigestStream();
+  const decryptStage = manifest?.encryption ? [createDecryptor(keyRing, manifest.encryption)] : [];
+  const outPass = new PassThrough({ highWaterMark: 256 * 1024 });
+  const controller = linkedController(signal);
+
+  try {
+    const downloadStream = await storage.download(sliceKey, { signal: controller.signal });
+    const stages = [downloadStream, digest, ...decryptStage, createGunzip(), outPass];
+
+    await settleAll(controller, [
+      runStreamPipeline(stages, { signal: controller.signal }),
+      consumer(outPass),
+    ]);
+  } finally {
+    controller.dispose();
+  }
+
+  const sha256 = digest.digest();
+  if (manifest?.sha256 && manifest.sha256 !== sha256) {
+    throw new Error(
+      `Oplog slice checksum mismatch for ${sliceKey}: expected ${manifest.sha256}, got ${sha256}`,
+    );
+  }
+  if (manifest?.size !== undefined && manifest.size !== digest.bytes) {
+    throw new Error(
+      `Oplog slice size mismatch for ${sliceKey}: expected ${manifest.size}, got ${digest.bytes}`,
+    );
+  }
+
+  return { bytes: digest.bytes, sha256, manifest };
 }
 
 export async function downloadAndExtractOplogSlice(
@@ -976,14 +1141,7 @@ export async function downloadAndExtractOplogSlice(
   destBsonFile: string,
 ): Promise<ExtractOplogSliceResult> {
   const manifest = await readManifest(storage, sliceKey);
-  const keyRing = resolveKeyRing(config);
-
-  if (manifest?.encryption) {
-    if (keyRing.length === 0) {
-      throw new Error(`Oplog slice ${sliceKey} is encrypted, but ENCRYPTION_KEY is not set`);
-    }
-    verifyManifest(keyRing, manifest);
-  }
+  const keyRing = verifySliceManifest(config, sliceKey, manifest);
 
   const digest = new DigestStream();
   const decryptStage = manifest?.encryption ? [createDecryptor(keyRing, manifest.encryption)] : [];
@@ -1028,12 +1186,20 @@ export function startOplogArchiver({
   const lockFile = path.join(config.workDir, ".oplog.lock");
   const distLockKey = `${pitrPrefix(scope)}.locks/oplog.lock.json`;
   let stopped = false;
-  let activePromise: Promise<BackupManifest | null> | null = null;
+  let activeTickPromise: Promise<void> | null = null;
+  let activeAbortController: AbortController | null = null;
   let timer: NodeJS.Timeout | null = null;
 
-  async function tick(): Promise<void> {
+  async function runTick(): Promise<void> {
     if (stopped || signal?.aborted) return;
     let release: (() => Promise<void>) | null = null;
+    const tickController = linkedController(signal);
+    activeAbortController = new AbortController();
+    const abortTick = (err: unknown) => {
+      activeAbortController?.abort(err);
+      tickController.abort(err);
+    };
+
     try {
       release = await acquireHybridLock({
         file: lockFile,
@@ -1042,6 +1208,10 @@ export function startOplogArchiver({
         staleAfterMs: Math.max(120_000, intervalMs * 3),
         distributedTtlMs: Math.max(90_000, intervalMs * 2),
         logger,
+        onLost: (err) => {
+          logger.error({ err }, "Oplog archiver lock lease lost; aborting active slice capture");
+          abortTick(err);
+        },
       });
       if (!release) {
         logger.debug("Skipping PITR oplog slice tick: another instance holds the oplog lock");
@@ -1052,12 +1222,12 @@ export function startOplogArchiver({
       // high write throughput (> maxSliceMb per flushIntervalSeconds) never falls behind.
       if (config.sharding?.enabled) {
         const { captureShardedOplogSlices } = await import("./sharding.js");
-        while (!stopped && !signal?.aborted) {
+        while (!stopped && !tickController.signal.aborted) {
           const result = await captureShardedOplogSlices({
             config,
             storage,
             logger,
-            signal,
+            signal: tickController.signal,
             createMongoClient,
           });
           if (!result) break;
@@ -1066,15 +1236,14 @@ export function startOplogArchiver({
           if (!anyCaptured) break;
         }
       } else {
-        while (!stopped && !signal?.aborted) {
-          activePromise = captureOplogSlice({
+        while (!stopped && !tickController.signal.aborted) {
+          const captured = await captureOplogSlice({
             config,
             storage,
             logger,
-            signal,
+            signal: tickController.signal,
             createMongoClient,
           });
-          const captured = await activePromise;
           if (!captured) break;
         }
       }
@@ -1085,11 +1254,19 @@ export function startOplogArchiver({
         await notifier.notifyFailure("pitr-oplog", err).catch(() => {});
       }
     } finally {
-      activePromise = null;
+      activeAbortController = null;
+      tickController.dispose();
       if (release) {
         await release().catch(() => {});
       }
     }
+  }
+
+  function scheduleTick(): void {
+    if (stopped || signal?.aborted || activeTickPromise) return;
+    activeTickPromise = runTick().finally(() => {
+      activeTickPromise = null;
+    });
   }
 
   return {
@@ -1101,9 +1278,9 @@ export function startOplogArchiver({
         },
         "Starting continuous PITR oplog archiver",
       );
-      void tick();
+      scheduleTick();
       timer = setInterval(() => {
-        if (!activePromise) void tick();
+        scheduleTick();
       }, intervalMs);
       timer.unref();
     },
@@ -1111,9 +1288,12 @@ export function startOplogArchiver({
     async stop(): Promise<void> {
       stopped = true;
       if (timer) clearInterval(timer);
-      if (activePromise) {
+      if (activeAbortController) {
+        activeAbortController.abort(new Error("Oplog archiver stopping"));
+      }
+      if (activeTickPromise) {
         try {
-          await activePromise;
+          await activeTickPromise;
         } catch {}
       }
     },

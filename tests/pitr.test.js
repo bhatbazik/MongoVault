@@ -174,6 +174,12 @@ describe("Continuous Oplog Archiver and PITR Restore Coordinator", () => {
                     (doc) => compareTimestamps(fromBsonTimestamp(doc.ts), lte) <= 0,
                   );
                 }
+                if (filter.ts?.$lt) {
+                  const lt = fromBsonTimestamp(filter.ts.$lt);
+                  filtered = filtered.filter(
+                    (doc) => compareTimestamps(fromBsonTimestamp(doc.ts), lt) < 0,
+                  );
+                }
                 const cursor = {
                   sort(spec) {
                     const dir = spec.$natural ?? spec.ts ?? 1;
@@ -688,6 +694,12 @@ describe("Continuous Oplog Archiver and PITR Restore Coordinator", () => {
                     (doc) => compareTimestamps(fromBsonTimestamp(doc.ts), lte) <= 0,
                   );
                 }
+                if (filter.ts?.$lt) {
+                  const lt = fromBsonTimestamp(filter.ts.$lt);
+                  filtered = filtered.filter(
+                    (doc) => compareTimestamps(fromBsonTimestamp(doc.ts), lt) < 0,
+                  );
+                }
                 return {
                   sort() {
                     return this;
@@ -720,9 +732,9 @@ describe("Continuous Oplog Archiver and PITR Restore Coordinator", () => {
     });
 
     expect(manifest).not.toBeNull();
-    // The slice should only capture up to 1010:1 (the start of the transaction), NOT 1020:1
-    expect(manifest.oplogWindow.endTs).toBe("1010:1");
-    expect(manifest.oplogWindow.entries).toBe(2);
+    // The slice must stop strictly BEFORE 1010:1 (the start of the in-progress transaction), capturing only 1000:1
+    expect(manifest.oplogWindow.endTs).toBe("1000:1");
+    expect(manifest.oplogWindow.entries).toBe(1);
   });
 
   it("fails closed if config.transactions query throws an unexpected error", async () => {
