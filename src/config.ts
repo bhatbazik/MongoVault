@@ -106,10 +106,6 @@ const schema = z
     SMTP_FROM: z.string().optional(),
     SMTP_TO: list,
 
-    SLACK_WEBHOOK_URL: z.string().url().optional(),
-    WEBHOOK_URL: z.string().url().optional(),
-    HEARTBEAT_URL: z.string().url().optional(),
-    DRILL_HEARTBEAT_URL: z.string().url().optional(),
     NOTIFY_ON_SUCCESS: flag(true),
 
     HTTP_PORT: z.coerce.number().int().min(0).max(65535).default(8080),
@@ -326,10 +322,6 @@ function toConfig(env: z.infer<typeof schema>): AppConfig {
             to: env.SMTP_TO,
           }
         : null,
-      slackWebhookUrl: env.SLACK_WEBHOOK_URL ?? null,
-      webhookUrl: env.WEBHOOK_URL ?? null,
-      heartbeatUrl: env.HEARTBEAT_URL ?? null,
-      drillHeartbeatUrl: env.DRILL_HEARTBEAT_URL ?? null,
     },
     http: { port: env.HTTP_PORT },
     logLevel: env.LOG_LEVEL,

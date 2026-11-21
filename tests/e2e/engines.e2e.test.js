@@ -78,10 +78,6 @@ function makeBaseConfig({
     notifications: {
       onSuccess: false,
       email: null,
-      slackWebhookUrl: null,
-      webhookUrl: null,
-      heartbeatUrl: null,
-      drillHeartbeatUrl: null,
     },
     http: { port: 0 },
     logLevel: "silent",

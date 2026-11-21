@@ -168,7 +168,7 @@ When a restore is requested:
 - **Grandfather-Father-Son (GFS) Retention:** Timezone-aware retention buckets (`keepLast`, `keepDaily`, `keepWeekly`, `keepMonthly`) with safety gates preventing deletion of base backups anchoring active PITR chains.
 - **Automated Restore Drills:** Scheduled validation that restores backups into isolated ephemeral databases (`_drill_<db>_<timestamp>`), verifies document counts, and reports oplog variances.
 - **Hybrid Concurrency Locking:** Local atomic PID lockfiles (`flag: "wx"`, stale takeover via atomic rename) combined with distributed S3 conditional PUT leases (`IfNoneMatch: "*"` / `IfMatch: etag`).
-- **Observability:** Prometheus metrics (`/metrics`), Kubernetes probes (`/healthz`, `/ready`), and alerting across Slack, generic Webhooks, SMTP email, and dead-man's switch pings.
+- **Observability:** Prometheus metrics (`/metrics`), Kubernetes probes (`/healthz`, `/ready`), and SMTP email alerting via Nodemailer.
 
 ### Major Architectural Decisions
 
@@ -344,7 +344,7 @@ src/
 
 #### 12. Monitoring, Observability & Notifications (`src/metrics.ts`, `src/notify.ts`)
 
-- **Responsibility:** Exposes Prometheus metrics and Kubernetes probes over an embedded HTTP server (`/healthz`, `/ready`, `/metrics`). Dispatches formatted alerts via SMTP email (Nodemailer), Slack webhooks, generic JSON webhooks, and dead-man's switch pings (`HEARTBEAT_URL`).
+- **Responsibility:** Exposes Prometheus metrics and Kubernetes probes over an embedded HTTP server (`/healthz`, `/ready`, `/metrics`). Dispatches formatted alerts via SMTP email (Nodemailer).
 - **Inputs:** System events, backup manifests, errors.
 - **Outputs:** HTTP responses, Prometheus scrape data, alert payloads.
 
@@ -1107,14 +1107,9 @@ The internal HTTP server (`src/metrics.ts`, default port `8080`) provides standa
 
 ---
 
-### 5.10 Notification Dispatcher
+### 5.10 Email Notification Dispatcher
 
-The notification subsystem (`src/notify.ts`) dispatches alerts through `CompositeNotifier`:
-
-- **Slack:** Formatted markdown blocks sent to `SLACK_WEBHOOK_URL`.
-- **Generic Webhook:** JSON payloads posted to `WEBHOOK_URL` containing event type, status, error, and manifest metadata.
-- **SMTP Email:** HTML/text summary sent via Nodemailer to `SMTP_TO`.
-- **Dead Man's Switch Heartbeat:** Pings `HEARTBEAT_URL` on success, and posts to `<HEARTBEAT_URL>/fail` on error. Operates independently of `NOTIFY_ON_SUCCESS`.
+The notification subsystem (`src/notify.ts`) dispatches formatted backup and failure summaries via `EmailNotifier` using Nodemailer (`SMTP_HOST`, `SMTP_PORT`, `SMTP_FROM`, `SMTP_TO`). Set `NOTIFY_ON_SUCCESS=false` to alert only on failures.
 
 ---
 
@@ -1725,11 +1720,7 @@ Configuration settings are validated at startup via Zod (`src/config.ts`).
 | `DRILL_MONGODB_URI`                    | String  |        _None_        |    No     | Isolated staging MongoDB connection URI. Must NOT match `MONGODB_URI`.                        |
 | `DRILL_CRON`                           | String  |        _None_        |   Cond.   | Cron expression for restore drills. Requires `DRILL_MONGODB_URI`.                             |
 | **Notifications & Observability**      |         |                      |           |                                                                                               |
-| `HEARTBEAT_URL`                        |   URL   |        _None_        |    No     | Dead-man's switch ping URL (e.g. Healthchecks.io). Appends `/fail` on failure.                |
-| `DRILL_HEARTBEAT_URL`                  |   URL   |        _None_        |    No     | Dedicated dead-man's switch ping URL for restore drill executions.                            |
-| `NOTIFY_ON_SUCCESS`                    | Boolean |        `true`        |    No     | Dispatch notification messages on successful backup runs as well as failures.                 |
-| `SLACK_WEBHOOK_URL`                    |   URL   |        _None_        |    No     | Slack incoming webhook URL for alerts.                                                        |
-| `WEBHOOK_URL`                          |   URL   |        _None_        |    No     | Generic HTTP POST endpoint receiving JSON alert payloads.                                     |
+| `NOTIFY_ON_SUCCESS`                    | Boolean |        `true`        |    No     | Dispatch email notifications on successful backup runs as well as failures.                   |
 | `SMTP_HOST`                            | String  |        _None_        |    No     | SMTP mail server hostname. Requires `SMTP_FROM` and `SMTP_TO`.                                |
 | `SMTP_PORT`                            | Number  |        `587`         |    No     | SMTP server port.                                                                             |
 | `SMTP_SECURE`                          | Boolean |       `false`        |    No     | Enable TLS/SSL connection for SMTP.                                                           |

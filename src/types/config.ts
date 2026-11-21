@@ -77,10 +77,6 @@ export interface SmtpConfig {
 export interface NotificationsConfig {
   onSuccess: boolean;
   email: SmtpConfig | null;
-  slackWebhookUrl: string | null;
-  webhookUrl: string | null;
-  heartbeatUrl: string | null;
-  drillHeartbeatUrl: string | null;
 }
 
 export interface HttpConfig {
