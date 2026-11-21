@@ -3,20 +3,23 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { type Transform, Writable } from "node:stream";
 import { createGunzip } from "node:zlib";
+import { MongoClient } from "mongodb";
 import { linkedController, settleAll } from "./abort.js";
 import { isClusterScope, readManifest, resolveBackup, resolveKeyRing, scopeOf } from "./catalog.js";
 import { createDecryptor, verifyManifest } from "./crypto.js";
 import { DigestStream } from "./digest.js";
+import { MongoOplogTargetClient, OplogApplier } from "./oplog-applier.js";
 import {
   downloadAndExtractOplogSlice,
   filterOplogSliceFile,
   formatOplogTimestamp,
   incrementOplogTimestamp,
   resolvePitrPlan,
+  streamOplogSlice,
 } from "./oplog.js";
 import { runStreamPipeline } from "./stream.js";
-import { mongorestore, replayOplogFile } from "./tools.js";
-import type { BackupManifest } from "./types/catalog.js";
+import { mongorestore } from "./tools.js";
+import type { BackupManifest, ShardedClusterMeta } from "./types/catalog.js";
 import type { AppConfig } from "./types/config.js";
 import type {
   DescribeBackupResult,
@@ -25,6 +28,23 @@ import type {
   RestoreResult,
   VerifyBackupResult,
 } from "./types/restore.js";
+
+/**
+ * System namespaces excluded during full-cluster logical restores (matching Percona PBM)
+ * so target cluster metadata, sessions, active transaction tables, and FCV are never clobbered.
+ */
+export const CLUSTER_SYSTEM_NS_EXCLUDE = [
+  "admin.system.version",
+  "config.system.sessions",
+  "config.transactions",
+  "config.rangeDeletions",
+  "config.shards",
+  "config.version",
+  "config.locks",
+  "config.lockpings",
+  "config.mongos",
+  "config.cache.*",
+];
 
 export class IntegrityError extends Error {
   constructor(message: string) {
@@ -83,6 +103,149 @@ function assertChecksum(key: string, expected: string | null, actual: string): v
   }
 }
 
+async function verifyGzipArchiveObject(
+  ctx: RestoreContext,
+  key: string,
+): Promise<VerifyBackupResult> {
+  const { config, storage, logger, signal } = ctx;
+  const manifest = await readManifest(storage, key);
+  const object = manifest ? null : await storage.head(key);
+  if (!manifest && !object) {
+    throw new IntegrityError(`Backup not found: ${key}`);
+  }
+  if (manifest?.key && manifest.key !== key) {
+    throw new IntegrityError(
+      `Manifest key mismatch for ${key}: manifest belongs to ${manifest.key}`,
+    );
+  }
+  const keyRing = resolveKeyRing(config);
+  const isSigned = Boolean(manifest?.signature?.hmac || manifest?.encryption?.manifestHmac);
+  if (isSigned && manifest) {
+    if (keyRing.length === 0) {
+      throw new IntegrityError(
+        `Backup manifest for ${key} is signed with HMAC, but ENCRYPTION_KEY is not configured`,
+      );
+    }
+    try {
+      verifyManifest(keyRing, manifest);
+    } catch (error) {
+      throw new IntegrityError((error as Error).message);
+    }
+  } else if (manifest?.encryption && keyRing.length === 0) {
+    throw new IntegrityError(`${key} is encrypted, but ENCRYPTION_KEY is not set`);
+  }
+
+  const checksum = manifest?.sha256 ?? object?.metadata?.sha256 ?? null;
+  if (!checksum) {
+    throw new IntegrityError(`${key} has no manifest or checksum to verify against`);
+  }
+
+  const digest = new DigestStream();
+  const discard = new Writable({ write: (_chunk, _encoding, callback) => callback() });
+
+  try {
+    const stages = [
+      await storage.download(key, { signal }),
+      digest,
+      ...decryptStage(config, manifest),
+      createGunzip(),
+      discard,
+    ];
+    await runStreamPipeline(stages, { signal });
+  } catch (error: unknown) {
+    const err = error as { name?: string; message?: string };
+    if (err.name === "AbortError") throw error;
+    throw new IntegrityError(`${key} could not be read back: ${err.message ?? String(error)}`);
+  }
+
+  const sha256 = digest.digest();
+  assertChecksum(key, checksum, sha256);
+  if (manifest && manifest.size !== digest.bytes) {
+    throw new IntegrityError(
+      `Size mismatch for ${key}: expected ${manifest.size}, got ${digest.bytes}`,
+    );
+  }
+
+  logger.debug({ key, sha256 }, "Archive object verified");
+  return { key, size: digest.bytes, sha256, encrypted: Boolean(manifest?.encryption) };
+}
+
+async function verifyShardedClusterBackup(
+  ctx: RestoreContext,
+  key: string,
+  manifest: BackupManifest | null,
+  checksum: string,
+): Promise<VerifyBackupResult> {
+  const { config, storage, logger, signal } = ctx;
+  const digest = new DigestStream();
+  const chunks: Buffer[] = [];
+  const collector = new Writable({
+    write(chunk, _encoding, callback) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      callback();
+    },
+  });
+
+  try {
+    const stages = [
+      await storage.download(key, { signal }),
+      digest,
+      ...decryptStage(config, manifest),
+      collector,
+    ];
+    await runStreamPipeline(stages, { signal });
+  } catch (error: unknown) {
+    const err = error as { name?: string; message?: string };
+    if (err.name === "AbortError") throw error;
+    throw new IntegrityError(`${key} could not be read back: ${err.message ?? String(error)}`);
+  }
+
+  const sha256 = digest.digest();
+  assertChecksum(key, checksum, sha256);
+
+  let clusterMeta: ShardedClusterMeta;
+  try {
+    clusterMeta = JSON.parse(Buffer.concat(chunks).toString("utf8")) as ShardedClusterMeta;
+  } catch (error) {
+    throw new IntegrityError(
+      `Invalid sharded cluster metadata JSON in ${key}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  // Recursively verify configsvr backup, every shard backup, and all bridging slices
+  const keysToVerify = new Set<string>();
+  if (clusterMeta.configsvr?.backupKey) {
+    keysToVerify.add(clusterMeta.configsvr.backupKey);
+  }
+  if (clusterMeta.configsvr?.bridgingSliceKey) {
+    keysToVerify.add(clusterMeta.configsvr.bridgingSliceKey);
+  }
+  for (const sKey of clusterMeta.configsvr?.bridgingSliceKeys ?? []) {
+    keysToVerify.add(sKey);
+  }
+  for (const shard of Object.values(clusterMeta.shards ?? {})) {
+    if (shard.backupKey) keysToVerify.add(shard.backupKey);
+    if (shard.bridgingSliceKey) keysToVerify.add(shard.bridgingSliceKey);
+    for (const sKey of shard.bridgingSliceKeys ?? []) {
+      keysToVerify.add(sKey);
+    }
+  }
+
+  logger.info(
+    { key, childObjects: keysToVerify.size },
+    "Verifying sharded cluster child archives and bridging slices",
+  );
+  for (const childKey of keysToVerify) {
+    await verifyGzipArchiveObject(ctx, childKey);
+  }
+
+  logger.info(
+    { key, sha256, verifiedChildren: keysToVerify.size },
+    "Sharded cluster backup verified",
+  );
+  return { key, size: digest.bytes, sha256, encrypted: Boolean(manifest?.encryption) };
+}
+
 export async function verifyBackup(
   ctx: RestoreContext,
   ref: string = "latest",
@@ -91,6 +254,11 @@ export async function verifyBackup(
   const { key, manifest, checksum } = await describeBackup(ctx, ref);
   if (!checksum) {
     throw new IntegrityError(`${key} has no manifest or checksum to verify against`);
+  }
+
+  if (manifest?.type === "sharded-cluster-backup" || /\.cluster(\.enc)?$/.test(key)) {
+    logger.info({ key }, "Verifying sharded cluster backup");
+    return verifyShardedClusterBackup(ctx, key, manifest, checksum);
   }
 
   logger.info({ key }, "Verifying backup");
@@ -186,6 +354,12 @@ export async function restoreBackup(
 
   const effectiveNsInclude =
     nsInclude ?? (isFilteredCluster ? `${target}.*` : isRenamedDb ? `${source}.*` : undefined);
+  // mongorestore rejects --nsExclude when --oplogReplay is enabled ("cannot use --oplogReplay with excludes specified").
+  // Pass systemNsExclude whenever oplogReplay is disabled; when oplogReplay is active, mongorestore handles internal collections natively.
+  const systemNsExclude =
+    isCluster && !hasNamespaceFilter && drop && !shouldReplayOplog
+      ? CLUSTER_SYSTEM_NS_EXCLUDE
+      : undefined;
 
   const controller = linkedController(signal);
   try {
@@ -195,9 +369,12 @@ export async function restoreBackup(
       workDir: config.workDir,
       nsInclude: effectiveNsInclude,
       nsExclude,
+      systemNsExclude,
       nsFrom: isRenamedDb ? `${source}.*` : undefined,
       nsTo: isRenamedDb ? `${target}.*` : undefined,
       drop,
+      preserveUUID: drop && !isRenamedDb,
+      bypassDocumentValidation: true,
       oplogReplay: shouldReplayOplog,
       oplogLimit,
       parallelCollections: parallelCollections ?? config.mongo.parallelCollections,
@@ -252,28 +429,39 @@ export async function restorePointInTime(
   }: RestoreOptions,
 ): Promise<RestoreResult> {
   const { config, storage, logger, signal, tools } = ctx;
-  const effectiveReplay = tools?.replayOplogFile ?? replayOplogFile;
-  const hasNamespaceFilter = Boolean(database || nsInclude || nsExclude);
-  const plan = await resolvePitrPlan(storage, scopeOf(config), pitr!, {
+  const initialIsFiltered =
+    (Boolean(database) &&
+      !isClusterScope(database) &&
+      (isClusterScope(config.mongo.database) || database !== config.mongo.database)) ||
+    Boolean(nsInclude) ||
+    Boolean(nsExclude);
+
+  let plan = await resolvePitrPlan(storage, scopeOf(config), pitr!, {
     engine: "logical",
-    includeBaseWindow: hasNamespaceFilter,
+    includeBaseWindow: initialIsFiltered,
   });
+
+  const source = plan.baseManifest?.database ?? config.mongo.database;
+  const target = database ?? source;
+  const isCluster = isClusterScope(source);
+  const isFilteredCluster = isCluster && !isClusterScope(target);
+  const isRenamedDb = !isCluster && target !== source;
+  const hasNamespaceFilter =
+    isFilteredCluster || isRenamedDb || Boolean(nsInclude) || Boolean(nsExclude);
+
+  if (hasNamespaceFilter !== initialIsFiltered) {
+    plan = await resolvePitrPlan(storage, scopeOf(config), pitr!, {
+      engine: "logical",
+      includeBaseWindow: hasNamespaceFilter,
+    });
+  }
+
   const targetLimit = formatOplogTimestamp(plan.targetTs);
   const exclusiveLimit = formatOplogTimestamp(incrementOplogTimestamp(plan.targetTs));
 
-  if (
-    hasNamespaceFilter &&
-    plan.baseManifest?.oplog &&
-    plan.baseManifest.oplogWindow?.startTs &&
-    plan.slices.length === 0
-  ) {
-    logger.warn(
-      {
-        baseKey: plan.baseBackup.key,
-        baseStartTs: plan.baseManifest.oplogWindow.startTs,
-        baseEndTs: formatOplogTimestamp(plan.baseEndTs),
-      },
-      "Namespace-filtered PITR disables --oplogReplay on base archive and no external oplog slices cover the base dump window",
+  if (hasNamespaceFilter && plan.baseManifest?.oplog && plan.slices.length === 0) {
+    throw new Error(
+      `Cannot perform namespace-filtered PITR restore from ${plan.baseBackup.key}: --oplogReplay on the base archive is disabled for filtered restores and no external oplog slices cover the base dump window`,
     );
   }
 
@@ -287,6 +475,8 @@ export async function restorePointInTime(
     "Resolved Point-in-Time Recovery (PITR) plan",
   );
 
+  const replayedBaseOplog = Boolean(plan.baseManifest?.oplog) && !hasNamespaceFilter;
+
   // Stage 1: Restore base backup
   const baseResult = await restoreBackup(ctx, {
     ref: plan.baseBackup.key,
@@ -296,63 +486,109 @@ export async function restorePointInTime(
     nsExclude,
     drop,
     preVerify,
-    oplogReplay: Boolean(plan.baseManifest?.oplog) && !hasNamespaceFilter,
-    oplogLimit:
-      plan.slices.length === 0 && plan.baseManifest?.oplog && !hasNamespaceFilter
-        ? exclusiveLimit
-        : undefined,
+    oplogReplay: replayedBaseOplog,
+    oplogLimit: plan.slices.length === 0 && replayedBaseOplog ? exclusiveLimit : undefined,
     parallelCollections,
   });
 
-  // Stage 2: Sequentially download, verify, decrypt, filter, and replay continuous oplog slices
+  // Stage 2: Replay continuous oplog slices up to plan.targetTs
   const controller = linkedController(signal);
   let replayedEntries = 0;
 
   try {
-    for (const slice of plan.slices) {
-      const sliceFile = path.join(config.workDir, `.pitr-slice-${randomUUID()}.oplog.bson`);
-      const filteredFile = path.join(config.workDir, `.pitr-filtered-${randomUUID()}.oplog.bson`);
-      try {
-        await downloadAndExtractOplogSlice(
-          { config, storage, signal: controller.signal },
-          slice.key,
-          sliceFile,
-        );
-        const { keptEntries } = await filterOplogSliceFile(sliceFile, filteredFile, {
-          targetTs: plan.targetTs,
-          database,
+    if (tools?.replayOplogFile) {
+      // Injectable legacy replay hook (primarily used by unit tests)
+      for (const slice of plan.slices) {
+        const sliceFile = path.join(config.workDir, `.pitr-slice-${randomUUID()}.oplog.bson`);
+        const filteredFile = path.join(config.workDir, `.pitr-filtered-${randomUUID()}.oplog.bson`);
+        try {
+          await downloadAndExtractOplogSlice(
+            { config, storage, signal: controller.signal },
+            slice.key,
+            sliceFile,
+          );
+          const { keptEntries } = await filterOplogSliceFile(sliceFile, filteredFile, {
+            startExclusiveTs: replayedBaseOplog ? plan.baseEndTs : undefined,
+            targetTs: plan.targetTs,
+            database: isFilteredCluster ? target : undefined,
+            nsInclude,
+            nsExclude,
+          });
+          if (keptEntries === 0) {
+            logger.debug({ sliceKey: slice.key }, "Skipping oplog slice with 0 matching entries");
+            continue;
+          }
+          await tools.replayOplogFile({
+            uri,
+            workDir: config.workDir,
+            oplogFile: filteredFile,
+            oplogLimit: exclusiveLimit,
+            timeoutMs: config.timeoutMs,
+            signal: controller.signal,
+            logger,
+          });
+          replayedEntries += keptEntries;
+          logger.info(
+            {
+              sliceKey: slice.key,
+              startTs: formatOplogTimestamp(slice.startTs),
+              endTs: formatOplogTimestamp(slice.endTs),
+              keptEntries,
+              oplogLimit: targetLimit,
+            },
+            "Replayed PITR oplog slice",
+          );
+        } finally {
+          await Promise.allSettled([
+            fs.rm(sliceFile, { force: true }),
+            fs.rm(filteredFile, { force: true }),
+          ]);
+        }
+      }
+    } else if (plan.slices.length > 0) {
+      // Production streaming OplogApplier (0 temp disk files, cross-slice txns, index DDL, rename cloning)
+      const client = new MongoClient(uri);
+      await client.connect();
+      const applier = new OplogApplier({
+        target: new MongoOplogTargetClient(client),
+        workDir: config.workDir,
+        logger,
+        startExclusiveTs: replayedBaseOplog ? plan.baseEndTs : undefined,
+        endTs: plan.targetTs,
+        filter: {
+          database: isFilteredCluster ? target : undefined,
           nsInclude,
           nsExclude,
-        });
-        if (keptEntries === 0) {
-          logger.debug({ sliceKey: slice.key }, "Skipping oplog slice with 0 matching entries");
-          continue;
+          clone: isRenamedDb ? { fromDb: source, toDb: target } : undefined,
+        },
+        backupType: "logical",
+      });
+
+      try {
+        for (const slice of plan.slices) {
+          const prevApplied = applier.getStats().appliedEntries;
+          await streamOplogSlice(
+            { config, storage, signal: controller.signal },
+            slice.key,
+            (stream) => applier.applyStream(stream, controller.signal),
+          );
+          const appliedInSlice = applier.getStats().appliedEntries - prevApplied;
+          logger.info(
+            {
+              sliceKey: slice.key,
+              startTs: formatOplogTimestamp(slice.startTs),
+              endTs: formatOplogTimestamp(slice.endTs),
+              appliedEntries: appliedInSlice,
+              oplogLimit: targetLimit,
+            },
+            "Replayed PITR oplog slice",
+          );
         }
-        await effectiveReplay({
-          uri,
-          workDir: config.workDir,
-          oplogFile: filteredFile,
-          oplogLimit: exclusiveLimit,
-          timeoutMs: config.timeoutMs,
-          signal: controller.signal,
-          logger,
-        });
-        replayedEntries += keptEntries;
-        logger.info(
-          {
-            sliceKey: slice.key,
-            startTs: formatOplogTimestamp(slice.startTs),
-            endTs: formatOplogTimestamp(slice.endTs),
-            keptEntries,
-            oplogLimit: targetLimit,
-          },
-          "Replayed PITR oplog slice",
-        );
+        await applier.buildPendingIndexes();
+        replayedEntries = applier.getStats().appliedEntries;
       } finally {
-        await Promise.allSettled([
-          fs.rm(sliceFile, { force: true }),
-          fs.rm(filteredFile, { force: true }),
-        ]);
+        await applier.dispose();
+        await client.close().catch(() => {});
       }
     }
 

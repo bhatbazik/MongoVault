@@ -146,4 +146,50 @@ describe("selective restore (namespace filtering)", () => {
 
     expect(mongorestoreCalled).toBe(false);
   });
+
+  it("fails closed on namespace-filtered PITR when base archive has oplog and no external slices cover the base window", async () => {
+    const manifestKey = "backups/_cluster/2026-03-10/base.archive.gz.manifest.json";
+    const baseKey = "backups/_cluster/2026-03-10/base.archive.gz";
+    const mockStorage = {
+      async *list() {
+        yield { key: baseKey, lastModified: new Date("2026-03-10T12:00:00Z") };
+        yield { key: manifestKey, lastModified: new Date("2026-03-10T12:00:00Z") };
+      },
+      async getJson(key) {
+        if (key === manifestKey) {
+          return {
+            data: {
+              version: 2,
+              engine: "logical",
+              key: baseKey,
+              database: "*",
+              createdAt: "2026-03-10T12:00:00Z",
+              completedAt: "2026-03-10T12:01:00Z",
+              size: 100,
+              sha256: "abc",
+              oplog: true,
+            },
+          };
+        }
+        return null;
+      },
+    };
+
+    const logger = pino({ level: "silent" });
+
+    await expect(
+      restoreBackup(
+        {
+          config: { ...config, mongo: { ...config.mongo, database: "*" } },
+          storage: mockStorage,
+          logger,
+        },
+        {
+          uri: "mongodb://localhost:27017",
+          nsInclude: "app.users",
+          pitr: "1773144060:0",
+        },
+      ),
+    ).rejects.toThrow(/Cannot perform namespace-filtered PITR restore/);
+  });
 });
