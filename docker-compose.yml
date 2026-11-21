@@ -1,13 +1,20 @@
 services:
   mongodb:
-    image: mongo:7.0
+    image: mongo:8.0
     restart: unless-stopped
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
     ports:
       - "27017:27017"
     environment:
       MONGO_INITDB_DATABASE: production
     volumes:
       - mongo_data:/data/db
+    healthcheck:
+      test: >
+        mongosh --quiet --eval "try { rs.status().ok } catch (e) { rs.initiate({ _id: 'rs0', members: [{ _id: 0, host: 'mongodb:27017' }] }).ok }"
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
   localstack:
     image: localstack/localstack:3.4
@@ -37,14 +44,19 @@ services:
     build: .
     restart: unless-stopped
     depends_on:
-      - mongodb
-      - localstack
-      - s3-init
+      mongodb:
+        condition: service_healthy
+      localstack:
+        condition: service_started
+      s3-init:
+        condition: service_completed_successfully
     ports:
       - "8080:8080"
     environment:
-      MONGODB_URI: "mongodb://mongodb:27017/production"
-      MONGODB_DATABASE: "production"
+      MONGODB_URI: "mongodb://mongodb:27017/production?replicaSet=rs0"
+      MONGODB_DATABASE: "*"
+      MONGODB_OPLOG: "true"
+      PITR_ENABLED: "true"
       S3_ENDPOINT: "http://localstack:4566"
       S3_REGION: "ap-south-1"
       S3_BUCKET: "backups"
@@ -59,6 +71,7 @@ services:
       LOG_LEVEL: "info"
       RETENTION_KEEP_LAST: 3
       RETENTION_KEEP_DAILY: 7
+      NOTIFY_ON_SUCCESS: "true"
 
 volumes:
   mongo_data:
