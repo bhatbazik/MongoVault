@@ -91,6 +91,9 @@ export class PhysicalBackupEngine implements BackupEngineStrategy {
       logger: options.logger,
       signal: options.signal,
       dbPath: options.dbPath,
+      fsyncLockFallback: options.config.physical?.allowFsyncLock,
+      allowPrimaryFsyncLock: options.config.physical?.allowPrimaryFsyncLock,
+      fsyncLockTimeoutMs: options.config.physical?.fsyncLockTimeoutMs,
     });
     return res.manifest;
   }

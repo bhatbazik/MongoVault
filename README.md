@@ -1778,13 +1778,33 @@ AWS S3 enforces a hard limit of **10,000 parts** per multipart upload:
 
 ---
 
-### Physical Backup Host Locality
+### Physical Backup Host Locality & `fsyncLock` Safety
 
 When using `--engine physical`:
 
 1. MongoVault must run on the same node as `mongod` or share access to the WiredTiger data directory (`PHYSICAL_DB_PATH`).
 2. MongoDB user permissions: MongoVault requires read permissions on `.wt` files.
-3. **Restoration Safety:** The target `mongod` instance must be shut down before running physical restore. MongoVault extracts raw files directly into `dbPath` and automatically deletes stale `mongod.lock` and `WiredTiger.lock` files.
+3. **`$backupCursor` Preferred / `fsyncLock` Opt-In:** MongoVault always attempts non-blocking `$backupCursor` + `$backupCursorExtend` first. Falling back to write-blocking `fsyncLock` is **disabled by default** — you must explicitly set `PHYSICAL_ALLOW_FSYNC_LOCK=true` to opt in.
+4. **Multi-Node Primary Guard:** Even when `PHYSICAL_ALLOW_FSYNC_LOCK=true`, MongoVault refuses to acquire `fsyncLock` on a multi-node replica set PRIMARY (which blocks all cluster writes and risks a persistent lock across failovers) unless you also set `PHYSICAL_ALLOW_PRIMARY_FSYNC_LOCK=true`. Always target a hidden/secondary member (`MONGODB_READ_PREFERENCE=secondary`).
+5. **Watchdog & Critical Unlock Handling:** An active `fsyncLock` is guarded by a watchdog timer (`PHYSICAL_FSYNC_LOCK_TIMEOUT_MS`, default `300000` ms / 5 min). On completion, failure, or abort, MongoVault retries `fsyncUnlock` across fresh connections and raises a critical `FsyncUnlockError` (never swallowed) if unlock cannot be confirmed.
+6. **Emergency Manual Unlock Runbook:** If an alert reports `FsyncUnlockError` or the backup host loses power while holding `fsyncLock`, connect directly to the affected `mongod` node and verify/release the lock:
+   ```javascript
+   db.adminCommand({ currentOp: 1 }).fsyncLock; // true if still write-locked
+   db.adminCommand({ fsyncUnlock: 1 }); // releases write lock
+   ```
+7. **Restoration Safety:** The target `mongod` instance must be shut down before running physical restore. MongoVault refuses to overwrite a directory containing a non-empty `mongod.lock`.
+
+---
+
+### Isolated-Target Restore Policy
+
+Multi-stage disaster recovery (base restore + sequential oplog slice replay) is inherently non-atomic if an external failure interrupts mid-replay, even though MongoVault pre-verifies all archives and slices before `--drop`.
+
+**Recommended production recovery workflow:**
+
+1. Always restore into a **fresh, isolated MongoDB deployment** first — never target the live production database directly.
+2. Validate restored collection counts, indexes, validators, views, and application-level invariants on the isolated target.
+3. Promote or cut over traffic only after full verification succeeds.
 
 ---
 
@@ -1793,7 +1813,19 @@ When using `--engine physical`:
 When using `--sharding`:
 
 1. **Balancer Drain Window:** MongoVault stops the cluster balancer and waits up to 30 seconds for in-flight chunk migrations to complete. If a migration round cannot conclude within 30 seconds, it aborts the backup with an `ActiveChunkMigrationError` to guarantee strict cross-shard consistency and eliminate duplicate or missing documents.
-2. **Network Direct Access:** MongoVault derives direct shard replica set URIs using the seed host addresses stored in `config.shards`. The host running MongoVault must have network route access to every individual shard host, not merely the `mongos` router.
+2. **Concurrent 2PC Transaction Safety:** After parallel CSRS and shard base dumps finish, MongoVault waits for boundary-straddling prepared 2PC transactions to settle, advances the common `clusterTime`, bridges every shard to that timestamp (automatically walking `prevOpTime` chains to bundle any precursor `prepare`/`partialTxn` entries from before the base dump cutoff), and reconciles cross-shard commits during restore. If any shard fails mid-backup, sibling dumps are aborted immediately and uploaded partial child archives are cleaned up.
+3. **Network Direct Access:** MongoVault derives direct shard replica set URIs using the seed host addresses stored in `config.shards`. The host running MongoVault must have network route access to every individual shard host, not merely the `mongos` router.
+
+---
+
+### Production Hardening Baseline
+
+Default settings favor low-friction local development (encryption, PITR, retention, and S3 Object Lock are disabled by default). For business-critical production deployments, enable all of the following:
+
+- **Mandatory Encryption:** Set `REQUIRE_ENCRYPTION=true` and store `ENCRYPTION_KEY` in a dedicated secret manager / KMS outside the backup bucket, with tested key-recovery procedures.
+- **Ransomware Immutability:** Enable `S3_OBJECT_LOCK_ENABLED=true` with `S3_OBJECT_LOCK_MODE=COMPLIANCE`, S3 Versioning, a separate AWS backup account, and least-privilege IAM preventing backup credentials from deleting protected objects.
+- **Continuous PITR + Alerting:** Enable `PITR_ENABLED=true`, size `local.oplog.rs` to retain at least 24–72 hours of peak writes, and deploy the Prometheus alert rules in [ops/prometheus-alerts.yml](ops/prometheus-alerts.yml) (`MongoVaultPitrGapDetected`, `MongoVaultPitrLagHigh`, `MongoVaultBackupFailure`).
+- **Scheduled Restore Drills:** Configure `DRILL_MONGODB_URI` and `DRILL_CRON` to continuously prove restoreability into an isolated target.
 
 ---
 
@@ -1801,10 +1833,10 @@ When using `--sharding`:
 
 - **Recovery Point Objective (RPO):**
   - Logical / Physical Backups: `RPO = Backup Frequency` (e.g., 24 hours with daily cron).
-  - Continuous PITR: `RPO ≤ PITR_FLUSH_INTERVAL_SECONDS` (default: 60 seconds; reducible to 5 seconds).
+  - Continuous PITR: Target flush interval is `PITR_FLUSH_INTERVAL_SECONDS` (default: 60 seconds; minimum: 5 seconds). **Actual achieved RPO is operational, not automatic** — it depends on continuous PITR daemon uptime, `local.oplog.rs` retention surviving any backup host outage without rollover, successful storage uploads, and active alerting on PITR lag/gaps.
 - **Recovery Time Objective (RTO):**
-  - Logical Engine: Moderate (governed by network download speed and index rebuild time).
-  - Physical Engine: Minimal (governed purely by network download speed and disk write throughput).
+  - Logical Engine: Governed by archive download throughput, `mongorestore` ingestion, index rebuilds, and oplog replay volume.
+  - Physical Engine: Governed by archive download speed, disk write throughput, and post-checkpoint oplog replay volume. Measure both RPO and RTO against your real dataset size before relying on them for SLAs.
 
 ---
 
@@ -1818,6 +1850,7 @@ src/
 │   ├── backup.ts         # Backup command handler
 │   ├── restore.ts        # Restore command handler
 │   ├── status.ts         # Status inspection handler
+│   ├── tui.ts            # Interactive full-screen TUI Control Center (`mongovault tui`)
 │   ├── check.ts          # Preflight checks handler
 │   ├── describe.ts       # Manifest metadata viewer
 │   ├── verify.ts         # Archive stream verification handler
@@ -1835,12 +1868,13 @@ src/
 │   ├── crypto.ts         # Encryption envelope and stream types
 │   ├── oplog.ts          # PITR oplog structures and timestamp types
 │   └── ...
+├── tui.ts                # Zero-dependency ANSI-aware TUI components (panels, tables, badges, spinners)
 ├── archive-stream.ts     # Zero-allocation mongodump --archive tap & collection streamer
 ├── backup.ts             # Logical backup pipeline
 ├── restore.ts            # Restore pipeline, selective filters, recursive verification
-├── physical.ts           # WiredTiger $backupCursor / fsyncLock & multi-step recovery
+├── physical.ts           # WiredTiger $backupCursor / opt-in fsyncLock & multi-step recovery
 ├── sharding.ts           # Coordinated multi-shard engine, CsrsRestorer & dist-txn sync
-├── oplog.ts              # PITR archiver, tailer, streaming slice reader, plan resolver
+├── oplog.ts              # PITR archiver, tailer, precursor chain walker, plan resolver
 ├── oplog-applier.ts      # Stateful streaming OplogApplier, OplogFilter, IndexCatalog & TxnBuffer
 ├── check.ts              # System preflight verification across all engines
 ├── status.ts             # Real-time topology, storage, lock, and PITR contiguity inspector
@@ -1870,10 +1904,13 @@ npm run build
 # Run type checking without code generation
 npm run typecheck
 
-# Execute Vitest unit test suite
+# Launch interactive CLI TUI Control Center
+npm run tui
+
+# Execute Vitest unit & chaos test suite
 npm test
 
-# Execute live MongoDB 8.0 End-to-End tests (Logical, Physical, Sharded + PITR)
+# Execute live MongoDB 7.0 / 8.0 / 9.0 End-to-End tests (Logical, Physical, Sharded + PITR)
 npm run test:e2e
 
 # Run tests in watch mode
@@ -1893,25 +1930,25 @@ npm run check
 
 ### Testing and Verification
 
-MongoVault maintains both a fast unit test suite (`tests/*.test.js`) and a real MongoDB 8.0 End-to-End integration suite (`tests/e2e/engines.e2e.test.js`):
+MongoVault maintains both a fast unit/chaos test suite (`tests/*.test.js`) and a real MongoDB End-to-End integration suite (`tests/e2e/engines.e2e.test.js`) tested in CI across **MongoDB 7.0, 8.0, and 9.0** and **Node.js 24.x & 26.x**:
 
-- **Unit Tests (`npm test`):**
-  - `tests/archive-stream.test.js`: Verifies zero-allocation `ArchiveOplogTap`, fragmented BSON streaming, and `streamArchiveCollections`.
-  - `tests/oplog-applier.test.js`: Verifies `OplogFilter`, multi-slice transaction buffering, >8 MiB disk-spilling `TxnBuffer`, cross-shard distributed transaction reconciliation, and `IndexCatalog` DDL tracking.
-  - `tests/correctness.test.js`: Verifies S3 multipart auto-scaling (`computeS3UploadParams`), AEAD trailing-byte rejection, `FilesystemStorageClient` path-traversal guards, PAX extended TAR headers (>255 UTF-8 bytes), live `mongod.lock` guard, cascade deletion, and recursive sharded verification.
-  - `tests/crypto.test.js`, `tests/pipeline.test.js`, `tests/pitr.test.js`, `tests/lock.test.js`, `tests/retention.test.js`, `tests/physical.test.js`, `tests/sharding.test.js`, `tests/selective-restore.test.js`, `tests/drill.test.js`, `tests/status.test.js`, `tests/check.test.js`, and more.
-- **Live MongoDB 8.0 E2E Tests (`npm run test:e2e`):**
-  - **Logical Engine + PITR:** Encrypted full-cluster backup with `ArchiveOplogTap`, `verifyBackup`, automated restore drill, multi-document ACID transaction + post-backup unique index DDL, zero-disk streaming PITR recovery undoing post-target disaster, and selective namespace-filtered PITR.
+- **Unit & Fault-Injection Tests (`npm test`):**
+  - `tests/chaos.test.js`: Fail-closed `OplogApplier` enforcement, precursor `prevOpTime` transaction bundling, stage-by-stage crash matrix (manifest write failure, oplog upload failure, mid-backup shard failure + orphan cleanup), S3 Range ETag mismatch, rollover gap alerts, and `REQUIRE_ENCRYPTION` enforcement.
+  - `tests/physical-full.test.js` & `tests/physical.test.js`: Opt-in `fsyncLock` refusal, multi-node primary refusal, `FsyncUnlockError` propagation, fresh-client unlock retries, watchdog abort/unlock, and 3-step `PhysicalRecoveryCoordinator`.
+  - `tests/archive-stream.test.js`, `tests/oplog-applier.test.js`, `tests/correctness.test.js`, `tests/tui.test.js`, `tests/crypto.test.js`, `tests/pipeline.test.js`, `tests/pitr.test.js`, `tests/lock.test.js`, `tests/retention.test.js`, `tests/sharding.test.js`, `tests/selective-restore.test.js`, `tests/drill.test.js`, `tests/status.test.js`, `tests/check.test.js`.
+- **Live MongoDB E2E Tests (`npm run test:e2e`):**
+  - **Logical Engine + PITR:** Encrypted full-cluster backup with `ArchiveOplogTap`, schema/validator/view drill verification, multi-document ACID + aborted transactions, index/DDL replay, DB-rename PITR, and interrupted restore recovery.
   - **Physical Engine + Recovery + PITR:** Encrypted physical hot backup, live `mongod.lock` guard, full `PhysicalRecoveryCoordinator` with streaming physical PITR, index build in standalone mode, `local.system.replset` cleanup, and clean `mongod` boot verification.
-  - **Sharded Cluster Engine + PITR:** Real CSRS + 2 shards + `mongos`, encrypted `.cluster.enc` backup, recursive `verifyBackup`, real cross-shard distributed ACID transaction, programmatic `CsrsRestorer`, sharded PITR with cross-shard transaction reconciliation, and intact `mongos` routing & sessions verification.
+  - **Sharded Cluster Engine + PITR:** Real CSRS + 2 shards + `mongos`, encrypted `.cluster.enc` backup, recursive `verifyBackup`, real cross-shard distributed ACID transaction, programmatic `CsrsRestorer`, MongoDB 9.0 authoritative shard catalog sync, and sharded PITR before/after commit.
+  - **Sharded Cluster Concurrent Stress:** Continuous cross-shard 2PC balance transfers, intentionally aborted cross-shard transactions, and concurrent DDL executed _while_ the base sharded backup runs, proving exact monetary conservation (`sum(balances) === constant`) and zero partial/leaked transactions upon restore.
 
 To run the test suites:
 
 ```bash
-# Fast unit tests
+# Fast unit & chaos tests
 npm test
 
-# Full live MongoDB 8.0 E2E verification (requires local mongod, mongos, mongodump, mongorestore in PATH)
+# Full live MongoDB E2E verification (requires local mongod, mongos, mongodump, mongorestore in PATH)
 npm run test:e2e
 ```
 

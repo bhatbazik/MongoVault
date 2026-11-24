@@ -103,7 +103,11 @@ async function runWithConcurrency<T, R>(
       results[idx] = await worker(items[idx]!, idx);
     }
   });
-  await Promise.all(workers);
+  const settled = await Promise.allSettled(workers);
+  const firstRejection = settled.find((r): r is PromiseRejectedResult => r.status === "rejected");
+  if (firstRejection) {
+    throw firstRejection.reason;
+  }
   return results;
 }
 
@@ -604,6 +608,123 @@ async function captureBridgingSlices({
 }
 
 /**
+ * Waits for any in-flight `prepared` distributed transactions on the given replica set
+ * whose `lastWriteOpTime.ts` or `startOpTime.ts` is `<= boundaryTs` to conclude (commit or abort),
+ * and ensures the node's majority-committed optime catches up to its latest oplog entry.
+ * Returns the node's post-settle majority-committed timestamp (or null if unavailable).
+ */
+async function settleShardPreparedTxnsAndOptime({
+  uri,
+  boundaryTs,
+  createMongoClient,
+  logger,
+  signal,
+  timeoutMs = 15_000,
+}: {
+  uri: string;
+  boundaryTs: OplogTimestamp;
+  createMongoClient: (u: string) => MongoClient;
+  logger: Logger;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}): Promise<OplogTimestamp | null> {
+  const shardClient = createMongoClient(uri);
+  try {
+    await shardClient.connect();
+    const configDb = typeof shardClient.db === "function" ? shardClient.db("config") : null;
+    const txCol =
+      configDb && typeof configDb.collection === "function"
+        ? configDb.collection("transactions")
+        : null;
+    const adminDb = typeof shardClient.db === "function" ? shardClient.db("admin") : null;
+    const localDb = typeof shardClient.db === "function" ? shardClient.db("local") : null;
+    const oplogCol =
+      localDb && typeof localDb.collection === "function" ? localDb.collection("oplog.rs") : null;
+
+    const deadline = Date.now() + timeoutMs;
+
+    // 1. Wait for prepared 2PC transactions straddling boundaryTs to finish committing/aborting
+    if (txCol && typeof txCol.find === "function") {
+      while (!signal?.aborted) {
+        const prepared = await txCol
+          .find({ state: "prepared" }, { readConcern: { level: "local" } })
+          .toArray()
+          .catch(() => []);
+        const straddling = prepared.filter((doc) => {
+          const ts =
+            fromBsonTimestamp((doc as { startOpTime?: { ts?: unknown } }).startOpTime?.ts) ??
+            fromBsonTimestamp((doc as { lastWriteOpTime?: { ts?: unknown } }).lastWriteOpTime?.ts);
+          return ts !== null && compareTimestamps(ts, boundaryTs) <= 0;
+        });
+        if (straddling.length === 0) break;
+        if (Date.now() >= deadline) {
+          throw new Error(
+            `Timed out waiting for ${straddling.length} prepared distributed transaction(s) at or before ${formatOplogTimestamp(boundaryTs)} to settle`,
+          );
+        }
+        await new Promise((r) => setTimeout(r, 100));
+      }
+    }
+
+    // 2. Wait briefly for majority-committed optime to catch up to the node's own newest oplog entry
+    let latestMajorityTs: OplogTimestamp | null = null;
+    if (adminDb && typeof adminDb.command === "function") {
+      const catchupDeadline = Math.min(deadline, Date.now() + 5_000);
+      while (!signal?.aborted) {
+        const [replStatus, newestDoc] = await Promise.all([
+          adminDb.command({ replSetGetStatus: 1 }).catch(() => null) as Promise<{
+            optimes?: {
+              lastCommittedOpTime?: { ts?: unknown };
+              appliedOpTime?: { ts?: unknown };
+            };
+          } | null>,
+          oplogCol && typeof oplogCol.find === "function"
+            ? oplogCol
+                .find({}, { projection: { ts: 1 } })
+                .sort({ $natural: -1 })
+                .limit(1)
+                .next()
+                .catch(() => null)
+            : Promise.resolve(null),
+        ]);
+
+        const committed = fromBsonTimestamp(replStatus?.optimes?.lastCommittedOpTime?.ts);
+        const applied = fromBsonTimestamp(replStatus?.optimes?.appliedOpTime?.ts);
+        const majorityTs =
+          committed && applied
+            ? compareTimestamps(committed, applied) <= 0
+              ? committed
+              : applied
+            : (committed ?? applied);
+        if (majorityTs) {
+          latestMajorityTs = majorityTs;
+        }
+        const newestTs = fromBsonTimestamp((newestDoc as { ts?: unknown } | null)?.ts);
+        if (
+          !newestTs ||
+          !majorityTs ||
+          compareTimestamps(majorityTs, newestTs) >= 0 ||
+          Date.now() >= catchupDeadline
+        ) {
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    }
+
+    return latestMajorityTs;
+  } catch (err) {
+    if (err instanceof Error && err.message.startsWith("Timed out waiting for")) {
+      throw err;
+    }
+    logger.debug({ err }, "Skipping shard prepared-txn settle check on mock/unreachable node");
+    return null;
+  } finally {
+    await shardClient.close().catch(() => {});
+  }
+}
+
+/**
  * Executes a distributed, coordinated backup across all shards and configsvr.
  */
 export async function runShardedClusterBackup({
@@ -617,6 +738,13 @@ export async function runShardedClusterBackup({
   const startedAt = new Date();
   const controller = linkedController(signal);
   const log = logger.child({ engine: "sharded-cluster" });
+  const uploadedArtifacts = new Set<string>();
+  const inFlightChildTasks: Array<Promise<unknown>> = [];
+  const trackArtifact = (key: string | undefined) => {
+    if (!key) return;
+    uploadedArtifacts.add(key);
+    uploadedArtifacts.add(manifestKey(key));
+  };
 
   if (config.requireEncryption && !config.encryptionKey) {
     throw new Error(
@@ -739,7 +867,15 @@ export async function runShardedClusterBackup({
       storage,
       logger: log.child({ component: "configsvr" }),
       signal: controller.signal,
-    });
+    })
+      .then((manifest) => {
+        trackArtifact(manifest.key);
+        return manifest;
+      })
+      .catch((err) => {
+        controller.abort(err);
+        throw err;
+      });
 
     const shardBackups: Record<string, ShardedClusterShardBackup> = {};
     const shardEndTimestamps: Record<string, string> = {};
@@ -773,6 +909,7 @@ export async function runShardedClusterBackup({
           signal: controller.signal,
         });
 
+        trackArtifact(shardManifest.key);
         shardBackups[shard.id] = {
           shardId: shard.id,
           host: shard.host,
@@ -793,10 +930,12 @@ export async function runShardedClusterBackup({
           manifestKey: "",
           status: "failed",
         };
+        controller.abort(shardError);
         throw shardError;
       }
     });
 
+    inFlightChildTasks.push(configsvrPromise, shardsPromise);
     const [configsvrManifest] = await Promise.all([configsvrPromise, shardsPromise]);
 
     // Determine common clusterTime >= configsvr and all shard oplogWindow.endTs
@@ -811,6 +950,34 @@ export async function runShardedClusterBackup({
         clusterTimeTs = endTs;
       }
     }
+
+    // Wait for any boundary-straddling prepared 2PC transactions across all shards to settle
+    // and for majority-committed optimes to catch up before picking the final common clusterTime.
+    // This guarantees that any cross-shard txn already committed inside one shard's base dump
+    // also has its commitTransaction oplog entry landed <= clusterTimeTs on every other shard.
+    if (backupRunner === runBackup) {
+      const settleUris = [
+        ...(configsvrDirectUri ? [configsvrDirectUri] : []),
+        ...topology.shards.map((s) => buildShardUri(config.mongo.uri, s.host)),
+      ];
+      const settledOptimes = await Promise.all(
+        settleUris.map((u) =>
+          settleShardPreparedTxnsAndOptime({
+            uri: u,
+            boundaryTs: clusterTimeTs,
+            createMongoClient,
+            logger: log,
+            signal: controller.signal,
+          }),
+        ),
+      );
+      for (const optTs of settledOptimes) {
+        if (optTs && compareTimestamps(optTs, clusterTimeTs) > 0) {
+          clusterTimeTs = optTs;
+        }
+      }
+    }
+
     try {
       const postPing = await client.db("admin").command({ ping: 1 });
       const parsed = fromBsonTimestamp(postPing?.$clusterTime?.clusterTime);
@@ -850,6 +1017,9 @@ export async function runShardedClusterBackup({
             untilTs: clusterTimeTs,
             keyPrefix: `${config.storage.prefix}/configsvr/_cluster/_bridging/${stamp}/`,
             createMongoClient,
+          }).then((keys) => {
+            for (const k of keys) trackArtifact(k);
+            return keys;
           })
         : Promise.resolve<string[]>([]);
 
@@ -870,6 +1040,7 @@ export async function runShardedClusterBackup({
             keyPrefix: `${config.storage.prefix}/shards/${shard.id}/_cluster/_bridging/${stamp}/`,
             createMongoClient,
           });
+          for (const k of keys) trackArtifact(k);
           if (keys.length > 0) {
             shardBackups[shard.id]!.bridgingSliceKey = keys[0];
             shardBackups[shard.id]!.bridgingSliceKeys = keys;
@@ -907,6 +1078,7 @@ export async function runShardedClusterBackup({
     };
 
     // Persist `.cluster[.enc]` payload with real encryption & real SHA-256 digest
+    trackArtifact(clusterKey);
     const rawMetaBuf = Buffer.from(JSON.stringify(clusterMeta, null, 2), "utf8");
     let clusterSha256: string;
     let clusterEncryption = configsvrManifest.encryption;
@@ -978,6 +1150,23 @@ export async function runShardedClusterBackup({
     );
 
     return { manifest: clusterManifest, clusterMeta, durationMs };
+  } catch (error) {
+    controller.abort(error);
+    // Wait for aborted/finishing sibling backup tasks to settle before removing uploaded artifacts
+    // so a sibling finishing its upload concurrently cannot leave orphaned files behind.
+    if (inFlightChildTasks.length > 0) {
+      await Promise.allSettled(inFlightChildTasks);
+    }
+    if (uploadedArtifacts.size > 0 && typeof storage.remove === "function") {
+      log.warn(
+        { artifactCount: uploadedArtifacts.size },
+        "Sharded cluster backup failed; cleaning up partial child archives and bridging slices",
+      );
+      await Promise.allSettled(
+        [...uploadedArtifacts].map((artifactKey) => storage.remove(artifactKey).catch(() => {})),
+      );
+    }
+    throw error;
   } finally {
     if (balancerStopped && topology?.balancerEnabled) {
       await balancer.start();

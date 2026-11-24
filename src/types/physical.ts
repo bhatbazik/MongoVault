@@ -25,7 +25,12 @@ export interface PhysicalBackupOptions {
   logger: Logger;
   signal?: AbortSignal;
   dbPath?: string;
+  /** Explicit opt-in to fall back to `fsyncLock` when `$backupCursor` is unavailable (defaults to `config.physical?.allowFsyncLock ?? false`). */
   fsyncLockFallback?: boolean;
+  /** Explicit opt-in to allow `fsyncLock` on a multi-node replica set PRIMARY (defaults to `config.physical?.allowPrimaryFsyncLock ?? false`). */
+  allowPrimaryFsyncLock?: boolean;
+  /** Maximum duration in milliseconds to hold `fsyncLock` before watchdog aborts backup (default: 300000). */
+  fsyncLockTimeoutMs?: number;
   createMongoClient?: (uri: string) => MongoClient;
 }
 

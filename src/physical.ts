@@ -60,6 +60,93 @@ const CURSOR_CREATE_RETRIES = 10;
 const OPEN_CONFLICT_WITH_CHECKPOINT_ERR_CODE = 50915;
 const OPLOG_ROLLED_OVER_ERR_CODE = 50917;
 const DISK_HEADROOM_MULTIPLIER = 1.1;
+const DEFAULT_FSYNC_LOCK_TIMEOUT_MS = 5 * 60_000;
+const FSYNC_UNLOCK_MAX_ATTEMPTS = 3;
+const FSYNC_UNLOCK_RETRY_DELAY_MS = 250;
+
+/**
+ * Critical error thrown when MongoVault cannot confirm that a MongoDB `fsyncLock`
+ * was released. Never swallowed so operators and alert pipelines are immediately
+ * notified that the node may still be write-locked.
+ */
+export class FsyncUnlockError extends Error {
+  readonly unlockError: unknown;
+
+  constructor(message: string, options: { unlockError: unknown; cause?: unknown }) {
+    super(message, options.cause !== undefined ? { cause: options.cause } : undefined);
+    this.name = "FsyncUnlockError";
+    this.unlockError = options.unlockError;
+  }
+}
+
+function isNotLockedError(err: unknown): boolean {
+  const e = err as { code?: number; message?: string } | null;
+  if (!e) return false;
+  if (e.code === 211) return true;
+  return /not locked/i.test(String(e.message ?? ""));
+}
+
+async function releaseFsyncLockWithRetry({
+  client,
+  uri,
+  createMongoClient,
+  logger,
+  maxAttempts = FSYNC_UNLOCK_MAX_ATTEMPTS,
+  baseDelayMs = FSYNC_UNLOCK_RETRY_DELAY_MS,
+}: {
+  client: MongoClient;
+  uri: string;
+  createMongoClient: (u: string) => MongoClient;
+  logger: PhysicalBackupOptions["logger"];
+  maxAttempts?: number;
+  baseDelayMs?: number;
+}): Promise<void> {
+  let lastError: unknown = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    let tempClient: MongoClient | null = null;
+    try {
+      const targetClient = attempt === 1 ? client : (tempClient = createMongoClient(uri));
+      if (tempClient) {
+        await tempClient.connect();
+      }
+      const unlockRes = await targetClient.db("admin").command({ fsyncUnlock: 1 });
+      if (!unlockRes || unlockRes.ok === 1 || unlockRes.lockCount === 0) {
+        if (attempt > 1) {
+          logger.warn({ attempt }, "Released MongoDB fsyncLock via fresh recovery connection");
+        } else {
+          logger.info("Released MongoDB fsyncLock");
+        }
+        return;
+      }
+      lastError = new Error(`Unexpected fsyncUnlock response: ${JSON.stringify(unlockRes)}`);
+    } catch (err) {
+      if (isNotLockedError(err)) {
+        logger.info("MongoDB reports node is already unlocked (fsyncUnlock not required)");
+        return;
+      }
+      lastError = err;
+      logger.error(
+        { err, attempt, maxAttempts },
+        "Failed attempt to release MongoDB fsyncLock; will retry on fresh connection",
+      );
+    } finally {
+      if (tempClient) {
+        await tempClient.close().catch(() => {});
+      }
+    }
+
+    if (attempt < maxAttempts) {
+      await new Promise((resolve) => setTimeout(resolve, baseDelayMs * attempt));
+    }
+  }
+
+  const detail = lastError instanceof Error ? lastError.message : String(lastError);
+  throw new FsyncUnlockError(
+    `CRITICAL: Failed to release MongoDB fsyncLock after ${maxAttempts} attempt(s) (${detail}). Node may remain write-locked! Run \`db.adminCommand({ fsyncUnlock: 1 })\` manually on the affected node immediately.`,
+    { unlockError: lastError },
+  );
+}
 
 /**
  * Safely extracts `--dbpath` from MongoDB `getCmdLineOpts` output, avoiding the
@@ -181,13 +268,14 @@ export async function createBackupCursorWithRetries(
 
 export async function probePhysicalCapability(
   client: MongoClient,
+  options: { probeFsyncLock?: boolean } = {},
 ): Promise<{ supportsBackupCursor: boolean; supportsFsyncLock: boolean; dbPath?: string }> {
   const admin = client.db("admin");
   let supportsBackupCursor = false;
   let supportsFsyncLock = false;
   let dbPath: string | undefined = undefined;
 
-  // 1. Try $backupCursor
+  // 1. Try $backupCursor (read-only, non-blocking)
   try {
     const cursor = admin.aggregate([{ $backupCursor: {} }]);
     const doc = await cursor.next();
@@ -212,15 +300,17 @@ export async function probePhysicalCapability(
     }
   }
 
-  // 3. Check fsyncLock capability
-  try {
-    const res = await admin.command({ fsync: 1, lock: true });
-    if (res && (res.ok === 1 || res.lock === true)) {
-      supportsFsyncLock = true;
-      await admin.command({ fsyncUnlock: 1 }).catch(() => {});
+  // 3. Never acquire a live write lock during read-only capability probing unless explicitly opted in.
+  if (options.probeFsyncLock && !supportsBackupCursor) {
+    try {
+      const res = await admin.command({ fsync: 1, lock: true });
+      if (res && (res.ok === 1 || res.lock === true)) {
+        supportsFsyncLock = true;
+        await admin.command({ fsyncUnlock: 1 });
+      }
+    } catch {
+      supportsFsyncLock = false;
     }
-  } catch {
-    supportsFsyncLock = false;
   }
 
   return { supportsBackupCursor, supportsFsyncLock, dbPath };
@@ -332,7 +422,9 @@ export async function runPhysicalBackup({
   logger,
   signal,
   dbPath: overrideDbPath,
-  fsyncLockFallback = true,
+  fsyncLockFallback,
+  allowPrimaryFsyncLock,
+  fsyncLockTimeoutMs,
   createMongoClient = (u) => new MongoClient(u),
 }: PhysicalBackupOptions): Promise<PhysicalBackupResult> {
   const startedAt = new Date();
@@ -342,6 +434,13 @@ export async function runPhysicalBackup({
       "Refusing to create unencrypted physical backup: REQUIRE_ENCRYPTION is enabled but ENCRYPTION_KEY is not configured",
     );
   }
+  const effectiveFsyncFallback =
+    fsyncLockFallback ?? Boolean(config.physical?.allowFsyncLock ?? false);
+  const effectiveAllowPrimaryFsyncLock =
+    allowPrimaryFsyncLock ?? Boolean(config.physical?.allowPrimaryFsyncLock ?? false);
+  const effectiveFsyncLockTimeoutMs =
+    fsyncLockTimeoutMs ?? config.physical?.fsyncLockTimeoutMs ?? DEFAULT_FSYNC_LOCK_TIMEOUT_MS;
+
   const scope = scopeOf(config);
   const key = archiveKey(scope, startedAt, { encrypted }).replace(
     /\.archive\.gz(\.enc)?$/,
@@ -361,7 +460,10 @@ export async function runPhysicalBackup({
   let locked = false;
   let cursor: ReturnType<ReturnType<MongoClient["db"]>["aggregate"]> | null = null;
   let keepAliveTimer: NodeJS.Timeout | null = null;
+  let fsyncWatchdogTimer: NodeJS.Timeout | null = null;
   let uploadCompleted = false;
+  let backupError: unknown = null;
+  let unlockFailure: FsyncUnlockError | null = null;
 
   try {
     await client.connect();
@@ -478,12 +580,12 @@ export async function runPhysicalBackup({
 
     const activeDbPath = resolvedDbPath;
 
-    // Fallback to fsyncLock if $backupCursor returned empty or is not supported
+    // Fallback to fsyncLock ONLY when explicitly opted in and $backupCursor is unavailable
     let fsyncOplogTs: string | undefined;
     if (!cursorMeta && dataFiles.length === 0) {
-      if (!fsyncLockFallback) {
+      if (!effectiveFsyncFallback) {
         throw new Error(
-          "Target MongoDB does not support $backupCursor and fsyncLock fallback is disabled",
+          "Target MongoDB does not support $backupCursor and fsyncLock fallback is disabled (set PHYSICAL_ALLOW_FSYNC_LOCK=true or fsyncLockFallback: true to explicitly opt in to write-blocking fsyncLock backups)",
         );
       }
 
@@ -494,15 +596,31 @@ export async function runPhysicalBackup({
         Array.isArray(hello?.hosts) &&
         hello.hosts.length > 1
       ) {
+        if (!effectiveAllowPrimaryFsyncLock) {
+          throw new Error(
+            `Refusing to acquire write-blocking fsyncLock on multi-node replica set PRIMARY (${hello.setName}). Target a secondary node (MONGODB_READ_PREFERENCE=secondary) or explicitly set PHYSICAL_ALLOW_PRIMARY_FSYNC_LOCK=true if you accept write downtime and failover lock risks.`,
+          );
+        }
         log.warn(
           { setName: hello.setName, hosts: hello.hosts },
-          "Running fsyncLock physical backup on a multi-node replica set PRIMARY blocks all cluster writes. Configure a secondary readPreference for zero-downtime backups.",
+          "Running opt-in fsyncLock physical backup on a multi-node replica set PRIMARY (blocks all cluster writes)",
         );
       }
 
       log.info("Acquiring fsyncLock on MongoDB cluster...");
       await admin.command({ fsync: 1, lock: true });
       locked = true;
+
+      // Start watchdog timer so fsyncLock is never held indefinitely if upload stalls
+      if (effectiveFsyncLockTimeoutMs > 0) {
+        fsyncWatchdogTimer = setTimeout(() => {
+          if (!locked || uploadCompleted) return;
+          const msg = `Physical backup fsyncLock watchdog triggered after ${effectiveFsyncLockTimeoutMs}ms; aborting backup to release write lock`;
+          log.error({ timeoutMs: effectiveFsyncLockTimeoutMs }, msg);
+          controller.abort(new Error(msg));
+        }, effectiveFsyncLockTimeoutMs);
+        fsyncWatchdogTimer.unref();
+      }
 
       // Warn if any in-progress/prepared multi-document transactions exist under fsyncLock
       try {
@@ -664,20 +782,20 @@ export async function runPhysicalBackup({
       }
     }
 
-    // Unlock MongoDB write lock if acquired and verify unlock succeeded
+    // Unlock MongoDB write lock if acquired and verify unlock succeeded BEFORE finalizing manifest.
+    // Never swallow unlock failures: if the node remains write-locked, propagate FsyncUnlockError.
     if (locked) {
-      const unlockRes = await client
-        .db("admin")
-        .command({ fsyncUnlock: 1 })
-        .catch((err) => {
-          log.error({ err }, "CRITICAL: Failed to release MongoDB fsyncLock");
-          return null;
-        });
-      if (unlockRes && unlockRes.ok !== 1 && unlockRes.lockCount !== 0) {
-        log.warn({ unlockRes }, "Unexpected response from fsyncUnlock");
+      if (fsyncWatchdogTimer) {
+        clearTimeout(fsyncWatchdogTimer);
+        fsyncWatchdogTimer = null;
       }
+      await releaseFsyncLockWithRetry({
+        client,
+        uri: config.mongo.uri,
+        createMongoClient,
+        logger: log,
+      });
       locked = false;
-      log.info("Released MongoDB fsyncLock");
     }
 
     const completedAt = new Date();
@@ -750,25 +868,47 @@ export async function runPhysicalBackup({
 
     return { manifest, filesCount: filesToArchive.length, totalBytes: digest.bytes };
   } catch (error) {
+    backupError = error;
     if (typeof storage.remove === "function") {
       await storage.remove(key).catch(() => {});
     }
-    throw error;
   } finally {
     uploadCompleted = true;
     if (keepAliveTimer) clearInterval(keepAliveTimer);
+    if (fsyncWatchdogTimer) clearTimeout(fsyncWatchdogTimer);
     if (cursor) {
       await cursor.close().catch(() => {});
     }
-    if (locked) {
-      await client
-        .db("admin")
-        .command({ fsyncUnlock: 1 })
-        .catch(() => {});
+    if (locked && !(backupError instanceof FsyncUnlockError)) {
+      try {
+        await releaseFsyncLockWithRetry({
+          client,
+          uri: config.mongo.uri,
+          createMongoClient,
+          logger: log,
+        });
+        locked = false;
+      } catch (err) {
+        unlockFailure =
+          err instanceof FsyncUnlockError
+            ? new FsyncUnlockError(err.message, {
+                unlockError: err.unlockError,
+                cause: backupError ?? err.cause,
+              })
+            : new FsyncUnlockError(
+                `CRITICAL: Failed to release MongoDB fsyncLock during cleanup (${err instanceof Error ? err.message : String(err)}). Run \`db.adminCommand({ fsyncUnlock: 1 })\` manually.`,
+                { unlockError: err, cause: backupError },
+              );
+      }
     }
     await client.close().catch(() => {});
     controller.dispose();
   }
+
+  if (unlockFailure) {
+    throw unlockFailure;
+  }
+  throw backupError;
 }
 
 async function findFreePort(): Promise<number> {

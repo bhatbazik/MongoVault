@@ -57,6 +57,12 @@ export interface PhysicalConfig {
   dbPath?: string;
   encryptionKeyFile?: string;
   directoryPerDb?: boolean;
+  /** Explicit opt-in required to allow falling back from `$backupCursor` to `fsyncLock` (default: false). */
+  allowFsyncLock?: boolean;
+  /** Explicit opt-in required to allow `fsyncLock` on a multi-node replica set PRIMARY (default: false). */
+  allowPrimaryFsyncLock?: boolean;
+  /** Maximum duration in milliseconds an `fsyncLock` may be held before watchdog aborts backup (default: 300000). */
+  fsyncLockTimeoutMs?: number;
 }
 
 export interface ShardingConfig {

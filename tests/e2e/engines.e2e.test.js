@@ -434,6 +434,7 @@ describe("Real MongoDB End-to-End Verification (All 3 Engines + PITR)", () => {
         storage,
         logger,
         dbPath: rs.dbPath,
+        fsyncLockFallback: true,
       });
       expect(physBackup.manifest.engine).toBe("physical");
       expect(physBackup.manifest.physical.mongoVersion).toMatch(/^(7|8|9)\.\d+\./);
@@ -754,6 +755,211 @@ describe("Real MongoDB End-to-End Verification (All 3 Engines + PITR)", () => {
       } finally {
         await postSession.endSession();
       }
+    } finally {
+      await mongosClient.close().catch(() => {});
+      await cluster.stop();
+    }
+  });
+
+  it("Sharded Cluster Concurrent Stress: continuous cross-shard 2PC transfers, aborted txns, and DDL DURING base backup -> restore preserves exact balance conservation", async () => {
+    const suiteDir = path.join(rootDir, "sharded-concurrent");
+    const storageDir = path.join(suiteDir, "storage");
+    const workDir = path.join(suiteDir, "work");
+    await fs.mkdir(storageDir, { recursive: true });
+    await fs.mkdir(workDir, { recursive: true });
+
+    const cluster = await startShardedCluster(suiteDir);
+    const mongosClient = new MongoClient(cluster.mongosUri);
+
+    try {
+      await mongosClient.connect();
+      const encKey = parseKey(generateKey());
+      const storage = new FilesystemStorageClient(storageDir);
+      const config = makeBaseConfig({
+        uri: cluster.mongosUri,
+        storageDir,
+        workDir,
+        encKey,
+        prefix: "sharded-stress",
+        sharding: { enabled: true },
+      });
+
+      // 1. Shard bank.accounts across shard01 and shard02 with 40 accounts x 1000 = 40,000 total
+      await mongosClient.db("admin").command({ enableSharding: "bank" });
+      await mongosClient.db("admin").command({
+        shardCollection: "bank.accounts",
+        key: { _id: "hashed" },
+      });
+
+      const INITIAL_BALANCE = 1000;
+      const ACCOUNT_COUNT = 40;
+      const EXPECTED_TOTAL = INITIAL_BALANCE * ACCOUNT_COUNT;
+      await mongosClient
+        .db("bank")
+        .collection("accounts")
+        .insertMany(
+          Array.from({ length: ACCOUNT_COUNT }, (_, i) => ({
+            _id: `acct-${String(i).padStart(2, "0")}`,
+            balance: INITIAL_BALANCE,
+            txCount: 0,
+          })),
+        );
+
+      // Discover which account IDs live on shard01 vs shard02 so every transfer is a TRUE cross-shard 2PC txn
+      const s1Client = new MongoClient(cluster.shard01.uri);
+      const s2Client = new MongoClient(cluster.shard02.uri);
+      let s1Ids = [];
+      let s2Ids = [];
+      try {
+        await Promise.all([s1Client.connect(), s2Client.connect()]);
+        s1Ids = (
+          await s1Client
+            .db("bank")
+            .collection("accounts")
+            .find({}, { projection: { _id: 1 } })
+            .toArray()
+        ).map((d) => d._id);
+        s2Ids = (
+          await s2Client
+            .db("bank")
+            .collection("accounts")
+            .find({}, { projection: { _id: 1 } })
+            .toArray()
+        ).map((d) => d._id);
+      } finally {
+        await Promise.all([s1Client.close().catch(() => {}), s2Client.close().catch(() => {})]);
+      }
+      expect(s1Ids.length).toBeGreaterThan(0);
+      expect(s2Ids.length).toBeGreaterThan(0);
+
+      // 2. Launch continuous concurrent cross-shard 2PC transfers + aborted txns + DDL WHILE backup executes!
+      let keepRunning = true;
+      let committedTransfers = 0;
+      let abortedTransfers = 0;
+      let ddlExecuted = false;
+
+      const workerLoop = (async () => {
+        const accountsColl = mongosClient.db("bank").collection("accounts");
+        let iter = 0;
+        while (keepRunning) {
+          iter++;
+          const fromId = s1Ids[iter % s1Ids.length];
+          const toId = s2Ids[iter % s2Ids.length];
+          const delta = iter % 2 === 0 ? 5 : -5;
+
+          // Every 4th iteration, run an intentionally ABORTED cross-shard transaction
+          if (iter % 4 === 0) {
+            const abortSession = mongosClient.startSession();
+            try {
+              abortSession.startTransaction();
+              await accountsColl.updateOne(
+                { _id: fromId },
+                { $inc: { balance: -9999 } },
+                { session: abortSession },
+              );
+              await accountsColl.updateOne(
+                { _id: toId },
+                { $inc: { balance: 9999 } },
+                { session: abortSession },
+              );
+              await abortSession.abortTransaction();
+              abortedTransfers++;
+            } catch {
+              await abortSession.abortTransaction().catch(() => {});
+            } finally {
+              await abortSession.endSession().catch(() => {});
+            }
+            continue;
+          }
+
+          // Execute a real committed cross-shard 2PC transfer preserving total balance === 40,000
+          const txSession = mongosClient.startSession();
+          try {
+            await txSession.withTransaction(async () => {
+              await accountsColl.updateOne(
+                { _id: fromId },
+                { $inc: { balance: -delta, txCount: 1 } },
+                { session: txSession },
+              );
+              await accountsColl.updateOne(
+                { _id: toId },
+                { $inc: { balance: delta, txCount: 1 } },
+                { session: txSession },
+              );
+            });
+            committedTransfers++;
+          } catch {
+            // Transient retryable txn error under heavy concurrency is fine
+          } finally {
+            await txSession.endSession().catch(() => {});
+          }
+
+          // Perform concurrent DDL mid-backup
+          if (!ddlExecuted && committedTransfers >= 3) {
+            ddlExecuted = true;
+            await accountsColl.createIndex({ txCount: 1 }, { name: "txCount_idx" }).catch(() => {});
+          }
+        }
+      })();
+
+      // Let concurrent workload warm up before starting the base sharded backup
+      while (committedTransfers < 4) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+
+      let clusterBackup;
+      try {
+        clusterBackup = await runShardedClusterBackup({ config, storage, logger });
+      } finally {
+        keepRunning = false;
+        await workerLoop;
+      }
+
+      expect(committedTransfers).toBeGreaterThanOrEqual(4);
+      expect(abortedTransfers).toBeGreaterThanOrEqual(1);
+
+      // Verify recursive cryptographic integrity of the concurrent backup
+      const verified = await verifyBackup({ config, storage, logger }, clusterBackup.manifest.key);
+      expect(verified.sha256).toBe(clusterBackup.manifest.sha256);
+
+      // 3. Wipe the entire bank database and restore directly to the backup's coordinated clusterTime
+      await mongosClient.db("bank").dropDatabase();
+      expect(await mongosClient.db("bank").collection("accounts").countDocuments()).toBe(0);
+
+      const restoreRes = await restoreShardedCluster({
+        config,
+        storage,
+        logger,
+        ref: clusterBackup.manifest.key,
+        drop: true,
+      });
+      expect(restoreRes.configsvrRestored).toBe(true);
+      expect(restoreRes.restoredShards.sort()).toEqual(["shard01", "shard02"]);
+      expect(restoreRes.oplogStats?.partialTxns ?? 0).toBe(0);
+      expect(restoreRes.oplogStats?.unknownCommands ?? []).toEqual([]);
+
+      // 4. CRITICAL INVARIANT CHECK: exact monetary conservation across BOTH shards!
+      // Any half-applied cross-shard transfer, lost precursor prepare, or leaked aborted txn
+      // would violate sum(balance) === 40,000 or produce negative/absurd balances!
+      const restoredAccounts = await mongosClient
+        .db("bank")
+        .collection("accounts")
+        .find({})
+        .toArray();
+      expect(restoredAccounts).toHaveLength(ACCOUNT_COUNT);
+
+      const restoredSum = restoredAccounts.reduce((acc, doc) => acc + doc.balance, 0);
+      expect(restoredSum).toBe(EXPECTED_TOTAL);
+
+      // Also verify no aborted -9999/+9999 mutation leaked into any document
+      for (const acct of restoredAccounts) {
+        expect(acct.balance).toBeGreaterThan(0);
+        expect(acct.balance).toBeLessThan(5000);
+      }
+      // Verify concurrent transfers were genuinely captured in the restored snapshot
+      const totalTxTouches = restoredAccounts.reduce((acc, doc) => acc + (doc.txCount || 0), 0);
+      expect(totalTxTouches).toBeGreaterThan(0);
+      expect(totalTxTouches % 2).toBe(0); // Every 2PC transfer increments txCount on BOTH accounts!
     } finally {
       await mongosClient.close().catch(() => {});
       await cluster.stop();

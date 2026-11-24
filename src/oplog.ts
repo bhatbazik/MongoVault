@@ -518,29 +518,67 @@ interface PitrStateRecord {
   gapDetected?: boolean;
 }
 
+const MAX_PRECURSOR_CHAIN_DEPTH = 512;
+
+function extractValidPrevOpTimeTs(prevOpTime: unknown): OplogTimestamp | null {
+  if (!prevOpTime || typeof prevOpTime !== "object") return null;
+  const p = prevOpTime as { ts?: unknown; t?: unknown };
+  // MongoDB marks the start of a transaction chain with prevOpTime.t === -1 or ts === Timestamp(-1, 0) / Timestamp(0, 0)
+  const termNum =
+    typeof p.t === "number"
+      ? p.t
+      : typeof p.t === "object" && p.t !== null && "toNumber" in p.t
+        ? (p.t as { toNumber: () => number }).toNumber()
+        : null;
+  if (termNum !== null && termNum < 0) return null;
+  const ts = fromBsonTimestamp(p.ts);
+  if (!ts) return null;
+  if (ts.t === 0 && ts.i === 0) return null;
+  if (ts.t === 0xffffffff) return null;
+  return ts;
+}
+
 function inspectRawOrObjectOplogDoc(doc: unknown): {
   ts: OplogTimestamp | null;
   rawBuf: Buffer;
   isPartialTxn: boolean;
+  prevOpTimeTs: OplogTimestamp | null;
+  isTxnOp: boolean;
 } {
   if (Buffer.isBuffer(doc) || doc instanceof Uint8Array) {
     const rawBuf = Buffer.isBuffer(doc) ? doc : Buffer.from(doc);
-    // Cheap partial decode ONLY for `ts` and `o.partialTxn` without re-serializing `rawBuf`
     const parsed = BSON.deserialize(rawBuf, { promoteValues: false }) as {
       ts?: unknown;
+      op?: unknown;
+      lsid?: unknown;
+      txnNumber?: unknown;
+      prevOpTime?: unknown;
       o?: { partialTxn?: unknown };
     };
+    const isTxnOp = parsed.op === "c" && parsed.lsid != null && parsed.txnNumber != null;
     return {
       ts: fromBsonTimestamp(parsed.ts),
       rawBuf,
       isPartialTxn: Boolean(parsed.o?.partialTxn),
+      prevOpTimeTs: isTxnOp ? extractValidPrevOpTimeTs(parsed.prevOpTime) : null,
+      isTxnOp,
     };
   }
-  const obj = doc as { ts?: unknown; o?: { partialTxn?: unknown } };
+  const obj = doc as {
+    ts?: unknown;
+    op?: unknown;
+    lsid?: unknown;
+    txnNumber?: unknown;
+    prevOpTime?: unknown;
+    o?: { partialTxn?: unknown };
+  };
+  const isTxnOp = obj.op === "c" && obj.lsid != null && obj.txnNumber != null;
   return {
     ts: fromBsonTimestamp(obj.ts),
     rawBuf: Buffer.from(BSON.serialize(obj as Record<string, unknown>)),
     isPartialTxn: Boolean(obj.o?.partialTxn),
+    prevOpTimeTs: isTxnOp ? extractValidPrevOpTimeTs(obj.prevOpTime) : null,
+    isTxnOp,
   };
 }
 
@@ -722,6 +760,9 @@ export async function captureOplogSlice({
     const cursor = oplog.find(query, { raw: true, promoteValues: false }).sort({ $natural: 1 });
 
     const rawDocs: Buffer[] = [];
+    const precursorDocs: Array<{ ts: OplogTimestamp; rawBuf: Buffer }> = [];
+    const seenTsKeys = new Set<string>();
+    const pendingPrecursorRoots: OplogTimestamp[] = [];
     let accumulatedBytes = 0;
     let firstTs: OplogTimestamp | null = null;
     let lastTs: OplogTimestamp | null = null;
@@ -730,7 +771,13 @@ export async function captureOplogSlice({
     try {
       for await (const doc of cursor) {
         if (signal?.aborted) break;
-        const { ts: docTs, rawBuf, isPartialTxn } = inspectRawOrObjectOplogDoc(doc);
+        const {
+          ts: docTs,
+          rawBuf,
+          isPartialTxn,
+          prevOpTimeTs,
+          isTxnOp,
+        } = inspectRawOrObjectOplogDoc(doc);
         if (!docTs) continue;
 
         // Defensive client-side enforcement in case a mock or driver ignores $lt
@@ -760,6 +807,18 @@ export async function captureOplogSlice({
               );
             }
           }
+        }
+        seenTsKeys.add(`${docTs.t}:${docTs.i}`);
+        // If a transaction entry (e.g. commitTransaction or continuation chunk) references a precursor
+        // prepare/partialTxn entry at or before cursorStartTs (for instance from during base mongodump),
+        // record it so we bundle the exact precursor chain ahead of this slice.
+        if (
+          isTxnOp &&
+          prevOpTimeTs &&
+          cursorStartTs &&
+          compareTimestamps(prevOpTimeTs, cursorStartTs) <= 0
+        ) {
+          pendingPrecursorRoots.push(prevOpTimeTs);
         }
         lastTs = docTs;
         rawDocs.push(rawBuf);
@@ -820,6 +879,32 @@ export async function captureOplogSlice({
       return null;
     }
 
+    // Walk prevOpTime chains for any transaction whose prepare/partialTxn landed at or before cursorStartTs
+    if (pendingPrecursorRoots.length > 0 && typeof oplog.findOne === "function") {
+      for (const rootTs of pendingPrecursorRoots) {
+        let curTs: OplogTimestamp | null = rootTs;
+        let depth = 0;
+        while (curTs && depth < MAX_PRECURSOR_CHAIN_DEPTH) {
+          const tsKey = `${curTs.t}:${curTs.i}`;
+          if (seenTsKeys.has(tsKey)) break;
+          seenTsKeys.add(tsKey);
+          const prevRaw = await oplog
+            .findOne({ ts: toBsonTimestamp(curTs) }, { raw: true, promoteValues: false })
+            .catch(() => null);
+          if (!prevRaw) break;
+          const prevInfo = inspectRawOrObjectOplogDoc(prevRaw);
+          if (!prevInfo.ts || !prevInfo.isTxnOp) break;
+          precursorDocs.push({ ts: prevInfo.ts, rawBuf: prevInfo.rawBuf });
+          curTs = prevInfo.prevOpTimeTs;
+          depth++;
+        }
+      }
+      precursorDocs.sort((a, b) => compareTimestamps(a.ts, b.ts));
+    }
+
+    const finalRawDocs =
+      precursorDocs.length > 0 ? [...precursorDocs.map((p) => p.rawBuf), ...rawDocs] : rawDocs;
+
     // Observed coverage reaches `effectiveUpperTs` when we drained the full window (not capped/truncated)
     const sliceCoverageEndTs =
       !hitMaxBytes && !cappedByActiveTx && compareTimestamps(effectiveUpperTs, lastTs) >= 0
@@ -830,7 +915,7 @@ export async function captureOplogSlice({
       config,
       storage,
       logger,
-      rawDocs,
+      rawDocs: finalRawDocs,
       startTs: firstTs,
       endTs: lastTs,
       coverageStartTs: cursorStartTs ?? firstTs,

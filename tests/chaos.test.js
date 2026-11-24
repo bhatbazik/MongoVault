@@ -827,4 +827,360 @@ describe("Chaos, Fault-Injection & Fail-Closed Recovery Correctness", () => {
       await fs.rm(workDir, { recursive: true, force: true });
     }
   });
+
+  it("bundles precursor prepare entries via prevOpTime when a transaction straddles base dump endTs and applies atomically", async () => {
+    const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "mv-chaos-precursor-"));
+    const storage = new FilesystemStorageClient(path.join(workDir, "store"));
+    try {
+      const config = {
+        workDir,
+        mongo: { uri: "mongodb://127.0.0.1:27017", database: "*", oplog: true },
+        storage: { prefix: "prod" },
+        pitr: { enabled: true, flushIntervalSeconds: 60, maxSliceMb: 16 },
+        encryptionKey: null,
+        encryptionKeyRing: [],
+      };
+
+      const lsid = { id: new Binary(Buffer.from("0123456789abcdef0123456789abcdef", "hex"), 4) };
+      const prepareTs = toBsonTimestamp({ t: 1000, i: 8 }); // <= baseEndTs (1000:9)!
+      const commitTs = toBsonTimestamp({ t: 1000, i: 11 }); // > baseEndTs (1000:9)!
+
+      const prepareDoc = Buffer.from(
+        BSON.serialize({
+          ts: prepareTs,
+          t: Long.fromNumber(1),
+          op: "c",
+          ns: "admin.$cmd",
+          lsid,
+          txnNumber: Long.fromNumber(7),
+          prevOpTime: { ts: new Timestamp({ t: 0, i: 0 }), t: Long.fromNumber(-1) },
+          o: {
+            applyOps: [{ op: "i", ns: "app.ledger", o: { _id: "straddle-1", delta: -500 } }],
+            prepare: true,
+          },
+        }),
+      );
+      const commitDoc = Buffer.from(
+        BSON.serialize({
+          ts: commitTs,
+          t: Long.fromNumber(1),
+          op: "c",
+          ns: "admin.$cmd",
+          lsid,
+          txnNumber: Long.fromNumber(7),
+          prevOpTime: { ts: prepareTs, t: Long.fromNumber(1) },
+          o: { commitTransaction: 1, commitTimestamp: toBsonTimestamp({ t: 1000, i: 10 }) },
+        }),
+      );
+
+      const fakeMongoClient = () => ({
+        connect: async () => {},
+        close: async () => {},
+        db: (name) => ({
+          command: async (cmd) => {
+            if (cmd.replSetGetStatus) {
+              return { optimes: { lastCommittedOpTime: { ts: commitTs } } };
+            }
+            return { ok: 1 };
+          },
+          collection: () => {
+            if (name === "config") {
+              return {
+                find: () => ({
+                  sort: () => ({ limit: () => ({ next: async () => null }) }),
+                }),
+              };
+            }
+            return {
+              findOne: async (q) => {
+                const qTs = q?.ts;
+                if (qTs && qTs.getHighBits?.() === 1000 && qTs.getLowBits?.() === 8) {
+                  return prepareDoc;
+                }
+                return null;
+              },
+              find: (query) => {
+                if (query && query.ts) {
+                  return {
+                    sort: () => ({
+                      async *[Symbol.asyncIterator]() {
+                        // Only entries > 1000:9 are returned by the range scan
+                        yield commitDoc;
+                      },
+                    }),
+                  };
+                }
+                return {
+                  sort: () => ({
+                    limit: () => ({
+                      next: async () => ({ ts: toBsonTimestamp({ t: 1000, i: 1 }) }),
+                    }),
+                  }),
+                };
+              },
+            };
+          },
+        }),
+      });
+
+      // Capture bridging slice starting strictly after baseEndTs = 1000:9
+      const sliceManifest = await captureOplogSlice({
+        config,
+        storage,
+        logger,
+        sinceTs: { t: 1000, i: 9 },
+        untilTs: { t: 1000, i: 11 },
+        updateState: false,
+        createMongoClient: fakeMongoClient,
+      });
+      expect(sliceManifest).not.toBeNull();
+      expect(sliceManifest.oplogWindow.entries).toBe(2); // precursor prepare + commitTransaction
+
+      // Replay through OplogApplier with startExclusiveTs = 1000:9 -> MUST apply straddle-1!
+      const target = createFakeTarget();
+      const applier = new OplogApplier({
+        target,
+        workDir,
+        logger,
+        startExclusiveTs: { t: 1000, i: 9 },
+        endTs: { t: 1000, i: 11 },
+      });
+      const { streamOplogSlice } = await import("../src/oplog.js");
+      await streamOplogSlice({ config, storage }, sliceManifest.key, (stream) =>
+        applier.applyStream(stream),
+      );
+      applier.assertComplete();
+
+      expect(target.opsApplied).toHaveLength(1);
+      expect(target.opsApplied[0].o._id).toBe("straddle-1");
+      await applier.dispose();
+    } finally {
+      await fs.rm(workDir, { recursive: true, force: true });
+    }
+  });
+
+  it("cleans up partial shard archives and aborts sibling dumps when a shard fails mid-backup", async () => {
+    const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "mv-chaos-sharded-abort-"));
+    const storage = new FilesystemStorageClient(path.join(workDir, "store"));
+    try {
+      const config = {
+        workDir,
+        mongo: { uri: "mongodb://mongos:27017", database: "*", oplog: true },
+        storage: { prefix: "sharded-fail", queueSize: 2 },
+        pitr: { enabled: false, flushIntervalSeconds: 60, maxSliceMb: 16 },
+        encryptionKey: null,
+        encryptionKeyRing: [],
+      };
+
+      let balancerStarted = false;
+      const fakeMongosClient = () => ({
+        connect: async () => {},
+        close: async () => {},
+        db: (_name) => ({
+          command: async (cmd) => {
+            if (cmd.hello) return { msg: "isdbgrid", me: "mongos:27017" };
+            if (cmd.balancerStatus) return { mode: "off", inBalancerRound: false };
+            if (cmd.balancerStop) return { ok: 1 };
+            if (cmd.balancerStart) {
+              balancerStarted = true;
+              return { ok: 1 };
+            }
+            if (cmd.getShardMap) return { map: { config: "cfgRS/cfg1:27019" } };
+            if (cmd.ping) return { ok: 1, $clusterTime: { clusterTime: { t: 1000, i: 1 } } };
+            return { ok: 1 };
+          },
+          collection: () => ({
+            find: () => ({
+              toArray: async () => [
+                { _id: "shard01", host: "rs1/s1:27018" },
+                { _id: "shard02", host: "rs2/s2:27018" },
+              ],
+            }),
+          }),
+        }),
+      });
+
+      const observedSignals = [];
+      const backupRunner = async ({ config: childCfg, storage: s, signal }) => {
+        observedSignals.push(signal);
+        if (childCfg.storage.prefix.endsWith("/shard02")) {
+          await new Promise((r) => setTimeout(r, 30));
+          throw new Error("shard02 replica set unreachable");
+        }
+        const childKey = `${childCfg.storage.prefix}/_cluster/2026-11-24/child.archive.gz`;
+        await s.upload(childKey, Readable.from([Buffer.from("payload")]));
+        const manifest = {
+          version: 1,
+          key: childKey,
+          database: "*",
+          createdAt: new Date().toISOString(),
+          completedAt: new Date().toISOString(),
+          durationMs: 10,
+          size: 7,
+          sha256: "abc",
+          compression: "gzip",
+          encryption: null,
+          oplog: true,
+          oplogWindow: { startTs: "1000:1", endTs: "1000:2" },
+          excludedCollections: [],
+          collections: {},
+        };
+        await writeManifest(s, manifest);
+        return manifest;
+      };
+
+      await expect(
+        runShardedClusterBackup({
+          config,
+          storage,
+          logger,
+          createMongoClient: fakeMongosClient,
+          backupRunner,
+        }),
+      ).rejects.toThrow(/shard02 replica set unreachable/);
+
+      // All sibling signals should have been aborted
+      expect(observedSignals.some((sig) => sig?.aborted)).toBe(true);
+
+      // All uploaded child archives & manifests MUST have been cleaned up (0 leftovers in storage!)
+      const remaining = [];
+      for await (const obj of storage.list("sharded-fail")) {
+        remaining.push(obj.key);
+      }
+      expect(remaining).toEqual([]);
+      expect(balancerStarted).toBe(false); // balancer was already off
+    } finally {
+      await fs.rm(workDir, { recursive: true, force: true });
+    }
+  });
+
+  it("stage-by-stage crash matrix leaves zero partial manifests or corrupted PITR state", async () => {
+    const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "mv-chaos-stages-"));
+    const storage = new FilesystemStorageClient(path.join(workDir, "store"));
+    try {
+      const config = {
+        workDir,
+        mongo: { uri: "mongodb://127.0.0.1:27017", database: "*", oplog: true },
+        storage: { prefix: "stages" },
+        pitr: { enabled: true, flushIntervalSeconds: 60, maxSliceMb: 16 },
+        encryptionKey: null,
+        encryptionKeyRing: [],
+      };
+
+      // Stage 1: Manifest write fails after archive upload -> archive MUST be removed
+      const failManifestStorage = {
+        bucket: storage.bucket,
+        list: (p) => storage.list(p),
+        head: (k) => storage.head(k),
+        upload: (k, s, o) => storage.upload(k, s, o),
+        remove: (k) => storage.remove(k),
+        putJson: async () => {
+          throw new Error("simulated crash during manifest write");
+        },
+        getJson: (k) => storage.getJson(k),
+      };
+
+      await expect(
+        runBackup({
+          config,
+          storage: failManifestStorage,
+          logger,
+          tools: {
+            getOplogBounds: async () => ({
+              oldestTs: { t: 100, i: 1 },
+              newestTs: { t: 100, i: 5 },
+            }),
+            mongodump: async () => ({
+              stdout: Readable.from([gzipSync(Buffer.from("archive-bytes"))]),
+              done: Promise.resolve({
+                collections: { "app.users": 1 },
+                oplogStartTs: { t: 100, i: 5 },
+                oplogEndTs: { t: 100, i: 6 },
+                oplogEntries: 1,
+              }),
+            }),
+          },
+        }),
+      ).rejects.toThrow(/manifest write/);
+
+      const afterBackupFail = [];
+      for await (const obj of storage.list("stages")) {
+        afterBackupFail.push(obj.key);
+      }
+      expect(afterBackupFail).toEqual([]);
+
+      // Stage 2: Oplog slice upload fails -> PITR state.json MUST NOT advance!
+      await storage.putJson(pitrStateKey({ prefix: "stages", database: "*" }), {
+        lastTs: "100:6",
+        updatedAt: new Date().toISOString(),
+      });
+      const failUploadStorage = {
+        bucket: storage.bucket,
+        list: (p) => storage.list(p),
+        head: (k) => storage.head(k),
+        getJson: (k) => storage.getJson(k),
+        putJson: (k, v, o) => storage.putJson(k, v, o),
+        remove: (k) => storage.remove(k),
+        upload: async () => {
+          throw new Error("simulated crash during oplog upload");
+        },
+      };
+
+      const opDoc = Buffer.from(
+        BSON.serialize({
+          ts: toBsonTimestamp({ t: 105, i: 1 }),
+          op: "i",
+          ns: "app.users",
+          o: { _id: "u1" },
+        }),
+      );
+      await expect(
+        captureOplogSlice({
+          config,
+          storage: failUploadStorage,
+          logger,
+          createMongoClient: () => ({
+            connect: async () => {},
+            close: async () => {},
+            db: (name) => ({
+              command: async (cmd) =>
+                cmd.replSetGetStatus
+                  ? { optimes: { lastCommittedOpTime: { ts: toBsonTimestamp({ t: 105, i: 1 }) } } }
+                  : { ok: 1 },
+              collection: () =>
+                name === "config"
+                  ? {
+                      find: () => ({ sort: () => ({ limit: () => ({ next: async () => null }) }) }),
+                    }
+                  : {
+                      find: (q) =>
+                        q && q.ts
+                          ? {
+                              sort: () => ({
+                                async *[Symbol.asyncIterator]() {
+                                  yield opDoc;
+                                },
+                              }),
+                            }
+                          : {
+                              sort: () => ({
+                                limit: () => ({
+                                  next: async () => ({ ts: toBsonTimestamp({ t: 100, i: 1 }) }),
+                                }),
+                              }),
+                            },
+                    },
+            }),
+          }),
+        }),
+      ).rejects.toThrow(/oplog upload/);
+
+      const pitrStateAfter = await storage.getJson(
+        pitrStateKey({ prefix: "stages", database: "*" }),
+      );
+      expect(pitrStateAfter.data.lastTs).toBe("100:6");
+    } finally {
+      await fs.rm(workDir, { recursive: true, force: true });
+    }
+  });
 });

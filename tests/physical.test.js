@@ -60,7 +60,8 @@ describe("physical backup engine", () => {
     await fs.rm(tempDestDir, { recursive: true, force: true });
   });
 
-  it("probes physical capabilities using mock MongoClient", async () => {
+  it("probes physical capabilities using mock MongoClient without invoking fsyncLock by default", async () => {
+    const fsyncCalls = [];
     const mockClient = {
       db(name) {
         if (name === "admin") {
@@ -78,6 +79,7 @@ describe("physical backup engine", () => {
                 return { parsed: { storage: { dbPath: "/var/lib/mongodb" } } };
               }
               if (cmd.fsync) {
+                fsyncCalls.push(cmd);
                 return { ok: 1, lock: true };
               }
               return { ok: 1 };
@@ -90,7 +92,9 @@ describe("physical backup engine", () => {
 
     const caps = await probePhysicalCapability(mockClient);
     expect(caps.supportsBackupCursor).toBe(true);
+    expect(caps.supportsFsyncLock).toBe(false);
     expect(caps.dbPath).toBe("/var/lib/mongodb");
+    expect(fsyncCalls).toHaveLength(0);
   });
 
   it("retries $backupCursor creation when WiredTiger checkpoint conflict occurs (code 50915)", async () => {

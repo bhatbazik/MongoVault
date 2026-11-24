@@ -730,6 +730,7 @@ interface BufferedTxn {
 export class TxnBuffer {
   private readonly txns = new Map<string, BufferedTxn>();
   private readonly committedDistTxns = new Map<string, OplogTimestamp | null>();
+  private readonly committedTxnIds = new Set<string>();
   private lastCommittedId: string | null = null;
   private readonly workDir: string;
   private readonly spillThresholdBytes: number;
@@ -815,7 +816,17 @@ export class TxnBuffer {
 
   recordDistCommit(txnId: string, commitTs: OplogTimestamp | null): void {
     this.committedDistTxns.set(txnId, commitTs);
+    this.committedTxnIds.add(txnId);
     this.lastCommittedId = txnId;
+  }
+
+  markCommitted(txnId: string): void {
+    this.committedTxnIds.add(txnId);
+    this.lastCommittedId = txnId;
+  }
+
+  hasCommitted(txnId: string): boolean {
+    return this.committedTxnIds.has(txnId);
   }
 
   lastCommitId(): string | null {
@@ -894,6 +905,7 @@ export class OplogApplier {
   private indexesBuilt = 0;
   private partialTxns = 0;
   private readonly unknownCommands: string[] = [];
+  private readonly seenPrecursorKeys = new Set<string>();
   private lastAppliedTs: OplogTimestamp | null = null;
   private reachedEnd = false;
 
@@ -971,6 +983,28 @@ export class OplogApplier {
 
   async handleOp(doc: OplogDoc): Promise<void> {
     const ts = extractBsonTimestamp(doc.ts);
+    const isPrecursorTxnEntry =
+      ts !== null &&
+      this.startExclusiveTs !== undefined &&
+      cmpTs(ts, this.startExclusiveTs) <= 0 &&
+      this.isTxnEntry(doc) &&
+      Array.isArray(doc.o?.applyOps) &&
+      (Boolean(doc.o?.prepare) || Boolean(doc.o?.partialTxn)) &&
+      !doc.o?.commitTransaction;
+
+    if (isPrecursorTxnEntry) {
+      const precursorKey = `${this.getTxnId(doc)}:${ts.t}:${ts.i}`;
+      if (this.seenPrecursorKeys.has(precursorKey)) {
+        this.recordSkip("beforeWindow");
+        return;
+      }
+      this.seenPrecursorKeys.add(precursorKey);
+      // Buffer precursor prepare/partialTxn entries bundled from before startExclusiveTs
+      // without advancing lastAppliedTs so subsequent ops > startExclusiveTs still replay cleanly.
+      await this.handleTxnOp(doc);
+      return;
+    }
+
     if (ts) {
       if (this.startTs && cmpTs(ts, this.startTs) < 0) {
         this.recordSkip("beforeWindow");
@@ -1153,7 +1187,7 @@ export class OplogApplier {
     }
 
     // Deduplicate commit entry across overlapping slice boundaries
-    if (this.txnBuffer.lastCommitId() === txnId && !this.txnBuffer.has(txnId)) {
+    if (this.txnBuffer.hasCommitted(txnId) && !this.txnBuffer.has(txnId)) {
       return;
     }
 
@@ -1175,6 +1209,7 @@ export class OplogApplier {
       );
     }
 
+    this.txnBuffer.markCommitted(txnId);
     await this.txnBuffer.consumeOps(txnId, async (innerOp) => {
       if (!this.filter.isIncluded(innerOp)) {
         this.recordSkip("filtered");

@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createFilesystemStorage } from "../src/storage.js";
 import {
+  FsyncUnlockError,
   PhysicalRecoveryCoordinator,
   restorePhysicalBackup,
   runPhysicalBackup,
@@ -73,6 +74,43 @@ describe("Physical Backup & Recovery (physical.ts full coverage)", () => {
     };
 
     try {
+      // 1. Without explicit opt-in, fsyncLock fallback MUST be refused
+      await expect(
+        runPhysicalBackup({
+          config: {
+            engine: "physical",
+            workDir,
+            timeoutMs: 30_000,
+            storage: { prefix: "mv" },
+            mongo: { uri: "mongodb://localhost:27017", database: "*" },
+            physical: { dbPath },
+          },
+          storage,
+          logger,
+          createMongoClient: () => fakeClient,
+        }),
+      ).rejects.toThrow(/fsyncLock fallback is disabled/i);
+
+      // 2. Even with allowFsyncLock=true, multi-node RS PRIMARY MUST be refused unless allowPrimaryFsyncLock=true
+      await expect(
+        runPhysicalBackup({
+          config: {
+            engine: "physical",
+            workDir,
+            timeoutMs: 30_000,
+            storage: { prefix: "mv" },
+            mongo: { uri: "mongodb://localhost:27017", database: "*" },
+            physical: { dbPath, allowFsyncLock: true },
+          },
+          storage,
+          logger,
+          createMongoClient: () => fakeClient,
+        }),
+      ).rejects.toThrow(
+        /Refusing to acquire write-blocking fsyncLock on multi-node replica set PRIMARY/i,
+      );
+
+      // 3. With explicit allowFsyncLock + allowPrimaryFsyncLock, backup proceeds, warns, and unlocks
       const res = await runPhysicalBackup({
         config: {
           engine: "physical",
@@ -80,7 +118,7 @@ describe("Physical Backup & Recovery (physical.ts full coverage)", () => {
           timeoutMs: 30_000,
           storage: { prefix: "mv" },
           mongo: { uri: "mongodb://localhost:27017", database: "*" },
-          physical: { dbPath, fsyncLockFallback: true },
+          physical: { dbPath, allowFsyncLock: true, allowPrimaryFsyncLock: true },
         },
         storage,
         logger,
@@ -166,7 +204,7 @@ describe("Physical Backup & Recovery (physical.ts full coverage)", () => {
           timeoutMs: 30_000,
           storage: { prefix: "mv" },
           mongo: { uri: "mongodb://localhost:27017", database: "*" },
-          physical: { dbPath: srcDb, fsyncLockFallback: true },
+          physical: { dbPath: srcDb, allowFsyncLock: true },
         },
         storage,
         logger,
@@ -283,6 +321,205 @@ describe("Physical Backup & Recovery (physical.ts full coverage)", () => {
       expect(droppedColls).toContain("config.cache.chunks.app.users");
       expect(droppedColls).toContain("config.transactions");
       expect(droppedColls).toContain("config.system.sessions");
+    } finally {
+      await fs.rm(workDir, { recursive: true, force: true });
+    }
+  });
+
+  it("retries fsyncUnlock on a fresh MongoClient when original connection drops, and throws FsyncUnlockError when unlock fails permanently", async () => {
+    const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "mv-phys-unlock-"));
+    const dbPath = path.join(workDir, "db");
+    const storeDir = path.join(workDir, "store");
+    await fs.mkdir(dbPath, { recursive: true });
+    await fs.writeFile(path.join(dbPath, "WiredTiger.wt"), "WT_DATA");
+
+    const storage = createFilesystemStorage({ basePath: storeDir });
+    const logger = makeLogger();
+
+    try {
+      // Case A: First unlock fails on original client; retry #2 opens fresh client and succeeds
+      let clientCreates = 0;
+      let unlockAttempts = 0;
+      const makeClient = (succeedOnAttempt) => {
+        clientCreates++;
+        return {
+          connect: vi.fn(async () => {}),
+          close: vi.fn(async () => {}),
+          db: () => ({
+            aggregate: () => ({
+              next: vi.fn(async () => {
+                throw new Error("$backupCursor unsupported");
+              }),
+              close: vi.fn(async () => {}),
+            }),
+            command: vi.fn(async (cmd) => {
+              if (cmd.buildInfo) return { version: "8.0.0" };
+              if (cmd.hello) return { ok: 1 };
+              if (cmd.fsync) return { ok: 1 };
+              if (cmd.fsyncUnlock) {
+                unlockAttempts++;
+                if (unlockAttempts < succeedOnAttempt) {
+                  throw new Error("socket reset during fsyncUnlock");
+                }
+                return { ok: 1, lockCount: 0 };
+              }
+              return { ok: 1 };
+            }),
+            collection: () => ({
+              countDocuments: vi.fn(async () => 0),
+              find: () => ({
+                sort: () => ({
+                  limit: () => ({ next: vi.fn(async () => null) }),
+                }),
+              }),
+            }),
+          }),
+        };
+      };
+
+      const recovered = await runPhysicalBackup({
+        config: {
+          engine: "physical",
+          workDir,
+          timeoutMs: 30_000,
+          storage: { prefix: "mv" },
+          mongo: { uri: "mongodb://localhost:27017", database: "*" },
+          physical: { dbPath, allowFsyncLock: true },
+        },
+        storage,
+        logger,
+        createMongoClient: () => makeClient(2),
+      });
+      expect(recovered.manifest.physical.cursorType).toBe("fsyncLock");
+      expect(clientCreates).toBe(2); // original client + 1 fresh retry client
+      expect(unlockAttempts).toBe(2);
+
+      // Case B: All unlock attempts fail -> MUST throw FsyncUnlockError (never swallow!)
+      clientCreates = 0;
+      unlockAttempts = 0;
+      await expect(
+        runPhysicalBackup({
+          config: {
+            engine: "physical",
+            workDir,
+            timeoutMs: 30_000,
+            storage: { prefix: "mv" },
+            mongo: { uri: "mongodb://localhost:27017", database: "*" },
+            physical: { dbPath, allowFsyncLock: true },
+          },
+          storage,
+          logger,
+          createMongoClient: () => makeClient(99),
+        }),
+      ).rejects.toThrow(FsyncUnlockError);
+      expect(unlockAttempts).toBe(3);
+
+      // Case C: Upload fails AND unlock also fails in finally -> MUST surface FsyncUnlockError with cause!
+      unlockAttempts = 0;
+      const failingStorage = {
+        ...storage,
+        upload: vi.fn(async () => {
+          throw new Error("S3 network disconnect");
+        }),
+        remove: vi.fn(async () => {}),
+      };
+      let caught = null;
+      try {
+        await runPhysicalBackup({
+          config: {
+            engine: "physical",
+            workDir,
+            timeoutMs: 30_000,
+            storage: { prefix: "mv" },
+            mongo: { uri: "mongodb://localhost:27017", database: "*" },
+            physical: { dbPath, allowFsyncLock: true },
+          },
+          storage: failingStorage,
+          logger,
+          createMongoClient: () => makeClient(99),
+        });
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(FsyncUnlockError);
+      expect(caught.message).toContain("db.adminCommand({ fsyncUnlock: 1 })");
+      expect(caught.cause?.message).toMatch(/S3 network disconnect/);
+    } finally {
+      await fs.rm(workDir, { recursive: true, force: true });
+    }
+  });
+
+  it("aborts stalled fsyncLock backup when fsyncLockTimeoutMs watchdog expires and unlocks MongoDB", async () => {
+    const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "mv-phys-watchdog-"));
+    const dbPath = path.join(workDir, "db");
+    await fs.mkdir(dbPath, { recursive: true });
+    await fs.writeFile(path.join(dbPath, "WiredTiger.wt"), "WT_DATA");
+
+    const logger = makeLogger();
+    let unlocked = false;
+
+    const fakeClient = {
+      connect: vi.fn(async () => {}),
+      close: vi.fn(async () => {}),
+      db: () => ({
+        aggregate: () => ({
+          next: vi.fn(async () => {
+            throw new Error("$backupCursor unsupported");
+          }),
+          close: vi.fn(async () => {}),
+        }),
+        command: vi.fn(async (cmd) => {
+          if (cmd.buildInfo) return { version: "8.0.0" };
+          if (cmd.hello) return { ok: 1 };
+          if (cmd.fsync) return { ok: 1 };
+          if (cmd.fsyncUnlock) {
+            unlocked = true;
+            return { ok: 1, lockCount: 0 };
+          }
+          return { ok: 1 };
+        }),
+        collection: () => ({
+          countDocuments: vi.fn(async () => 0),
+          find: () => ({
+            sort: () => ({
+              limit: () => ({ next: vi.fn(async () => null) }),
+            }),
+          }),
+        }),
+      }),
+    };
+
+    const stalledStorage = {
+      bucket: "test",
+      upload: vi.fn(
+        (_key, _stream, { signal }) =>
+          new Promise((_, reject) => {
+            signal?.addEventListener("abort", () => {
+              reject(signal.reason ?? new Error("aborted"));
+            });
+          }),
+      ),
+      remove: vi.fn(async () => {}),
+    };
+
+    try {
+      await expect(
+        runPhysicalBackup({
+          config: {
+            engine: "physical",
+            workDir,
+            timeoutMs: 30_000,
+            storage: { prefix: "mv" },
+            mongo: { uri: "mongodb://localhost:27017", database: "*" },
+            physical: { dbPath, allowFsyncLock: true },
+          },
+          storage: stalledStorage,
+          logger,
+          fsyncLockTimeoutMs: 60,
+          createMongoClient: () => fakeClient,
+        }),
+      ).rejects.toThrow(/watchdog/i);
+      expect(unlocked).toBe(true);
     } finally {
       await fs.rm(workDir, { recursive: true, force: true });
     }
