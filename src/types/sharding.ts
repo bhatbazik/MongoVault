@@ -51,6 +51,7 @@ export interface ShardedRestoreOptions {
   pitr?: string;
   signal?: AbortSignal;
   drop?: boolean;
+  preVerify?: boolean;
   createMongoClient?: (uri: string) => MongoClient;
   restoreRunner?: (ctx: RestoreContext, opts: RestoreOptions) => Promise<RestoreResult>;
 }

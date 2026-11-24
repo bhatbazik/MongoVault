@@ -105,4 +105,21 @@ describe("config", () => {
     });
     expect(config.encryptionKeyRing.length).toBe(2);
   });
+
+  it("enforces ENCRYPTION_KEY when REQUIRE_ENCRYPTION is enabled", () => {
+    expect(() =>
+      loadConfig({
+        ...minimalValidEnv,
+        REQUIRE_ENCRYPTION: "true",
+      }),
+    ).toThrow("ENCRYPTION_KEY is required when REQUIRE_ENCRYPTION is enabled");
+
+    const config = loadConfig({
+      ...minimalValidEnv,
+      REQUIRE_ENCRYPTION: "true",
+      ENCRYPTION_KEY: generateKey(),
+    });
+    expect(config.requireEncryption).toBe(true);
+    expect(config.encryptionKey).not.toBeNull();
+  });
 });

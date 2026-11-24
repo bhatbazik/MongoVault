@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { MongoClient } from "mongodb";
 import { createDecryptor, createEncryptor, keyId } from "./crypto.js";
+import { fromBsonTimestamp } from "./oplog.js";
 import { checkDatabaseTools, checkTool } from "./tools.js";
 import type { AppConfig } from "./types/config.js";
 import type { StorageClient } from "./types/storage.js";
@@ -79,15 +80,74 @@ async function checkMongo(
       message: `Connected successfully to ${hello.me || "instance"} (setName: ${hello.setName || "none"})`,
     });
 
-    if (config.mongo.oplog) {
+    if (config.mongo.oplog || config.pitr?.enabled) {
       try {
-        const oplogColl = client.db("local").collection("oplog.rs");
+        const localDb = client.db("local");
+        const oplogColl = localDb.collection("oplog.rs");
         const count = await oplogColl.estimatedDocumentCount();
+        let windowNote = "";
+        let windowSeconds: number | null = null;
+        let fillRatio: number | null = null;
+
+        try {
+          if (typeof oplogColl.find === "function") {
+            const oldestDoc = await oplogColl
+              .find({}, { projection: { ts: 1 } })
+              .sort({ $natural: 1 })
+              .limit(1)
+              .next();
+            const newestDoc = await oplogColl
+              .find({}, { projection: { ts: 1 } })
+              .sort({ $natural: -1 })
+              .limit(1)
+              .next();
+            const oldestTs = fromBsonTimestamp(oldestDoc?.ts);
+            const newestTs = fromBsonTimestamp(newestDoc?.ts);
+            if (oldestTs && newestTs && newestTs.t >= oldestTs.t) {
+              windowSeconds = newestTs.t - oldestTs.t;
+              const hours = (windowSeconds / 3600).toFixed(2);
+              windowNote = `, retention span ~${hours}h`;
+            }
+          }
+          if (typeof localDb.command === "function") {
+            const stats = (await localDb.command({ collStats: "oplog.rs" }).catch(() => null)) as {
+              size?: number;
+              maxSize?: number;
+            } | null;
+            if (
+              stats &&
+              typeof stats.size === "number" &&
+              typeof stats.maxSize === "number" &&
+              stats.maxSize > 0
+            ) {
+              fillRatio = stats.size / stats.maxSize;
+              windowNote += ` (${Math.round(fillRatio * 100)}% of ${Math.round(stats.maxSize / (1024 * 1024))} MiB cap)`;
+            }
+          }
+        } catch {
+          // Best-effort oplog window sizing probe
+        }
+
         checks.push({
           name: "MongoDB Oplog Access",
           passed: true,
-          message: `local.oplog.rs accessible (~${count} entries)`,
+          message: `local.oplog.rs accessible (~${count} entries${windowNote})`,
         });
+
+        const minSafeWindowSeconds = Math.max(3600, (config.pitr?.flushIntervalSeconds ?? 60) * 10);
+        if (
+          config.pitr?.enabled &&
+          windowSeconds !== null &&
+          fillRatio !== null &&
+          fillRatio >= 0.8 &&
+          windowSeconds < minSafeWindowSeconds
+        ) {
+          checks.push({
+            name: "MongoDB Oplog Window",
+            passed: false,
+            message: `Oplog is ${Math.round(fillRatio * 100)}% full with only ${(windowSeconds / 3600).toFixed(2)}h retention (< ${(minSafeWindowSeconds / 3600).toFixed(1)}h safe minimum); resize local.oplog.rs to avoid PITR rollover gaps`,
+          });
+        }
       } catch (err) {
         checks.push({
           name: "MongoDB Oplog Access",
@@ -208,10 +268,19 @@ function checkEncryption(config: AppConfig): CheckItem {
     }
   }
 
+  if (config.requireEncryption) {
+    return {
+      name: "Client-Side Encryption",
+      passed: false,
+      message: "REQUIRE_ENCRYPTION is enabled, but ENCRYPTION_KEY is not configured",
+    };
+  }
+
   return {
     name: "Client-Side Encryption",
     passed: true,
-    message: "Disabled (No master key configured)",
+    message:
+      "Disabled (WARNING: ENCRYPTION_KEY not set — backups are unencrypted and manifests unsigned; set REQUIRE_ENCRYPTION=true in production)",
   };
 }
 

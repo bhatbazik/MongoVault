@@ -430,6 +430,11 @@ export async function uploadOplogSlice({
 
   const startedAt = new Date();
   const encrypted = Boolean(config.encryptionKey);
+  if (config.requireEncryption && !encrypted) {
+    throw new Error(
+      "Refusing to upload unencrypted PITR oplog slice: REQUIRE_ENCRYPTION is enabled but ENCRYPTION_KEY is not configured",
+    );
+  }
   const scope = scopeOf(config);
   const key = oplogSliceKey(scope, startTs, endTs, { encrypted, keyPrefix });
   const log = logger.child({ key });
@@ -1196,16 +1201,25 @@ export function startOplogArchiver({
   let activeTickPromise: Promise<void> | null = null;
   let activeAbortController: AbortController | null = null;
   let timer: NodeJS.Timeout | null = null;
+  let lastGapNotifiedKey: string | null = null;
 
-  function recordManifestMetrics(manifest: BackupManifest): void {
+  async function recordManifestAndNotifyGap(manifest: BackupManifest): Promise<void> {
     const endTsStr = manifest.oplogWindow?.coverageEndTs ?? manifest.oplogWindow?.endTs;
     const endTs = endTsStr ? parseOplogTimestamp(endTsStr) : null;
+    const hasGap = Boolean(manifest.oplogWindow?.gapDetected);
     metrics?.recordPitrSliceSuccess?.(
       manifest.oplogWindow?.entries ?? 0,
       manifest.size ?? 0,
       endTs?.t ?? Math.floor(Date.now() / 1000),
-      Boolean(manifest.oplogWindow?.gapDetected),
+      hasGap,
     );
+    if (hasGap && notifier && lastGapNotifiedKey !== manifest.key) {
+      lastGapNotifiedKey = manifest.key;
+      const gapErr = new Error(
+        `PITR timeline gap detected on slice ${manifest.key}: MongoDB oplog rolled over before archiver captured all entries. Take a fresh base backup to restore continuous PITR coverage.`,
+      );
+      await notifier.notifyFailure("pitr-oplog-gap", gapErr).catch(() => {});
+    }
   }
 
   async function runTick(): Promise<void> {
@@ -1254,7 +1268,7 @@ export function startOplogArchiver({
             ...Object.values(result.shards).filter((m): m is BackupManifest => Boolean(m)),
           ];
           for (const m of capturedList) {
-            recordManifestMetrics(m);
+            await recordManifestAndNotifyGap(m);
           }
           if (capturedList.length === 0) break;
         }
@@ -1270,7 +1284,7 @@ export function startOplogArchiver({
           });
           if (!captured) break;
           capturedAny = true;
-          recordManifestMetrics(captured);
+          await recordManifestAndNotifyGap(captured);
         }
         if (!capturedAny && metrics?.recordPitrCoverage && typeof storage.getJson === "function") {
           const stateObj = await storage

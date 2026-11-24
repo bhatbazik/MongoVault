@@ -34,7 +34,7 @@ import {
   resolvePitrPlan,
   streamOplogSlice,
 } from "./oplog.js";
-import { restoreBackup } from "./restore.js";
+import { restoreBackup, verifyArchiveObject } from "./restore.js";
 import { runStreamPipeline } from "./stream.js";
 import type {
   BackupManifest,
@@ -617,6 +617,17 @@ export async function runShardedClusterBackup({
   const startedAt = new Date();
   const controller = linkedController(signal);
   const log = logger.child({ engine: "sharded-cluster" });
+
+  if (config.requireEncryption && !config.encryptionKey) {
+    throw new Error(
+      "Refusing to create unencrypted sharded cluster backup: REQUIRE_ENCRYPTION is enabled but ENCRYPTION_KEY is not configured",
+    );
+  }
+  if (!config.encryptionKey) {
+    log.warn(
+      "ENCRYPTION_KEY is not configured; sharded cluster backup archives and manifests will be stored unencrypted and unsigned",
+    );
+  }
 
   log.info("Inspecting sharded cluster topology...");
   const client = createMongoClient(config.mongo.uri);
@@ -1288,6 +1299,7 @@ export async function restoreShardedCluster({
   pitr,
   signal,
   drop = false,
+  preVerify = drop,
   createMongoClient = (u) => new MongoClient(u),
   restoreRunner = restoreBackup,
 }: ShardedRestoreOptions): Promise<ShardedRestoreResult> {
@@ -1362,6 +1374,52 @@ export async function restoreShardedCluster({
         throw new Error(
           `Target cluster topology is missing mapping for shard "${shardId}" (source host: ${shard.host ?? "unknown"}). Refusing to fall back to source shard host.`,
         );
+      }
+    }
+
+    // Pre-verify ALL child archives, bridging slices, and PITR slices BEFORE dropping any user
+    // databases or mutating CSRS/shards so a corrupt/missing object never leaves the cluster torn.
+    const configsvrSliceKeys = collectOrderedSliceKeys(
+      clusterMeta.configsvr.bridgingSliceKeys,
+      clusterMeta.configsvr.bridgingSliceKey,
+      pitrPlan?.configsvrPlan?.slices,
+    );
+    const shardSliceKeyMap = new Map<string, string[]>();
+    let totalSlicesToReplay = configsvrSliceKeys.length;
+    for (const [shardId, shard] of Object.entries(clusterMeta.shards)) {
+      const keys = collectOrderedSliceKeys(
+        shard.bridgingSliceKeys,
+        shard.bridgingSliceKey,
+        pitrPlan?.shardPlans[shardId]?.slices,
+      );
+      shardSliceKeyMap.set(shardId, keys);
+      totalSlicesToReplay += keys.length;
+    }
+
+    const preVerifiedAllChildren =
+      Boolean(preVerify) &&
+      typeof storage.download === "function" &&
+      restoreRunner === restoreBackup;
+    if (preVerifiedAllChildren) {
+      const allKeysToVerify = new Set<string>();
+      if (clusterMeta.configsvr?.backupKey) {
+        allKeysToVerify.add(clusterMeta.configsvr.backupKey);
+      }
+      for (const sKey of configsvrSliceKeys) {
+        allKeysToVerify.add(sKey);
+      }
+      for (const [shardId, shard] of Object.entries(clusterMeta.shards)) {
+        if (shard.backupKey) allKeysToVerify.add(shard.backupKey);
+        for (const sKey of shardSliceKeyMap.get(shardId) ?? []) {
+          allKeysToVerify.add(sKey);
+        }
+      }
+      log.info(
+        { objectsCount: allKeysToVerify.size, drop },
+        "Pre-verifying all sharded child archives, bridging slices, and PITR slices before destructive restore",
+      );
+      for (const childKey of allKeysToVerify) {
+        await verifyArchiveObject({ config, storage, logger: log, signal }, childKey);
       }
     }
 
@@ -1477,6 +1535,7 @@ export async function restoreShardedCluster({
           uri: targetShardUri,
           database: "*",
           drop,
+          ...(preVerifiedAllChildren ? { preVerify: false } : {}),
           oplogReplay: true,
           oplogLimit: hasPostBaseSlices ? undefined : exclusiveLimit,
         },
@@ -1496,23 +1555,6 @@ export async function restoreShardedCluster({
     }
 
     // 4. Streaming oplog replay across configsvr & all shards + cross-shard distributed txn reconciliation
-    const configsvrSliceKeys = collectOrderedSliceKeys(
-      clusterMeta.configsvr.bridgingSliceKeys,
-      clusterMeta.configsvr.bridgingSliceKey,
-      pitrPlan?.configsvrPlan?.slices,
-    );
-    const shardSliceKeyMap = new Map<string, string[]>();
-    let totalSlicesToReplay = configsvrSliceKeys.length;
-    for (const [shardId, shard] of Object.entries(clusterMeta.shards)) {
-      const keys = collectOrderedSliceKeys(
-        shard.bridgingSliceKeys,
-        shard.bridgingSliceKey,
-        pitrPlan?.shardPlans[shardId]?.slices,
-      );
-      shardSliceKeyMap.set(shardId, keys);
-      totalSlicesToReplay += keys.length;
-    }
-
     if (totalSlicesToReplay > 0 && effectiveTargetTs) {
       const activeNodes: Array<{
         id: string;

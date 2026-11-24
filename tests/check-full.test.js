@@ -173,4 +173,66 @@ describe("Preflight Check (check.ts full coverage)", () => {
     });
     expect(r2.checks.find((c) => c.name === "Sharded Cluster (mongos)")?.passed).toBe(false);
   });
+
+  it("fails preflight when REQUIRE_ENCRYPTION is enabled without a key or when PITR oplog window is critically short", async () => {
+    mockCheckDbTools.mockResolvedValueOnce({
+      mongodump: { available: true, version: "100.20.1" },
+      mongorestore: { available: true, version: "100.20.1" },
+    });
+
+    const shortWindowClient = () => ({
+      connect: vi.fn(async () => {}),
+      close: vi.fn(async () => {}),
+      db: (name) => ({
+        command: vi.fn(async (cmd) => {
+          if (cmd.ping) return { ok: 1 };
+          if (cmd.hello) return { me: "rs0:27017", setName: "rs0" };
+          if (name === "local" && cmd.collStats === "oplog.rs") {
+            return { size: 950 * 1024 * 1024, maxSize: 1024 * 1024 * 1024 };
+          }
+          return {};
+        }),
+        collection: () => ({
+          estimatedDocumentCount: vi.fn(async () => 50000),
+          findOne: vi.fn(async () => null),
+          find: () => ({
+            sort: (s) => ({
+              limit: () => ({
+                next: vi.fn(async () => ({
+                  ts: s.$natural === 1 ? { t: 1000, i: 1 } : { t: 1600, i: 1 },
+                })),
+              }),
+            }),
+          }),
+        }),
+      }),
+    });
+
+    const storeMap = new Map();
+    const storage = {
+      bucket: "test-bkt",
+      putJson: vi.fn(async (k, v) => storeMap.set(k, v)),
+      getJson: vi.fn(async (k) => ({ data: storeMap.get(k) })),
+      head: vi.fn(async () => ({ size: 12 })),
+      remove: vi.fn(async (k) => storeMap.delete(k)),
+    };
+
+    const res = await runPreflightCheck({
+      config: {
+        ...baseConfig,
+        sharding: null,
+        encryptionKey: null,
+        requireEncryption: true,
+        pitr: { enabled: true, flushIntervalSeconds: 60 },
+      },
+      storage,
+      createMongoClient: shortWindowClient,
+    });
+
+    expect(res.allPassed).toBe(false);
+    expect(res.checks.find((c) => c.name === "Client-Side Encryption")?.passed).toBe(false);
+    const windowCheck = res.checks.find((c) => c.name === "MongoDB Oplog Window");
+    expect(windowCheck?.passed).toBe(false);
+    expect(windowCheck?.message).toMatch(/resize local\.oplog\.rs/i);
+  });
 });

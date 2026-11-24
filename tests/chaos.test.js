@@ -1,7 +1,9 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough, Readable } from "node:stream";
+import { gzipSync } from "node:zlib";
 import { BSON, Binary, Long, Timestamp } from "mongodb";
 import pino from "pino";
 import { describe, expect, it, vi } from "vitest";
@@ -13,11 +15,13 @@ import {
   captureOplogSlice,
   pitrStateKey,
   resolvePitrPlan,
+  startOplogArchiver,
   toBsonTimestamp,
   uploadOplogSlice,
 } from "../src/oplog.js";
-import { PhysicalRecoveryCoordinator } from "../src/physical.js";
-import { resolveShardedPitrPlan } from "../src/sharding.js";
+import { PhysicalRecoveryCoordinator, runPhysicalBackup } from "../src/physical.js";
+import { IntegrityError, restoreBackup } from "../src/restore.js";
+import { resolveShardedPitrPlan, runShardedClusterBackup } from "../src/sharding.js";
 import { FilesystemStorageClient, S3StorageClient } from "../src/storage.js";
 import { generateTarStream } from "../src/tar.js";
 
@@ -632,6 +636,193 @@ describe("Chaos, Fault-Injection & Fail-Closed Recovery Correctness", () => {
       expect(lostErr).toBeInstanceOf(Error);
       expect(lostErr.message).toMatch(/Distributed lock lease lost/);
       await hybridRel();
+    } finally {
+      await fs.rm(workDir, { recursive: true, force: true });
+    }
+  });
+
+  it("pre-verifies all planned PITR oplog slices BEFORE executing destructive --drop on base restore", async () => {
+    const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "mv-chaos-preverify-"));
+    const storage = new FilesystemStorageClient(path.join(workDir, "store"));
+    try {
+      const config = {
+        workDir,
+        mongo: { uri: "mongodb://127.0.0.1:27017", database: "*", oplog: true },
+        storage: { prefix: "prod" },
+        pitr: { enabled: true, flushIntervalSeconds: 60, maxSliceMb: 16 },
+        encryptionKey: null,
+        encryptionKeyRing: [],
+      };
+
+      const baseKey = "prod/_cluster/2026-03-10/20260310T120000Z.archive.gz";
+      const baseGz = gzipSync(Buffer.from("valid-base-archive"));
+      await storage.upload(baseKey, baseGz);
+      await writeManifest(storage, {
+        version: 2,
+        key: baseKey,
+        database: "*",
+        createdAt: "2026-03-10T12:00:00.000Z",
+        completedAt: "2026-03-10T12:00:05.000Z",
+        durationMs: 5000,
+        size: baseGz.length,
+        sha256: createHash("sha256").update(baseGz).digest("hex"),
+        compression: "gzip",
+        encryption: null,
+        oplog: true,
+        oplogWindow: { startTs: "1000:1", endTs: "1000:5" },
+        excludedCollections: [],
+        collections: {},
+      });
+
+      const sliceManifest = await uploadOplogSlice({
+        config,
+        storage,
+        logger,
+        rawDocs: [
+          Buffer.from(
+            BSON.serialize({
+              ts: toBsonTimestamp({ t: 1010, i: 1 }),
+              op: "i",
+              ns: "app.users",
+              o: { _id: "u1" },
+            }),
+          ),
+        ],
+        startTs: { t: 1000, i: 6 },
+        endTs: { t: 1010, i: 1 },
+        previousEndTs: { t: 1000, i: 5 },
+      });
+      expect(sliceManifest).not.toBeNull();
+
+      // Tamper with the PITR slice payload after upload
+      await storage.upload(sliceManifest.key, gzipSync(Buffer.from("tampered-oplog-slice")));
+
+      const mongorestoreSpy = vi.fn();
+      await expect(
+        restoreBackup(
+          { config, storage, logger, tools: { mongorestore: mongorestoreSpy } },
+          { uri: "mongodb://127.0.0.1:27017", pitr: "1010:1", drop: true },
+        ),
+      ).rejects.toThrow(IntegrityError);
+
+      // CRITICAL: mongorestore (--drop) must NEVER have been invoked!
+      expect(mongorestoreSpy).not.toHaveBeenCalled();
+    } finally {
+      await fs.rm(workDir, { recursive: true, force: true });
+    }
+  });
+
+  it("dispatches immediate email failure alert when oplog archiver detects a rollover gap slice and enforces REQUIRE_ENCRYPTION", async () => {
+    const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "mv-chaos-gap-notify-"));
+    const storage = new FilesystemStorageClient(path.join(workDir, "store"));
+    try {
+      const config = {
+        workDir,
+        mongo: { uri: "mongodb://127.0.0.1:27017", database: "*", oplog: true },
+        storage: { prefix: "prod" },
+        pitr: { enabled: true, flushIntervalSeconds: 60, maxSliceMb: 16 },
+        encryptionKey: null,
+        encryptionKeyRing: [],
+      };
+
+      // Seed prior state at 1000:1, while MongoDB oplog oldest is now 2000:1 -> gapDetected = true!
+      await storage.putJson(pitrStateKey({ prefix: "prod", database: "*" }), {
+        lastTs: "1000:1",
+        updatedAt: new Date().toISOString(),
+      });
+
+      const fakeDoc = Buffer.from(
+        BSON.serialize({
+          ts: toBsonTimestamp({ t: 2005, i: 1 }),
+          op: "i",
+          ns: "app.items",
+          o: { _id: "x1" },
+        }),
+      );
+      const fakeMongoClient = () => ({
+        connect: async () => {},
+        close: async () => {},
+        db: (name) => ({
+          command: async (cmd) => {
+            if (cmd.replSetGetStatus) {
+              return {
+                optimes: { lastCommittedOpTime: { ts: toBsonTimestamp({ t: 2005, i: 1 }) } },
+              };
+            }
+            return { ok: 1 };
+          },
+          collection: () => {
+            if (name === "config") {
+              return {
+                find: () => ({
+                  sort: () => ({
+                    limit: () => ({ next: async () => null }),
+                  }),
+                }),
+              };
+            }
+            return {
+              find: (query) => {
+                if (query && query.ts) {
+                  return {
+                    sort: () => ({
+                      async *[Symbol.asyncIterator]() {
+                        yield fakeDoc;
+                      },
+                    }),
+                  };
+                }
+                return {
+                  sort: () => ({
+                    limit: () => ({
+                      next: async () => ({ ts: toBsonTimestamp({ t: 2000, i: 1 }) }),
+                    }),
+                  }),
+                };
+              },
+            };
+          },
+        }),
+      });
+
+      const notifyFailure = vi.fn(async () => {});
+      const archiver = startOplogArchiver({
+        config,
+        storage,
+        logger,
+        notifier: { notifySuccess: vi.fn(async () => {}), notifyFailure },
+        createMongoClient: fakeMongoClient,
+      });
+      archiver.start();
+      await new Promise((r) => setTimeout(r, 150));
+      await archiver.stop();
+
+      expect(notifyFailure).toHaveBeenCalledWith(
+        "pitr-oplog-gap",
+        expect.objectContaining({ message: expect.stringMatching(/PITR timeline gap detected/i) }),
+      );
+
+      // REQUIRE_ENCRYPTION fail-closed checks across all backup engines & oplog slices
+      const strictCfg = { ...config, requireEncryption: true, encryptionKey: null };
+      await expect(runBackup({ config: strictCfg, storage, logger })).rejects.toThrow(
+        /REQUIRE_ENCRYPTION/,
+      );
+      await expect(
+        uploadOplogSlice({
+          config: strictCfg,
+          storage,
+          logger,
+          rawDocs: [fakeDoc],
+          startTs: { t: 2005, i: 1 },
+          endTs: { t: 2005, i: 1 },
+        }),
+      ).rejects.toThrow(/REQUIRE_ENCRYPTION/);
+      await expect(runPhysicalBackup({ config: strictCfg, storage, logger })).rejects.toThrow(
+        /REQUIRE_ENCRYPTION/,
+      );
+      await expect(runShardedClusterBackup({ config: strictCfg, storage, logger })).rejects.toThrow(
+        /REQUIRE_ENCRYPTION/,
+      );
     } finally {
       await fs.rm(workDir, { recursive: true, force: true });
     }

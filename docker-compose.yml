@@ -1,6 +1,6 @@
 services:
   mongodb:
-    image: mongo:8.0
+    image: mongo:9.0
     restart: unless-stopped
     command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
     ports:
@@ -17,7 +17,7 @@ services:
       retries: 10
 
   localstack:
-    image: localstack/localstack:3.4
+    image: localstack/localstack:2026.04.3
     restart: unless-stopped
     ports:
       - "4566:4566"
@@ -28,7 +28,7 @@ services:
       - localstack_data:/var/lib/localstack
 
   s3-init:
-    image: amazon/aws-cli:2.15.40
+    image: amazon/aws-cli:2.42.2
     depends_on:
       - localstack
     environment:

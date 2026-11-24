@@ -197,10 +197,20 @@ export async function runBackup({
   const effectiveTools: BackupTools = tools ?? { mongodump, getOplogBounds };
   const startedAt = new Date();
   const encrypted = Boolean(config.encryptionKey);
+  if (config.requireEncryption && !encrypted) {
+    throw new Error(
+      "Refusing to create unencrypted backup: REQUIRE_ENCRYPTION is enabled but ENCRYPTION_KEY is not configured",
+    );
+  }
   const key = archiveKey(scopeOf(config), startedAt, { encrypted });
   const log = logger.child({ key });
   const controller = linkedController(signal);
 
+  if (!encrypted) {
+    log.warn(
+      "ENCRYPTION_KEY is not configured; backup archive and manifest will be stored unencrypted and unsigned",
+    );
+  }
   log.info({ database: config.mongo.database, encrypted }, "Backup started");
 
   try {

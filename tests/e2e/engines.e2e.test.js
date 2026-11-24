@@ -84,7 +84,7 @@ function makeBaseConfig({
   };
 }
 
-describe("Real MongoDB 8.0 End-to-End Verification (All 3 Engines + PITR)", () => {
+describe("Real MongoDB End-to-End Verification (All 3 Engines + PITR)", () => {
   let rootDir;
 
   beforeAll(async () => {
@@ -186,7 +186,8 @@ describe("Real MongoDB 8.0 End-to-End Verification (All 3 Engines + PITR)", () =
       expect(drillRes.viewsVerified).toBe(1);
       expect(drillRes.readWriteVerified).toBe(true);
 
-      // 3. Post-backup writes: single insert, new unique index (commitIndexBuild), and multi-doc ACID txn
+      // 3. Post-backup writes: rich DDL (createIndex, dropIndex, renameCollection, collMod TTL,
+      //    new post-backup view), committed multi-doc ACID txn, AND aborted multi-doc txn
       await client
         .db("shop")
         .collection("orders")
@@ -194,7 +195,25 @@ describe("Real MongoDB 8.0 End-to-End Verification (All 3 Engines + PITR)", () =
       await client
         .db("shop")
         .collection("orders")
+        .createIndex({ amount: 1 }, { name: "temp_amount_idx" });
+      await client.db("shop").collection("orders").dropIndex("temp_amount_idx");
+      await client
+        .db("shop")
+        .collection("orders")
         .insertOne({ _id: "o2", userId: "u2", sku: "SKU-2", amount: 30 });
+      await client
+        .db("shop")
+        .collection("temp_ledger")
+        .insertOne({ _id: "l1", note: "renamed-in-pitr" });
+      await client.db("shop").collection("temp_ledger").rename("ledger");
+      await client.db("analytics").command({
+        collMod: "events",
+        index: { name: "events_ttl", expireAfterSeconds: 43200 },
+      });
+      await client.db("shop").createCollection("high_value_orders", {
+        viewOn: "orders",
+        pipeline: [{ $match: { amount: { $gte: 30 } } }],
+      });
 
       const session = client.startSession();
       try {
@@ -210,6 +229,26 @@ describe("Real MongoDB 8.0 End-to-End Verification (All 3 Engines + PITR)", () =
         });
       } finally {
         await session.endSession();
+      }
+
+      // Execute and explicitly ABORT a multi-document transaction -> must NEVER appear after PITR
+      const abortSession = client.startSession();
+      try {
+        abortSession.startTransaction();
+        await client
+          .db("shop")
+          .collection("users")
+          .updateOne({ _id: "u2" }, { $inc: { balance: 999 } }, { session: abortSession });
+        await client
+          .db("shop")
+          .collection("orders")
+          .insertOne(
+            { _id: "o-aborted", userId: "u2", sku: "SKU-ABORT", amount: 999 },
+            { session: abortSession },
+          );
+        await abortSession.abortTransaction();
+      } finally {
+        await abortSession.endSession();
       }
 
       const targetTs = await getLatestOplogTs(rs.uri);
@@ -237,8 +276,30 @@ describe("Real MongoDB 8.0 End-to-End Verification (All 3 Engines + PITR)", () =
       // Confirm disaster state before restore
       expect(await client.db("shop").collection("orders").countDocuments()).toBe(0);
 
-      // 5. Full-cluster streaming PITR restore to exact targetTs (ZERO temp slice files!)
+      // 5a. Simulate an interrupted Stage 2 PITR restore (abort mid-slice) -> must fail closed,
+      //     and prove subsequent clean re-restore recovers the exact target state!
       const pitrStr = formatOplogTimestamp(targetTs);
+      const interruptController = new AbortController();
+      const interruptingStorage = Object.create(storage);
+      let sliceDownloadCount = 0;
+      interruptingStorage.download = async (key, opts) => {
+        if (key.includes(".oplog.bson")) {
+          sliceDownloadCount++;
+          // Abort on replay pass (after pre-verification pass)
+          if (sliceDownloadCount > 1) {
+            interruptController.abort(new Error("Simulated mid-replay interruption"));
+          }
+        }
+        return storage.download(key, opts);
+      };
+      await expect(
+        restoreBackup(
+          { config, storage: interruptingStorage, logger, signal: interruptController.signal },
+          { uri: rs.uri, pitr: pitrStr, drop: true },
+        ),
+      ).rejects.toThrow();
+
+      // 5b. Full-cluster streaming PITR restore to exact targetTs (clean recovery after interruption!)
       const restoreRes = await restoreBackup(
         { config, storage, logger },
         { uri: rs.uri, pitr: pitrStr, drop: true },
@@ -256,9 +317,11 @@ describe("Real MongoDB 8.0 End-to-End Verification (All 3 Engines + PITR)", () =
       expect(pitrDrillRes.readWriteVerified).toBe(true);
       expect(pitrDrillRes.oplogStats?.partialTxns).toBe(0);
 
-      // Verify exact PITR state
+      // Verify exact PITR state (committed txn applied, aborted txn absent, post-disaster undone)
       const u1 = await client.db("shop").collection("users").findOne({ _id: "u1" });
+      const u2 = await client.db("shop").collection("users").findOne({ _id: "u2" });
       expect(u1.balance).toBe(60); // Multi-doc ACID txn applied!
+      expect(u2.balance).toBe(50); // Aborted txn did NOT mutate Bob!
       expect(await client.db("shop").collection("users").findOne({ _id: "u-bad" })).toBeNull();
 
       const orders = await client
@@ -268,10 +331,26 @@ describe("Real MongoDB 8.0 End-to-End Verification (All 3 Engines + PITR)", () =
         .sort({ _id: 1 })
         .toArray();
       expect(orders.map((o) => o._id)).toEqual(["o1", "o2", "o3-txn"]);
+      expect(await client.db("shop").collection("orders").findOne({ _id: "o-aborted" })).toBeNull();
 
-      // Verify index created after base backup was rebuilt by OplogApplier.buildPendingIndexes()
+      // Verify post-backup DDL: createIndex, dropIndex, renameCollection, collMod TTL, and new view
       const indexes = await client.db("shop").collection("orders").indexes();
       expect(indexes.some((idx) => idx.name === "sku_unique" && idx.unique === true)).toBe(true);
+      expect(indexes.some((idx) => idx.name === "temp_amount_idx")).toBe(false);
+      expect(await client.db("shop").collection("ledger").findOne({ _id: "l1" })).toEqual({
+        _id: "l1",
+        note: "renamed-in-pitr",
+      });
+      const eventsIndexes = await client.db("analytics").collection("events").indexes();
+      expect(eventsIndexes.find((idx) => idx.name === "events_ttl")?.expireAfterSeconds).toBe(
+        43200,
+      );
+      const highValueOrders = await client
+        .db("shop")
+        .collection("high_value_orders")
+        .find({})
+        .toArray();
+      expect(highValueOrders.length).toBe(2);
 
       // Verify analytics.events drop after targetTs was undone & restored constraints are enforced
       expect(await client.db("analytics").collection("events").countDocuments()).toBe(1);
@@ -357,7 +436,7 @@ describe("Real MongoDB 8.0 End-to-End Verification (All 3 Engines + PITR)", () =
         dbPath: rs.dbPath,
       });
       expect(physBackup.manifest.engine).toBe("physical");
-      expect(physBackup.manifest.physical.mongoVersion).toMatch(/^8\.0\./);
+      expect(physBackup.manifest.physical.mongoVersion).toMatch(/^(7|8|9)\.\d+\./);
       expect(physBackup.manifest.oplogWindow?.endTs).toBeTruthy();
 
       // Verify live mongod.lock guard refuses to overwrite running source dbPath

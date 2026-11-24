@@ -183,17 +183,21 @@ async function getRestoredCollectionInfos(
 async function verifySchemaAndReadWrite({
   manifest,
   isCluster,
+  isPitr = false,
   resolveDbAndColl,
   collectionInfosByDb,
   probeDb,
   readSampleTargets,
+  logger,
 }: {
   manifest: BackupManifest;
   isCluster: boolean;
+  isPitr?: boolean;
   resolveDbAndColl: (colKey: string) => { db: Db; dbName: string; collName: string } | null;
   collectionInfosByDb: Map<string, Map<string, RestoredCollectionInfo> | null>;
   probeDb: Db | null;
   readSampleTargets: Array<{ namespace: string; db: Db; collName: string }>;
+  logger?: DrillContext["logger"];
 }): Promise<{
   schemaMismatches: DrillSchemaMismatch[];
   indexesVerified: number;
@@ -202,10 +206,21 @@ async function verifySchemaAndReadWrite({
   readWriteVerified: boolean;
 }> {
   const schemaMismatches: DrillSchemaMismatch[] = [];
+  const pitrSchemaDrifts: DrillSchemaMismatch[] = [];
   let indexesVerified = 0;
   let validatorsVerified = 0;
   let viewsVerified = 0;
   let readWriteVerified = false;
+
+  const recordSchemaDiff = (diff: DrillSchemaMismatch) => {
+    if (isPitr) {
+      // Post-backup DDL (collMod, renameCollection, dropIndex, drop, etc.) legitimately
+      // mutates schema between the base snapshot and the PITR target timestamp.
+      pitrSchemaDrifts.push(diff);
+    } else {
+      schemaMismatches.push(diff);
+    }
+  };
 
   // 1. Verify recorded indexes & collection options/validators when manifest.schema is present
   if (manifest.schema) {
@@ -217,7 +232,7 @@ async function verifySchemaAndReadWrite({
       const actualInfo = dbInfos?.get(target.collName);
 
       if (dbInfos && !actualInfo) {
-        schemaMismatches.push({
+        recordSchemaDiff({
           namespace: colKey,
           kind: "options",
           detail: "collection missing from restored database metadata",
@@ -233,7 +248,7 @@ async function verifySchemaAndReadWrite({
             stableStringify(expectedMeta.options.validator) !==
             stableStringify(actualOpts.validator)
           ) {
-            schemaMismatches.push({
+            recordSchemaDiff({
               namespace: colKey,
               kind: "validator",
               detail: "collection validator definition does not match backup schema",
@@ -246,7 +261,7 @@ async function verifySchemaAndReadWrite({
           expectedMeta.options.validationLevel !== undefined &&
           expectedMeta.options.validationLevel !== actualOpts.validationLevel
         ) {
-          schemaMismatches.push({
+          recordSchemaDiff({
             namespace: colKey,
             kind: "validator",
             detail: `validationLevel mismatch (expected ${expectedMeta.options.validationLevel}, got ${String(actualOpts.validationLevel)})`,
@@ -256,7 +271,7 @@ async function verifySchemaAndReadWrite({
           expectedMeta.options.validationAction !== undefined &&
           expectedMeta.options.validationAction !== actualOpts.validationAction
         ) {
-          schemaMismatches.push({
+          recordSchemaDiff({
             namespace: colKey,
             kind: "validator",
             detail: `validationAction mismatch (expected ${expectedMeta.options.validationAction}, got ${String(actualOpts.validationAction)})`,
@@ -266,7 +281,7 @@ async function verifySchemaAndReadWrite({
           expectedMeta.options.capped !== undefined &&
           Boolean(expectedMeta.options.capped) !== Boolean(actualOpts.capped)
         ) {
-          schemaMismatches.push({
+          recordSchemaDiff({
             namespace: colKey,
             kind: "options",
             detail: `capped option mismatch (expected ${expectedMeta.options.capped}, got ${String(actualOpts.capped)})`,
@@ -277,7 +292,7 @@ async function verifySchemaAndReadWrite({
           stableStringify(expectedMeta.options.timeseries) !==
             stableStringify(actualOpts.timeseries)
         ) {
-          schemaMismatches.push({
+          recordSchemaDiff({
             namespace: colKey,
             kind: "options",
             detail: "timeseries collection options do not match backup schema",
@@ -306,7 +321,7 @@ async function verifySchemaAndReadWrite({
         for (const expectedIdx of expectedMeta.indexes) {
           const found = byName.get(expectedIdx.name);
           if (!found) {
-            schemaMismatches.push({
+            recordSchemaDiff({
               namespace: colKey,
               kind: "index",
               detail: `expected index "${expectedIdx.name}" (${stableStringify(expectedIdx.key)}) is missing`,
@@ -315,7 +330,8 @@ async function verifySchemaAndReadWrite({
           }
           const diff = compareIndexSpec(expectedIdx, found);
           if (diff) {
-            schemaMismatches.push({ namespace: colKey, kind: "index", detail: diff });
+            recordSchemaDiff({ namespace: colKey, kind: "index", detail: diff });
+            if (isPitr) indexesVerified++;
           } else {
             indexesVerified++;
           }
@@ -331,7 +347,7 @@ async function verifySchemaAndReadWrite({
       const dbInfos = collectionInfosByDb.get(target.dbName);
       const actualInfo = dbInfos?.get(target.collName);
       if (!actualInfo || actualInfo.type !== "view") {
-        schemaMismatches.push({
+        recordSchemaDiff({
           namespace: expectedView.name,
           kind: "view",
           detail: "expected view is missing or not restored as a view",
@@ -343,12 +359,12 @@ async function verifySchemaAndReadWrite({
         actualOpts.viewOn !== expectedView.viewOn ||
         stableStringify(actualOpts.pipeline ?? []) !== stableStringify(expectedView.pipeline ?? [])
       ) {
-        schemaMismatches.push({
+        recordSchemaDiff({
           namespace: expectedView.name,
           kind: "view",
           detail: `view definition mismatch (expected viewOn="${expectedView.viewOn}", got "${String(actualOpts.viewOn)}")`,
         });
-        continue;
+        if (!isPitr) continue;
       }
 
       const viewColl = target.db.collection(target.collName);
@@ -365,6 +381,13 @@ async function verifySchemaAndReadWrite({
         }
       }
       viewsVerified++;
+    }
+
+    if (pitrSchemaDrifts.length > 0) {
+      logger?.info(
+        { driftsCount: pitrSchemaDrifts.length, drifts: pitrSchemaDrifts },
+        "Schema differed from base snapshot during PITR drill (expected when post-backup DDL replayed)",
+      );
     }
   } else {
     // Backwards-compatible index count inspection for manifests without recorded schema metadata
@@ -593,10 +616,12 @@ export async function runDrill(
       const schemaCheck = await verifySchemaAndReadWrite({
         manifest: activeManifest,
         isCluster: false,
+        isPitr: Boolean(resolvedPitr),
         resolveDbAndColl: (colKey) => ({ db, dbName: database, collName: colKey }),
         collectionInfosByDb: new Map([[database, collectionInfos]]),
         probeDb: db,
         readSampleTargets,
+        logger,
       });
 
       if (mismatches.length > 0 || schemaCheck.schemaMismatches.length > 0) {
@@ -717,6 +742,7 @@ export async function runDrill(
       const schemaCheck = await verifySchemaAndReadWrite({
         manifest: activeManifest,
         isCluster: true,
+        isPitr: Boolean(resolvedPitr),
         resolveDbAndColl: (colKey) => {
           const firstDot = colKey.indexOf(".");
           if (firstDot <= 0) return null;
@@ -727,6 +753,7 @@ export async function runDrill(
         collectionInfosByDb,
         probeDb: userProbeDbName ? client.db(userProbeDbName) : null,
         readSampleTargets,
+        logger,
       });
 
       if (mismatches.length > 0 || schemaCheck.schemaMismatches.length > 0) {

@@ -1096,14 +1096,33 @@ The internal HTTP server (`src/metrics.ts`, default port `8080`) provides standa
 
 #### Prometheus Metrics Catalog
 
-| Metric Name                                           | Type      | Labels                                 | Description                                           |
-| :---------------------------------------------------- | :-------- | :------------------------------------- | :---------------------------------------------------- |
-| `mongodb_backup_runs_total`                           | Counter   | `status` (success/failure), `database` | Total count of backup executions                      |
-| `mongodb_backup_duration_seconds`                     | Histogram | `database`                             | Backup run duration in seconds (buckets: 1s to 3600s) |
-| `mongodb_backup_size_bytes`                           | Gauge     | `database`                             | Byte size of the most recently generated archive      |
-| `mongodb_backup_last_success_timestamp_seconds`       | Gauge     | `database`                             | Unix timestamp of the most recent successful backup   |
-| `mongodb_backup_drill_runs_total`                     | Counter   | `status` (success/failure)             | Total count of automated restore drill runs           |
-| `mongodb_backup_drill_last_success_timestamp_seconds` | Gauge     | None                                   | Unix timestamp of the most recent successful drill    |
+| Metric Name                                           | Type      | Labels                                 | Description                                                                    |
+| :---------------------------------------------------- | :-------- | :------------------------------------- | :----------------------------------------------------------------------------- |
+| `mongodb_backup_runs_total`                           | Counter   | `status` (success/failure), `database` | Total count of backup executions                                               |
+| `mongodb_backup_duration_seconds`                     | Histogram | `database`                             | Backup run duration in seconds (buckets: 1s to 3600s)                          |
+| `mongodb_backup_size_bytes`                           | Gauge     | `database`                             | Byte size of the most recently generated archive                               |
+| `mongodb_backup_last_success_timestamp_seconds`       | Gauge     | `database`                             | Unix timestamp of the most recent successful backup                            |
+| `mongodb_backup_drill_runs_total`                     | Counter   | `status` (success/failure)             | Total count of automated restore drill runs                                    |
+| `mongodb_backup_drill_last_success_timestamp_seconds` | Gauge     | None                                   | Unix timestamp of the most recent successful drill                             |
+| `mongodb_backup_pitr_slices_total`                    | Counter   | `status` (success/failure)             | Total PITR oplog slice capture executions                                      |
+| `mongodb_backup_pitr_slice_entries_total`             | Counter   | None                                   | Total oplog entries archived into PITR slices                                  |
+| `mongodb_backup_pitr_slice_bytes_total`               | Counter   | None                                   | Total compressed/encrypted bytes uploaded for PITR slices                      |
+| `mongodb_backup_pitr_last_slice_timestamp_seconds`    | Gauge     | None                                   | Oplog Unix timestamp covered by the most recent archived PITR slice            |
+| `mongodb_backup_pitr_lag_seconds`                     | Gauge     | None                                   | Current PITR archive lag in seconds relative to wall clock                     |
+| `mongodb_backup_pitr_gap_detected`                    | Gauge     | None                                   | `1` when an oplog rollover/timeline gap has been detected, `0` when continuous |
+
+Ready-to-use Prometheus Alertmanager rules covering missed backups, PITR lag, oplog rollover gaps, and failed restore drills are included in [`ops/prometheus-alerts.yml`](ops/prometheus-alerts.yml).
+
+#### Production Hardening Checklist (Self-Hosted Operational Responsibility)
+
+MongoVault is a self-hosted backup engine, not a managed DBaaS service. Before relying on it for production recovery:
+
+1. **Enforce client-side encryption:** Set `ENCRYPTION_KEY` and `REQUIRE_ENCRYPTION=true` so backups, PITR slices, and manifests fail closed if a key is missing. Store keys in a separate secret manager/KMS outside the backup bucket.
+2. **Isolate & lock S3 storage:** Store backups in a dedicated AWS account with S3 Versioning and Object Lock (`S3_OBJECT_LOCK_ENABLED=true`).
+3. **Size your MongoDB oplog window:** Ensure `local.oplog.rs` retains enough hours to survive worst-case archiver or network outages (`mongovault check` inspects oplog retention span and fill ratio).
+4. **Wire alerting:** Load [`ops/prometheus-alerts.yml`](ops/prometheus-alerts.yml) into Prometheus/Alertmanager and configure SMTP notifications (`SMTP_HOST`) so failed uploads and oplog rollover gaps page immediately.
+5. **Restore into staging first:** Destructive `--drop` restores pre-verify all base archives, sharded child archives, and planned PITR slices before dropping collections, but multi-stage restores are still non-atomic if interrupted mid-flight. Always prefer restoring into an isolated staging cluster, validating, and cutting over.
+6. **Engine scope:** Use the **Logical** engine for MongoDB Atlas or any managed MongoDB without host filesystem access; use the **Physical** engine only on self-hosted clusters with local WiredTiger `dbPath` access.
 
 ---
 

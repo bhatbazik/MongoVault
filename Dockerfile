@@ -1,7 +1,7 @@
 # -----------------------------------------------------------------------------
 # Stage 1: Build TypeScript artifacts
 # -----------------------------------------------------------------------------
-FROM node:22-bookworm-slim AS builder
+FROM node:26-bookworm-slim AS builder
 
 WORKDIR /app
 
@@ -15,7 +15,7 @@ RUN npm run build
 # -----------------------------------------------------------------------------
 # Stage 2: Production runtime image
 # -----------------------------------------------------------------------------
-FROM node:22-bookworm-slim AS runner
+FROM node:26-bookworm-slim AS runner
 
 ENV NODE_ENV=production
 
@@ -24,8 +24,8 @@ RUN apt-get update \
     ca-certificates \
     curl \
     gnupg \
-  && curl -fsSL https://www.mongodb.org/static/pgp/server-7.0.asc | gpg --dearmor -o /usr/share/keyrings/mongodb-server-7.0.gpg \
-  && echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/debian bookworm/mongodb-org/7.0 main" > /etc/apt/sources.list.d/mongodb-org-7.0.list \
+  && curl -fsSL https://pgp.mongodb.com/server-9.asc | gpg --dearmor -o /usr/share/keyrings/mongodb-server-9.gpg \
+  && echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-9.gpg ] https://repo.mongodb.org/apt/debian bookworm/mongodb-org/9.0 main" > /etc/apt/sources.list.d/mongodb-org-9.0.list \
   && apt-get update \
   && apt-get install -y --no-install-recommends mongodb-database-tools \
   && apt-get purge -y --auto-remove curl gnupg \

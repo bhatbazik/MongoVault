@@ -103,7 +103,7 @@ function assertChecksum(key: string, expected: string | null, actual: string): v
   }
 }
 
-async function verifyGzipArchiveObject(
+export async function verifyArchiveObject(
   ctx: RestoreContext,
   key: string,
 ): Promise<VerifyBackupResult> {
@@ -236,7 +236,7 @@ async function verifyShardedClusterBackup(
     "Verifying sharded cluster child archives and bridging slices",
   );
   for (const childKey of keysToVerify) {
-    await verifyGzipArchiveObject(ctx, childKey);
+    await verifyArchiveObject(ctx, childKey);
   }
 
   logger.info(
@@ -476,6 +476,18 @@ export async function restorePointInTime(
   );
 
   const replayedBaseOplog = Boolean(plan.baseManifest?.oplog) && !hasNamespaceFilter;
+
+  // Pre-verify ALL planned PITR oplog slices BEFORE Stage 1 executes any destructive --drop
+  // so a corrupted, missing, or undecryptable slice never leaves the target database torn.
+  if (preVerify && plan.slices.length > 0 && typeof storage.download === "function") {
+    logger.info(
+      { slicesCount: plan.slices.length, drop },
+      "Pre-verifying all planned PITR oplog slices before base restore",
+    );
+    for (const slice of plan.slices) {
+      await verifyArchiveObject(ctx, slice.key);
+    }
+  }
 
   // Stage 1: Restore base backup
   const baseResult = await restoreBackup(ctx, {

@@ -29,6 +29,7 @@ import {
   streamOplogSlice,
 } from "./oplog.js";
 import { runStreamPipeline } from "./stream.js";
+import { verifyArchiveObject } from "./restore.js";
 import {
   createTarHeader,
   createTarPackStream,
@@ -336,6 +337,11 @@ export async function runPhysicalBackup({
 }: PhysicalBackupOptions): Promise<PhysicalBackupResult> {
   const startedAt = new Date();
   const encrypted = Boolean(config.encryptionKey);
+  if (config.requireEncryption && !encrypted) {
+    throw new Error(
+      "Refusing to create unencrypted physical backup: REQUIRE_ENCRYPTION is enabled but ENCRYPTION_KEY is not configured",
+    );
+  }
   const scope = scopeOf(config);
   const key = archiveKey(scope, startedAt, { encrypted }).replace(
     /\.archive\.gz(\.enc)?$/,
@@ -344,6 +350,11 @@ export async function runPhysicalBackup({
   const log = logger.child({ key, engine: "physical" });
   const controller = linkedController(signal);
 
+  if (!encrypted) {
+    log.warn(
+      "ENCRYPTION_KEY is not configured; physical backup archive and manifest will be stored unencrypted and unsigned",
+    );
+  }
   log.info({ uri: config.mongo.uri }, "Initiating physical hot backup");
 
   const client = createMongoClient(config.mongo.uri);
@@ -1216,6 +1227,17 @@ export async function restorePhysicalBackup({
   } else if (manifestData?.encryption) {
     if (keyRing.length === 0) {
       throw new Error(`Physical backup ${backupKey} is encrypted, but ENCRYPTION_KEY is not set`);
+    }
+  }
+
+  // Pre-verify all planned PITR oplog slices BEFORE extracting or modifying targetDbPath
+  if (pitrPlan && pitrPlan.slices.length > 0 && typeof storage.download === "function") {
+    log.info(
+      { slicesCount: pitrPlan.slices.length },
+      "Pre-verifying all planned physical PITR oplog slices before extraction",
+    );
+    for (const slice of pitrPlan.slices) {
+      await verifyArchiveObject({ config, storage, logger: log, signal }, slice.key);
     }
   }
 

@@ -1,0 +1,65 @@
+groups:
+  - name: mongovault-backup-and-pitr
+    rules:
+      - alert: MongoVaultBackupFailed
+        expr: increase(mongodb_backup_runs_total{status="failure"}[15m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MongoVault backup failed for {{ $labels.database }}"
+          description: "At least one scheduled MongoVault backup run failed in the last 15 minutes."
+
+      - alert: MongoVaultBackupOverdue
+        expr: (time() - mongodb_backup_last_success_timestamp_seconds) > 93600
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MongoVault backup overdue for {{ $labels.database }}"
+          description: "No successful backup has completed in over 26 hours."
+
+      - alert: MongoVaultPitrGapDetected
+        expr: mongodb_backup_pitr_gap_detected == 1
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MongoVault PITR oplog timeline gap detected"
+          description: "MongoDB local.oplog.rs rolled over before the PITR archiver captured all entries. Take a fresh base backup immediately to re-anchor continuous PITR coverage."
+
+      - alert: MongoVaultPitrLagHigh
+        expr: mongodb_backup_pitr_lag_seconds > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MongoVault PITR archive lag exceeds 5 minutes"
+          description: "PITR oplog archive lag is {{ $value | humanizeDuration }}. Verify archiver health, storage connectivity, and MongoDB oplog retention sizing."
+
+      - alert: MongoVaultPitrSliceFailures
+        expr: increase(mongodb_backup_pitr_slices_total{status="failure"}[15m]) >= 3
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MongoVault PITR slice uploads failing repeatedly"
+          description: "Three or more PITR slice uploads failed within 15 minutes. Prolonged outages risk oplog rollover."
+
+      - alert: MongoVaultRestoreDrillFailed
+        expr: increase(mongodb_backup_drill_runs_total{status="failure"}[1h]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MongoVault automated restore drill failed"
+          description: "The scheduled restore drill failed verification (counts, schema/indexes/validators/views, or read/write probe)."
+
+      - alert: MongoVaultRestoreDrillOverdue
+        expr: (time() - mongodb_backup_drill_last_success_timestamp_seconds) > 691200
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "MongoVault restore drill overdue (>8 days)"
+          description: "No automated restore drill has succeeded in over 8 days."

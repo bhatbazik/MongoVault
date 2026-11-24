@@ -85,6 +85,7 @@ const schema = z
 
     ENCRYPTION_KEY: z.string().optional(),
     ENCRYPTION_KEY_RING: z.string().optional(),
+    REQUIRE_ENCRYPTION: flag(false),
 
     PITR_ENABLED: flag(false),
     PITR_FLUSH_INTERVAL_SECONDS: z.coerce.number().int().min(5).max(3600).default(60),
@@ -124,6 +125,13 @@ const schema = z
         code: "custom",
         path: ["DRILL_CRON"],
         message: "DRILL_MONGODB_URI is required when DRILL_CRON is set",
+      });
+    }
+    if (env.REQUIRE_ENCRYPTION && !env.ENCRYPTION_KEY) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["ENCRYPTION_KEY"],
+        message: "ENCRYPTION_KEY is required when REQUIRE_ENCRYPTION is enabled",
       });
     }
     if (env.ENCRYPTION_KEY) {
@@ -289,6 +297,7 @@ function toConfig(env: z.infer<typeof schema>): AppConfig {
       ...(env.ENCRYPTION_KEY ? [parseKey(env.ENCRYPTION_KEY)] : []),
       ...(env.ENCRYPTION_KEY_RING ? parseKeyRing(env.ENCRYPTION_KEY_RING) : []),
     ]),
+    requireEncryption: env.REQUIRE_ENCRYPTION,
     retention: retentionEnabled ? retention : null,
     drill: env.DRILL_MONGODB_URI
       ? { uri: env.DRILL_MONGODB_URI, cron: env.DRILL_CRON ?? null }

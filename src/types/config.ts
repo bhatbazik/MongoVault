@@ -93,6 +93,7 @@ export interface AppConfig {
   workDir: string;
   encryptionKey: Buffer | null;
   encryptionKeyRing: Buffer[];
+  requireEncryption?: boolean;
   retention: RetentionPolicy | null;
   drill: DrillConfig | null;
   physical?: PhysicalConfig | null;
