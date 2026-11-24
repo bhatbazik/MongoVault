@@ -189,7 +189,7 @@ export function createScheduler({
       }
 
       if (config.pitr?.enabled) {
-        oplogArchiver = startOplogArchiver({ config, storage, logger, notifier });
+        oplogArchiver = startOplogArchiver({ config, storage, logger, notifier, metrics });
         oplogArchiver.start();
       }
 

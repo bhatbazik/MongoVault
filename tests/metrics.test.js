@@ -18,6 +18,9 @@ describe("Metrics Registry & HTTP Health/Metrics Server", () => {
     metrics.recordBackupFailure("appdb");
     metrics.recordDrillSuccess();
     metrics.recordDrillFailure();
+    metrics.recordPitrSliceSuccess(42, 8192, Math.floor(Date.now() / 1000) - 5, false);
+    metrics.recordPitrSliceFailure(true);
+    metrics.recordPitrCoverage(Math.floor(Date.now() / 1000), false);
 
     const output = await metrics.getMetrics();
     expect(metrics.contentType).toContain("text/plain");
@@ -26,6 +29,12 @@ describe("Metrics Registry & HTTP Health/Metrics Server", () => {
     expect(output).toContain('mongodb_backup_size_bytes{database="appdb"} 1048576');
     expect(output).toContain('mongodb_backup_drill_runs_total{status="success"} 1');
     expect(output).toContain('mongodb_backup_drill_runs_total{status="failure"} 1');
+    expect(output).toContain('mongodb_backup_pitr_slices_total{status="success"} 1');
+    expect(output).toContain('mongodb_backup_pitr_slices_total{status="failure"} 1');
+    expect(output).toContain("mongodb_backup_pitr_slice_entries_total 42");
+    expect(output).toContain("mongodb_backup_pitr_slice_bytes_total 8192");
+    expect(output).toContain("mongodb_backup_pitr_gap_detected 0");
+    expect(output).toContain("mongodb_backup_pitr_lag_seconds");
   });
 
   it("returns null when port is 0 or falsy", () => {

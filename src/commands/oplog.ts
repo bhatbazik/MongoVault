@@ -67,8 +67,8 @@ export class OplogSliceCommand implements CommandHandler {
 
 export class OplogTailCommand implements CommandHandler {
   async execute(ctx: CliCommandContext): Promise<void> {
-    const { config, storage, logger, notifier } = ctx;
-    const archiver = startOplogArchiver({ config, storage, logger, notifier });
+    const { config, storage, logger, notifier, metrics } = ctx;
+    const archiver = startOplogArchiver({ config, storage, logger, notifier, metrics });
     archiver.start();
     const shutdown = async (signal: string) => {
       logger.info({ signal }, "Stopping continuous oplog archiver...");

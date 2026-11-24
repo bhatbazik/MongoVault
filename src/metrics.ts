@@ -48,6 +48,43 @@ export function createMetricsRegistry(): MetricsRegistry {
     registers: [register],
   });
 
+  const pitrSlicesTotal = new client.Counter({
+    name: "mongodb_backup_pitr_slices_total",
+    help: "Total count of PITR oplog slice capture executions",
+    labelNames: ["status"],
+    registers: [register],
+  });
+
+  const pitrSliceEntriesTotal = new client.Counter({
+    name: "mongodb_backup_pitr_slice_entries_total",
+    help: "Total number of oplog entries archived into PITR slices",
+    registers: [register],
+  });
+
+  const pitrSliceBytesTotal = new client.Counter({
+    name: "mongodb_backup_pitr_slice_bytes_total",
+    help: "Total compressed/encrypted bytes uploaded for PITR slices",
+    registers: [register],
+  });
+
+  const pitrLastSliceTimestamp = new client.Gauge({
+    name: "mongodb_backup_pitr_last_slice_timestamp_seconds",
+    help: "Oplog Unix timestamp in seconds covered by the most recent archived PITR slice",
+    registers: [register],
+  });
+
+  const pitrLagSeconds = new client.Gauge({
+    name: "mongodb_backup_pitr_lag_seconds",
+    help: "Current PITR archive lag in seconds relative to wall clock",
+    registers: [register],
+  });
+
+  const pitrGapDetected = new client.Gauge({
+    name: "mongodb_backup_pitr_gap_detected",
+    help: "Whether a PITR oplog timeline gap has been detected (1 = gap, 0 = continuous)",
+    registers: [register],
+  });
+
   return {
     recordBackupSuccess(database: string, sizeBytes: number, durationMs: number): void {
       backupRunsTotal.inc({ status: "success", database });
@@ -67,6 +104,33 @@ export function createMetricsRegistry(): MetricsRegistry {
 
     recordDrillFailure(): void {
       drillRunsTotal.inc({ status: "failure" });
+    },
+
+    recordPitrSliceSuccess(
+      entries: number,
+      sizeBytes: number,
+      endEpochSeconds: number,
+      gapDetected = false,
+    ): void {
+      pitrSlicesTotal.inc({ status: "success" });
+      if (entries > 0) pitrSliceEntriesTotal.inc(entries);
+      if (sizeBytes > 0) pitrSliceBytesTotal.inc(sizeBytes);
+      pitrLastSliceTimestamp.set(endEpochSeconds);
+      pitrLagSeconds.set(Math.max(0, Math.floor(Date.now() / 1000) - endEpochSeconds));
+      pitrGapDetected.set(gapDetected ? 1 : 0);
+    },
+
+    recordPitrSliceFailure(gapDetected = false): void {
+      pitrSlicesTotal.inc({ status: "failure" });
+      if (gapDetected) {
+        pitrGapDetected.set(1);
+      }
+    },
+
+    recordPitrCoverage(coverageEndEpochSeconds: number, gapDetected = false): void {
+      pitrLastSliceTimestamp.set(coverageEndEpochSeconds);
+      pitrLagSeconds.set(Math.max(0, Math.floor(Date.now() / 1000) - coverageEndEpochSeconds));
+      pitrGapDetected.set(gapDetected ? 1 : 0);
     },
 
     async getMetrics(): Promise<string> {

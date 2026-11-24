@@ -16,6 +16,14 @@ export interface MetricsRegistry {
   recordBackupFailure: (database: string) => void;
   recordDrillSuccess: () => void;
   recordDrillFailure: () => void;
+  recordPitrSliceSuccess?: (
+    entries: number,
+    sizeBytes: number,
+    endEpochSeconds: number,
+    gapDetected?: boolean,
+  ) => void;
+  recordPitrSliceFailure?: (gapDetected?: boolean) => void;
+  recordPitrCoverage?: (coverageEndEpochSeconds: number, gapDetected?: boolean) => void;
   getMetrics: () => Promise<string>;
   contentType: string;
 }
