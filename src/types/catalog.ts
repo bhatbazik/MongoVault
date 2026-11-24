@@ -82,6 +82,42 @@ export interface ManifestSignature {
   hmac: string;
 }
 
+export interface SchemaIndexSpec {
+  name: string;
+  key: Record<string, unknown>;
+  unique?: boolean;
+  sparse?: boolean;
+  expireAfterSeconds?: number;
+  partialFilterExpression?: Record<string, unknown>;
+  hidden?: boolean;
+}
+
+export interface SchemaCollectionOptions {
+  validator?: Record<string, unknown>;
+  validationLevel?: string;
+  validationAction?: string;
+  capped?: boolean;
+  size?: number;
+  max?: number;
+  timeseries?: Record<string, unknown>;
+}
+
+export interface SchemaCollectionMeta {
+  indexes: SchemaIndexSpec[];
+  options?: SchemaCollectionOptions;
+}
+
+export interface SchemaViewMeta {
+  name: string;
+  viewOn: string;
+  pipeline: Record<string, unknown>[];
+}
+
+export interface BackupSchemaMetadata {
+  collections: Record<string, SchemaCollectionMeta>;
+  views: SchemaViewMeta[];
+}
+
 export interface BackupManifest {
   version: number;
   type?: string;
@@ -100,6 +136,7 @@ export interface BackupManifest {
   oplogWindow?: ManifestOplogWindow | null;
   excludedCollections: string[];
   collections: Record<string, number>;
+  schema?: BackupSchemaMetadata;
   physical?: PhysicalBackupMeta;
   sharding?: ShardedClusterMeta;
   objectLock?: {

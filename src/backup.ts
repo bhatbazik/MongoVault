@@ -8,8 +8,142 @@ import { formatOplogTimestamp, getOplogBounds } from "./oplog.js";
 import { runStreamPipeline } from "./stream.js";
 import { isClusterDatabase, mongodump } from "./tools.js";
 import type { BackupContext } from "./types/backup.js";
-import type { BackupManifest } from "./types/catalog.js";
+import type {
+  BackupManifest,
+  BackupSchemaMetadata,
+  SchemaCollectionMeta,
+  SchemaCollectionOptions,
+  SchemaIndexSpec,
+  SchemaViewMeta,
+} from "./types/catalog.js";
 import type { BackupTools } from "./types/tools.js";
+
+const SYSTEM_DBS_FOR_SCHEMA = new Set(["admin", "local", "config"]);
+
+function normalizeIndexSpec(raw: Record<string, unknown>): SchemaIndexSpec | null {
+  if (typeof raw.name !== "string" || !raw.key || typeof raw.key !== "object") {
+    return null;
+  }
+  const spec: SchemaIndexSpec = {
+    name: raw.name,
+    key: raw.key as Record<string, unknown>,
+  };
+  if (raw.unique === true) spec.unique = true;
+  if (raw.sparse === true) spec.sparse = true;
+  if (typeof raw.expireAfterSeconds === "number") {
+    spec.expireAfterSeconds = raw.expireAfterSeconds;
+  }
+  if (raw.partialFilterExpression && typeof raw.partialFilterExpression === "object") {
+    spec.partialFilterExpression = raw.partialFilterExpression as Record<string, unknown>;
+  }
+  if (raw.hidden === true) spec.hidden = true;
+  return spec;
+}
+
+function extractCollectionOptions(
+  rawOptions?: Record<string, unknown>,
+): SchemaCollectionOptions | undefined {
+  if (!rawOptions || typeof rawOptions !== "object") return undefined;
+  const out: SchemaCollectionOptions = {};
+  if (rawOptions.validator && typeof rawOptions.validator === "object") {
+    out.validator = rawOptions.validator as Record<string, unknown>;
+  }
+  if (typeof rawOptions.validationLevel === "string") {
+    out.validationLevel = rawOptions.validationLevel;
+  }
+  if (typeof rawOptions.validationAction === "string") {
+    out.validationAction = rawOptions.validationAction;
+  }
+  if (rawOptions.capped === true) out.capped = true;
+  if (typeof rawOptions.size === "number") out.size = rawOptions.size;
+  if (typeof rawOptions.max === "number") out.max = rawOptions.max;
+  if (rawOptions.timeseries && typeof rawOptions.timeseries === "object") {
+    out.timeseries = rawOptions.timeseries as Record<string, unknown>;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/**
+ * Lightweight pre-backup capture of database schema metadata (indexes, validators,
+ * collection options, and views) so automated restore drills can verify full structural
+ * fidelity beyond document counts. Non-fatal if metadata queries are unavailable.
+ */
+async function collectSchemaMetadata(
+  uri: string,
+  database: string,
+  excludeCollections: string[] = [],
+): Promise<BackupSchemaMetadata | undefined> {
+  const client = new MongoClient(uri, { serverSelectionTimeoutMS: 5_000 });
+  const isCluster = isClusterDatabase(database);
+  const excludedSet = new Set(excludeCollections);
+
+  try {
+    await client.connect();
+    let dbNames: string[];
+    if (isCluster) {
+      const res = (await client.db("admin").command({ listDatabases: 1, nameOnly: true })) as {
+        databases?: Array<{ name?: string }>;
+      };
+      dbNames = (res.databases ?? [])
+        .map((d) => d.name)
+        .filter((n): n is string => Boolean(n) && !SYSTEM_DBS_FOR_SCHEMA.has(n!));
+    } else {
+      dbNames = [database];
+    }
+
+    const collections: Record<string, SchemaCollectionMeta> = {};
+    const views: SchemaViewMeta[] = [];
+
+    for (const dbName of dbNames) {
+      const db = client.db(dbName);
+      const infos = await db.listCollections({}, { nameOnly: false }).toArray();
+      for (const info of infos) {
+        const collName = info.name;
+        if (!collName || collName.startsWith("system.")) continue;
+        if (!isCluster && excludedSet.has(collName)) continue;
+
+        const key = isCluster ? `${dbName}.${collName}` : collName;
+        if (info.type === "view") {
+          const opts = (
+            info as { options?: { viewOn?: string; pipeline?: Record<string, unknown>[] } }
+          ).options;
+          if (opts?.viewOn) {
+            views.push({
+              name: key,
+              viewOn: opts.viewOn,
+              pipeline: Array.isArray(opts.pipeline) ? opts.pipeline : [],
+            });
+          }
+          continue;
+        }
+
+        const rawIndexes = await db
+          .collection(collName)
+          .indexes()
+          .catch(() => [] as Record<string, unknown>[]);
+        const indexes = rawIndexes
+          .map((idx) => normalizeIndexSpec(idx as Record<string, unknown>))
+          .filter((idx): idx is SchemaIndexSpec => idx !== null);
+        const options = extractCollectionOptions(
+          (info as { options?: Record<string, unknown> }).options,
+        );
+        collections[key] = {
+          indexes,
+          ...(options ? { options } : {}),
+        };
+      }
+    }
+
+    if (Object.keys(collections).length === 0 && views.length === 0) {
+      return undefined;
+    }
+    return { collections, views };
+  } catch {
+    return undefined;
+  } finally {
+    await client.close().catch(() => {});
+  }
+}
 
 /**
  * Lightweight pre-backup estimate of database size (non-fatal) so S3 multipart
@@ -71,7 +205,7 @@ export async function runBackup({
 
   try {
     const requireOplogBounds = Boolean(config.pitr?.enabled);
-    const [preOplog, expectedSizeBytes] = await Promise.all([
+    const [preOplog, expectedSizeBytes, schemaMetadata] = await Promise.all([
       config.mongo.oplog && effectiveTools.getOplogBounds
         ? effectiveTools.getOplogBounds(config.mongo.uri, { phase: "pre" }).catch((err) => {
             if (requireOplogBounds) {
@@ -85,6 +219,13 @@ export async function runBackup({
         : Promise.resolve(null),
       !tools
         ? estimateDatabaseSizeBytes(config.mongo.uri, config.mongo.database)
+        : Promise.resolve(undefined),
+      !tools
+        ? collectSchemaMetadata(
+            config.mongo.uri,
+            config.mongo.database,
+            config.mongo.excludeCollections,
+          )
         : Promise.resolve(undefined),
     ]);
 
@@ -209,6 +350,7 @@ export async function runBackup({
       oplog: Boolean(config.mongo.oplog),
       ...(oplogWindow ? { oplogWindow } : {}),
       collections,
+      ...(schemaMetadata ? { schema: schemaMetadata } : {}),
     };
 
     await writeManifest(storage, manifest, config.encryptionKey);

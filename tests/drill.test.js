@@ -255,4 +255,225 @@ describe("restore drill", () => {
       }),
     ).rejects.toThrow(/Safety violation: DRILL_MONGODB_URI resolves to the same MongoDB cluster/);
   });
+
+  it("rejects catastrophic oplog count drops (e.g. 1 of 1000 docs) and enforces oplogWindow.entries bound", async () => {
+    const rawGzip = gzipSync(Buffer.from("dummy-drill-archive"));
+    const tools = {
+      mongodump: async () => ({
+        stdout: Readable.from(rawGzip),
+        done: Promise.resolve({
+          collections: { "app.users": 1000 },
+          oplogStartTs: { t: 100, i: 1 },
+          oplogEndTs: { t: 105, i: 1 },
+          oplogEntries: 5,
+        }),
+      }),
+      mongorestore: async () => ({
+        stdin: new PassThrough().on("data", () => {}),
+        done: Promise.resolve({ restored: 1000, failed: 0 }),
+      }),
+    };
+    const config = {
+      mongo: { uri: "mongodb://prod:27017", database: "*", excludeCollections: [], oplog: true },
+      drill: { uri: "mongodb://staging:27017" },
+      storage: { prefix: "backups" },
+      workDir: tmpDir,
+      timeoutMs: 5000,
+      encryptionKey: null,
+      schedule: { timezone: "UTC" },
+    };
+
+    await runBackup({ config, storage: mockStorage, logger, tools });
+
+    // Restoring 1 doc (or 900 docs) when only 5 oplog entries existed MUST fail!
+    const brokenClient = {
+      async connect() {},
+      async close() {},
+      db() {
+        return {
+          async dropDatabase() {},
+          listCollections() {
+            return {
+              async toArray() {
+                return [{ name: "users" }];
+              },
+            };
+          },
+          collection() {
+            return {
+              async countDocuments() {
+                return 1;
+              },
+            };
+          },
+        };
+      },
+    };
+
+    await expect(
+      runDrill({
+        config,
+        storage: mockStorage,
+        logger,
+        tools,
+        createMongoClient: () => brokenClient,
+      }),
+    ).rejects.toThrow(/app\.users: expected 1000, restored 1/);
+  });
+
+  it("verifies indexes, validators, views, and read/write probe from manifest.schema and fails on mismatches", async () => {
+    const tools = createMockTools({ users: 10 });
+    const config = {
+      mongo: { uri: "mongodb://prod:27017", database: "app", excludeCollections: [] },
+      drill: { uri: "mongodb://staging:27017" },
+      storage: { prefix: "backups" },
+      workDir: tmpDir,
+      timeoutMs: 5000,
+      encryptionKey: null,
+      schedule: { timezone: "UTC" },
+    };
+
+    const manifest = await runBackup({ config, storage: mockStorage, logger, tools });
+    // Attach recorded schema metadata (indexes + TTL + validator + view) to manifest
+    const mKey = `${manifest.key}.manifest.json`;
+    const stored = await mockStorage.getJson(mKey);
+    stored.schema = {
+      collections: {
+        users: {
+          indexes: [
+            { name: "_id_", key: { _id: 1 } },
+            { name: "email_unique", key: { email: 1 }, unique: true },
+            { name: "ttl_idx", key: { createdAt: 1 }, expireAfterSeconds: 3600 },
+          ],
+          options: {
+            validator: { $jsonSchema: { bsonType: "object", required: ["email"] } },
+            validationLevel: "strict",
+            validationAction: "error",
+          },
+        },
+      },
+      views: [{ name: "active_users", viewOn: "users", pipeline: [{ $match: { active: true } }] }],
+    };
+    await mockStorage.putJson(mKey, stored);
+
+    // 1. Missing unique index & mismatched validator -> must fail DrillError
+    const missingIdxClient = {
+      async connect() {},
+      async close() {},
+      db() {
+        return {
+          async dropDatabase() {},
+          listCollections() {
+            return {
+              async toArray() {
+                return [
+                  { name: "users", type: "collection", options: {} },
+                  {
+                    name: "active_users",
+                    type: "view",
+                    options: { viewOn: "users", pipeline: [{ $match: { active: true } }] },
+                  },
+                ];
+              },
+            };
+          },
+          collection(name) {
+            return {
+              async countDocuments() {
+                return name === "users" ? 10 : 0;
+              },
+              async indexes() {
+                return [{ name: "_id_", key: { _id: 1 } }];
+              },
+              async findOne() {
+                return { _id: 1 };
+              },
+            };
+          },
+        };
+      },
+    };
+
+    await expect(
+      runDrill({
+        config,
+        storage: mockStorage,
+        logger,
+        tools,
+        createMongoClient: () => missingIdxClient,
+      }),
+    ).rejects.toThrow(/email_unique.*missing/);
+
+    // 2. Full matching schema + working read/write probe -> passes with full verification counts
+    const probeDocs = new Map();
+    const healthyClient = {
+      async connect() {},
+      async close() {},
+      db(dbName) {
+        return {
+          databaseName: dbName,
+          async dropDatabase() {},
+          listCollections() {
+            return {
+              async toArray() {
+                return [
+                  {
+                    name: "users",
+                    type: "collection",
+                    options: {
+                      validator: { $jsonSchema: { required: ["email"], bsonType: "object" } },
+                      validationLevel: "strict",
+                      validationAction: "error",
+                    },
+                  },
+                  {
+                    name: "active_users",
+                    type: "view",
+                    options: { viewOn: "users", pipeline: [{ $match: { active: true } }] },
+                  },
+                ];
+              },
+            };
+          },
+          collection(name) {
+            return {
+              async countDocuments() {
+                return name === "users" ? 10 : 0;
+              },
+              async indexes() {
+                return [
+                  { name: "_id_", key: { _id: 1 } },
+                  { name: "email_unique", key: { email: 1 }, unique: true },
+                  { name: "ttl_idx", key: { createdAt: 1 }, expireAfterSeconds: 3600 },
+                ];
+              },
+              async insertOne(doc) {
+                probeDocs.set(doc._id, doc);
+              },
+              async findOne(q) {
+                if (q && q._id !== undefined) return probeDocs.get(q._id) ?? null;
+                return { _id: "u1", email: "a@b.com" };
+              },
+              async deleteOne(q) {
+                probeDocs.delete(q._id);
+              },
+              async drop() {},
+            };
+          },
+        };
+      },
+    };
+
+    const res = await runDrill({
+      config,
+      storage: mockStorage,
+      logger,
+      tools,
+      createMongoClient: () => healthyClient,
+    });
+    expect(res.indexesVerified).toBe(3);
+    expect(res.validatorsVerified).toBe(1);
+    expect(res.viewsVerified).toBe(1);
+    expect(res.readWriteVerified).toBe(true);
+  });
 });
