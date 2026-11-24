@@ -494,6 +494,7 @@ export async function restorePointInTime(
   // Stage 2: Replay continuous oplog slices up to plan.targetTs
   const controller = linkedController(signal);
   let replayedEntries = 0;
+  let oplogStats: RestoreResult["oplogStats"];
 
   try {
     if (tools?.replayOplogFile) {
@@ -585,7 +586,20 @@ export async function restorePointInTime(
           );
         }
         await applier.buildPendingIndexes();
-        replayedEntries = applier.getStats().appliedEntries;
+        applier.assertComplete();
+        oplogStats = applier.getStats();
+        replayedEntries = oplogStats.appliedEntries;
+        logger.info(
+          {
+            appliedEntries: oplogStats.appliedEntries,
+            skippedEntries: oplogStats.skippedEntries,
+            skipBreakdown: oplogStats.skipBreakdown,
+            indexesBuilt: oplogStats.indexesBuilt,
+            uncommittedTxns: oplogStats.uncommittedTxns,
+            partialTxns: oplogStats.partialTxns,
+          },
+          "Completed PITR oplog replay",
+        );
       } finally {
         await applier.dispose();
         await client.close().catch(() => {});
@@ -597,6 +611,7 @@ export async function restorePointInTime(
       pitrTarget: targetLimit,
       replayedSlices: plan.slices.length,
       replayedEntries,
+      ...(oplogStats ? { oplogStats } : {}),
     };
   } finally {
     controller.dispose();

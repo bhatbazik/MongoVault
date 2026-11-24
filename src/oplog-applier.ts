@@ -6,10 +6,18 @@ import { BSON, Binary, type MongoClient } from "mongodb";
 import { readBsonDocumentsFromStream } from "./archive-stream.js";
 import { isClusterScope } from "./catalog.js";
 import type { Logger } from "./types/logger.js";
-import type { OplogTimestamp } from "./types/oplog.js";
+import type { OplogApplierStats, OplogSkipBreakdown, OplogTimestamp } from "./types/oplog.js";
+
+export type { OplogApplierStats, OplogSkipBreakdown };
 
 const TXN_SPILL_THRESHOLD_BYTES = 8 * 1024 * 1024; // 8 MiB per-txn RAM cap before spilling to disk
-const MAX_COMMIT_HISTORY = 100;
+
+export class OplogReplayError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "OplogReplayError";
+  }
+}
 
 /**
  * Config collections allowed during oplog replay (`configCollToKeep` + `settings`).
@@ -44,6 +52,13 @@ const DONT_PRESERVE_UUID_EXACT = new Set([
   "config.chunks",
 ]);
 
+const IGNORED_SAFE_OPLOG_COMMANDS = new Set([
+  "setIndexCommitQuorum",
+  "migrateCloneStart",
+  "migrateCloneComplete",
+  "noop",
+]);
+
 const KNOWN_OPLOG_COMMANDS = new Set([
   "renameCollection",
   "dropDatabase",
@@ -62,6 +77,11 @@ const KNOWN_OPLOG_COMMANDS = new Set([
   "startIndexBuild",
   "abortIndexBuild",
   "commitIndexBuild",
+  "refineCollectionShardKey",
+  "reshardCollection",
+  "createSearchIndex",
+  "updateSearchIndex",
+  "dropSearchIndex",
 ]);
 
 const TARGET_COLL_COMMANDS = new Set([
@@ -114,13 +134,49 @@ export interface CommittedDistTxn {
   commitTs: OplogTimestamp | null;
 }
 
-export interface OplogApplierStats {
-  appliedEntries: number;
-  skippedEntries: number;
-  indexesBuilt: number;
-  lastAppliedTs: OplogTimestamp | null;
-  uncommittedTxns: number;
-  partialTxns: number;
+export function createEmptyOplogStats(): OplogApplierStats {
+  return {
+    appliedEntries: 0,
+    skippedEntries: 0,
+    skipBreakdown: {
+      beforeWindow: 0,
+      noop: 0,
+      filtered: 0,
+      indexLifecycle: 0,
+      benignReplayRace: 0,
+      unrecognized: 0,
+    },
+    indexesBuilt: 0,
+    lastAppliedTs: null,
+    uncommittedTxns: 0,
+    partialTxns: 0,
+    unknownCommands: [],
+  };
+}
+
+export function mergeOplogStats(statsList: OplogApplierStats[]): OplogApplierStats {
+  const merged = createEmptyOplogStats();
+  for (const s of statsList) {
+    merged.appliedEntries += s.appliedEntries;
+    merged.skippedEntries += s.skippedEntries;
+    merged.skipBreakdown.beforeWindow += s.skipBreakdown.beforeWindow;
+    merged.skipBreakdown.noop += s.skipBreakdown.noop;
+    merged.skipBreakdown.filtered += s.skipBreakdown.filtered;
+    merged.skipBreakdown.indexLifecycle += s.skipBreakdown.indexLifecycle;
+    merged.skipBreakdown.benignReplayRace += s.skipBreakdown.benignReplayRace;
+    merged.skipBreakdown.unrecognized += s.skipBreakdown.unrecognized;
+    merged.indexesBuilt += s.indexesBuilt;
+    merged.uncommittedTxns += s.uncommittedTxns;
+    merged.partialTxns += s.partialTxns;
+    merged.unknownCommands.push(...s.unknownCommands);
+    if (
+      s.lastAppliedTs &&
+      (!merged.lastAppliedTs || cmpTs(s.lastAppliedTs, merged.lastAppliedTs) > 0)
+    ) {
+      merged.lastAppliedTs = s.lastAppliedTs;
+    }
+  }
+  return merged;
 }
 
 /**
@@ -665,7 +721,8 @@ interface BufferedTxn {
  */
 export class TxnBuffer {
   private readonly txns = new Map<string, BufferedTxn>();
-  private readonly recentCommits: CommittedDistTxn[] = [];
+  private readonly committedDistTxns = new Map<string, OplogTimestamp | null>();
+  private lastCommittedId: string | null = null;
   private readonly workDir: string;
   private readonly spillThresholdBytes: number;
 
@@ -749,21 +806,21 @@ export class TxnBuffer {
   }
 
   recordDistCommit(txnId: string, commitTs: OplogTimestamp | null): void {
-    if (this.recentCommits.length >= MAX_COMMIT_HISTORY) {
-      this.recentCommits.shift();
-    }
-    this.recentCommits.push({ id: txnId, commitTs });
+    this.committedDistTxns.set(txnId, commitTs);
+    this.lastCommittedId = txnId;
   }
 
   lastCommitId(): string | null {
-    const last = this.recentCommits[this.recentCommits.length - 1];
-    return last ? last.id : null;
+    return this.lastCommittedId;
   }
 
   getLeftovers(): { uncommittedIds: string[]; committedDistTxns: CommittedDistTxn[] } {
     return {
       uncommittedIds: [...this.txns.keys()],
-      committedDistTxns: [...this.recentCommits],
+      committedDistTxns: [...this.committedDistTxns.entries()].map(([id, commitTs]) => ({
+        id,
+        commitTs,
+      })),
     };
   }
 
@@ -789,6 +846,11 @@ export interface OplogApplierOptions {
   backupType?: "logical" | "physical";
   /** If true, ignores DuplicateKey on `config.chunks` during unsafe/physical replay. */
   unsafe?: boolean;
+  /**
+   * Fail closed on unrecognized oplog commands or malformed entries (default: true).
+   * Disable only for explicit diagnostic overrides.
+   */
+  strict?: boolean;
 }
 
 /**
@@ -809,11 +871,21 @@ export class OplogApplier {
   private readonly endTs?: OplogTimestamp;
   private readonly backupType: "logical" | "physical";
   private readonly unsafe: boolean;
+  private readonly strict: boolean;
 
   private appliedEntries = 0;
   private skippedEntries = 0;
+  private readonly skipBreakdown: OplogSkipBreakdown = {
+    beforeWindow: 0,
+    noop: 0,
+    filtered: 0,
+    indexLifecycle: 0,
+    benignReplayRace: 0,
+    unrecognized: 0,
+  };
   private indexesBuilt = 0;
   private partialTxns = 0;
+  private readonly unknownCommands: string[] = [];
   private lastAppliedTs: OplogTimestamp | null = null;
   private reachedEnd = false;
 
@@ -827,17 +899,38 @@ export class OplogApplier {
     this.endTs = options.endTs;
     this.backupType = options.backupType ?? "logical";
     this.unsafe = Boolean(options.unsafe);
+    this.strict = options.strict !== false;
+  }
+
+  private recordSkip(reason: keyof OplogSkipBreakdown): void {
+    this.skippedEntries++;
+    this.skipBreakdown[reason]++;
   }
 
   getStats(): OplogApplierStats {
     return {
       appliedEntries: this.appliedEntries,
       skippedEntries: this.skippedEntries,
+      skipBreakdown: { ...this.skipBreakdown },
       indexesBuilt: this.indexesBuilt,
       lastAppliedTs: this.lastAppliedTs,
       uncommittedTxns: this.txnBuffer.getLeftovers().uncommittedIds.length,
       partialTxns: this.partialTxns,
+      unknownCommands: [...this.unknownCommands],
     };
+  }
+
+  assertComplete(): void {
+    if (this.partialTxns > 0) {
+      throw new OplogReplayError(
+        `Oplog replay integrity check failed: ${this.partialTxns} committed transaction(s) had incomplete operations`,
+      );
+    }
+    if (this.strict && this.unknownCommands.length > 0) {
+      throw new OplogReplayError(
+        `Oplog replay integrity check failed: encountered unrecognized oplog command(s): ${[...new Set(this.unknownCommands)].join(", ")}`,
+      );
+    }
   }
 
   getTxnLeftovers(): { uncommittedIds: string[]; committedDistTxns: CommittedDistTxn[] } {
@@ -872,11 +965,15 @@ export class OplogApplier {
     const ts = extractBsonTimestamp(doc.ts);
     if (ts) {
       if (this.startTs && cmpTs(ts, this.startTs) < 0) {
-        this.skippedEntries++;
+        this.recordSkip("beforeWindow");
         return;
       }
       if (this.startExclusiveTs && cmpTs(ts, this.startExclusiveTs) <= 0) {
-        this.skippedEntries++;
+        this.recordSkip("beforeWindow");
+        return;
+      }
+      if (this.lastAppliedTs && cmpTs(ts, this.lastAppliedTs) <= 0) {
+        this.recordSkip("beforeWindow");
         return;
       }
       if (this.endTs && cmpTs(ts, this.endTs) > 0) {
@@ -886,7 +983,7 @@ export class OplogApplier {
     }
 
     if (doc.op === "n") {
-      this.skippedEntries++;
+      this.recordSkip("noop");
       return;
     }
 
@@ -897,7 +994,11 @@ export class OplogApplier {
     }
 
     if (!this.filter.isIncluded(doc)) {
-      this.skippedEntries++;
+      const isIdxLifecycle =
+        doc.op === "c" &&
+        doc.o &&
+        (doc.o.startIndexBuild !== undefined || doc.o.abortIndexBuild !== undefined);
+      this.recordSkip(isIdxLifecycle ? "indexLifecycle" : "filtered");
       return;
     }
 
@@ -908,6 +1009,8 @@ export class OplogApplier {
   /**
    * Reconciles prepared/uncommitted distributed transactions against the union of
    * committed transaction IDs reported by all shards.
+   * Fails closed if any transaction known to have committed on another shard has only
+   * partial prepared operations locally.
    */
   async handleUncommittedTxn(
     clusterCommits: Map<string, OplogTimestamp | null>,
@@ -915,27 +1018,35 @@ export class OplogApplier {
     const { uncommittedIds } = this.txnBuffer.getLeftovers();
     let applied = 0;
     let partial = 0;
+    const partialIds: string[] = [];
 
     for (const id of uncommittedIds) {
       if (!clusterCommits.has(id)) continue;
       if (!this.txnBuffer.isAllOps(id)) {
         partial++;
         this.partialTxns++;
-        this.logger?.warn(
+        partialIds.push(id);
+        this.logger?.error(
           { txnId: id },
-          "Distributed transaction was committed on another shard but only partial prepared ops were present before cutoff",
+          "CRITICAL: Distributed transaction committed on another shard but only partial prepared ops were present before cutoff",
         );
         await this.txnBuffer.discard(id);
         continue;
       }
       await this.txnBuffer.consumeOps(id, async (innerOp) => {
         if (!this.filter.isIncluded(innerOp)) {
-          this.skippedEntries++;
+          this.recordSkip("filtered");
           return;
         }
         await this.handleNonTxnOp(innerOp);
       });
       applied++;
+    }
+
+    if (partialIds.length > 0) {
+      throw new OplogReplayError(
+        `Cannot complete consistent recovery: ${partialIds.length} committed distributed transaction(s) had only partial prepared operations before cutoff (${partialIds.join(", ")})`,
+      );
     }
 
     const remaining = this.txnBuffer.getLeftovers().uncommittedIds.length;
@@ -1048,9 +1159,17 @@ export class OplogApplier {
       return;
     }
 
+    if (!this.txnBuffer.isAllOps(txnId)) {
+      this.partialTxns++;
+      await this.txnBuffer.discard(txnId);
+      throw new OplogReplayError(
+        `Cannot commit transaction "${txnId}": explicit commitTransaction received while buffered operations are still incomplete (missing final applyOps chunk)`,
+      );
+    }
+
     await this.txnBuffer.consumeOps(txnId, async (innerOp) => {
       if (!this.filter.isIncluded(innerOp)) {
-        this.skippedEntries++;
+        this.recordSkip("filtered");
         return;
       }
       await this.handleNonTxnOp(innerOp);
@@ -1074,22 +1193,47 @@ export class OplogApplier {
     let renameFrom: { db: string; coll: string } | null = null;
     let renameTo: { db: string; coll: string } | null = null;
 
+    if (op.op !== "i" && op.op !== "u" && op.op !== "d" && op.op !== "c") {
+      if (this.strict) {
+        throw new OplogReplayError(
+          `Unsupported oplog operation type "${String(op.op)}" on namespace "${ns}"`,
+        );
+      }
+      this.logger?.warn({ op: op.op, ns }, "Skipping unsupported oplog operation type");
+      this.recordSkip("unrecognized");
+      return;
+    }
+
     if (op.op === "c") {
       const o = op.o;
       const cmdKey = getFirstCommandKey(o);
       if (!o || !cmdKey) {
-        this.skippedEntries++;
+        if (this.strict) {
+          throw new OplogReplayError(`Malformed empty command oplog entry on namespace "${ns}"`);
+        }
+        this.recordSkip("unrecognized");
         return;
       }
 
       if (cmdKey === "startIndexBuild" || cmdKey === "abortIndexBuild") {
-        this.skippedEntries++;
+        this.recordSkip("indexLifecycle");
+        return;
+      }
+
+      if (IGNORED_SAFE_OPLOG_COMMANDS.has(cmdKey)) {
+        this.recordSkip("noop");
         return;
       }
 
       if (!KNOWN_OPLOG_COMMANDS.has(cmdKey)) {
-        this.logger?.debug({ cmdKey, ns }, "Skipping unrecognized oplog command");
-        this.skippedEntries++;
+        this.unknownCommands.push(cmdKey);
+        if (this.strict) {
+          throw new OplogReplayError(
+            `Unrecognized oplog command "${cmdKey}" on namespace "${ns}"; refusing to silently skip potentially data-mutating operation`,
+          );
+        }
+        this.logger?.warn({ cmdKey, ns }, "Skipping unrecognized oplog command (non-strict mode)");
+        this.recordSkip("unrecognized");
         return;
       }
 
@@ -1098,7 +1242,7 @@ export class OplogApplier {
           const nested = Array.isArray(o.applyOps) ? (o.applyOps as OplogDoc[]) : [];
           for (const item of nested) {
             if (!this.filter.isIncluded(item)) {
-              this.skippedEntries++;
+              this.recordSkip("filtered");
               continue;
             }
             await this.handleNonTxnOp(item);
@@ -1214,14 +1358,14 @@ export class OplogApplier {
           { ns: cleanOp.ns, query: cleanOp.o2 },
           "Skipping update to missing time-series bucket (TTL race)",
         );
-        this.skippedEntries++;
+        this.recordSkip("benignReplayRace");
         return;
       }
 
       // Allow duplicate key on config.chunks in unsafe/physical replay
       const errCode = (err as { code?: number })?.code;
       if (this.unsafe && cleanOp.ns === "config.chunks" && errCode === 11000) {
-        this.skippedEntries++;
+        this.recordSkip("benignReplayRace");
         return;
       }
 
@@ -1232,7 +1376,7 @@ export class OplogApplier {
         ("drop" in cleanOp.o || "dropIndexes" in cleanOp.o || "deleteIndexes" in cleanOp.o) &&
         (errCode === 26 || errCode === 27)
       ) {
-        this.skippedEntries++;
+        this.recordSkip("benignReplayRace");
         return;
       }
 

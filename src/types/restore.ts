@@ -1,6 +1,7 @@
 import type { BackupManifest } from "./catalog.js";
 import type { AppConfig } from "./config.js";
 import type { Logger } from "./logger.js";
+import type { OplogApplierStats } from "./oplog.js";
 import type { StorageClient } from "./storage.js";
 import type { RestoreTools } from "./tools.js";
 
@@ -35,6 +36,7 @@ export interface RestoreResult {
   pitrTarget?: string;
   replayedSlices?: number;
   replayedEntries?: number;
+  oplogStats?: OplogApplierStats;
 }
 
 export interface VerifyBackupResult {

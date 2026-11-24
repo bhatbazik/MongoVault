@@ -4,7 +4,7 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import { BSON, Binary, Timestamp } from "mongodb";
 import { describe, expect, it, vi } from "vitest";
-import { IndexCatalog, OplogApplier, TxnBuffer } from "../src/oplog-applier.js";
+import { IndexCatalog, OplogApplier, OplogReplayError, TxnBuffer } from "../src/oplog-applier.js";
 
 function encodeOplogStream(docs) {
   const chunks = docs.map((d) => Buffer.from(BSON.serialize(d)));
@@ -124,7 +124,7 @@ describe("OplogApplier, IndexCatalog & TxnBuffer (full edge-case coverage)", () 
           o: { startIndexBuild: "items" },
           ts: new Timestamp({ t: 10, i: 1 }),
         },
-        { op: "c", ns: "app.$cmd", o: { unknownCmd: 1 }, ts: new Timestamp({ t: 10, i: 2 }) },
+        { op: "c", ns: "app.$cmd", o: { noop: 1 }, ts: new Timestamp({ t: 10, i: 2 }) },
         {
           op: "c",
           ns: "app.$cmd",
@@ -272,12 +272,11 @@ describe("OplogApplier, IndexCatalog & TxnBuffer (full edge-case coverage)", () 
       const leftovers = applier.getTxnLeftovers();
       expect(leftovers.uncommittedIds.length).toBe(2);
 
-      // Pretend coordinator saw commits for both lsid2 and lsid3
+      // Pretend coordinator saw commits for both lsid2 (complete) and lsid3 (partial -> must fail closed!)
       const clusterCommits = new Map(leftovers.uncommittedIds.map((id) => [id, { t: 11, i: 1 }]));
-      const recon = await applier.handleUncommittedTxn(clusterCommits);
-      expect(recon.applied).toBe(1);
-      expect(recon.partial).toBe(1);
+      await expect(applier.handleUncommittedTxn(clusterCommits)).rejects.toThrow(OplogReplayError);
       expect(appliedIds).toEqual(["dist-ok"]);
+      expect(applier.getStats().partialTxns).toBe(1);
       await applier.dispose();
     } finally {
       await fs.rm(workDir, { recursive: true, force: true });

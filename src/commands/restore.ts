@@ -59,6 +59,20 @@ export class RestoreCommand implements CommandHandler {
               `Slices:     ${result.replayedSlices} replayed (${result.replayedEntries} entries)`,
             );
           }
+          const stats = result.oplogStats as
+            | {
+                appliedEntries?: number;
+                skippedEntries?: number;
+                indexesBuilt?: number;
+                uncommittedTxns?: number;
+                partialTxns?: number;
+              }
+            | undefined;
+          if (stats) {
+            console.log(
+              `Oplog:      ${stats.appliedEntries ?? 0} applied, ${stats.skippedEntries ?? 0} skipped, ${stats.indexesBuilt ?? 0} indexes built, ${stats.uncommittedTxns ?? 0} uncommitted discarded`,
+            );
+          }
         }
       }
     } catch (error) {
