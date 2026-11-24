@@ -3,6 +3,7 @@ import type { BackupContext } from "./backup.js";
 import type { BackupManifest, ShardedClusterMeta } from "./catalog.js";
 import type { AppConfig } from "./config.js";
 import type { Logger } from "./logger.js";
+import type { OplogApplierStats } from "./oplog.js";
 import type { RestoreContext, RestoreOptions, RestoreResult } from "./restore.js";
 import type { StorageClient } from "./storage.js";
 
@@ -61,4 +62,5 @@ export interface ShardedRestoreResult {
   configsvrRestored: boolean;
   pitrTarget?: string;
   replayedSlices?: number;
+  oplogStats?: OplogApplierStats;
 }

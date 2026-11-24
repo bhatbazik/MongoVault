@@ -19,7 +19,7 @@ import {
 import { createDecryptor, createEncryptor, verifyManifest } from "./crypto.js";
 import { DigestStream } from "./digest.js";
 import { formatDuration } from "./format.js";
-import { MongoOplogTargetClient, OplogApplier } from "./oplog-applier.js";
+import { MongoOplogTargetClient, OplogApplier, mergeOplogStats } from "./oplog-applier.js";
 import {
   captureOplogSlice,
   compareTimestamps,
@@ -543,6 +543,7 @@ async function captureBridgingSlices({
   untilTs,
   keyPrefix,
   createMongoClient,
+  activeTxnWaitTimeoutMs = 15_000,
 }: {
   config: AppConfig;
   storage: StorageClient;
@@ -552,12 +553,15 @@ async function captureBridgingSlices({
   untilTs: OplogTimestamp;
   keyPrefix: string;
   createMongoClient: (uri: string) => MongoClient;
+  activeTxnWaitTimeoutMs?: number;
 }): Promise<string[]> {
   const keys: string[] = [];
   let cursorTs = sinceTs;
+  let blockedSinceMs: number | null = null;
 
   for (let i = 0; i < MAX_BRIDGE_SLICE_ITERATIONS; i++) {
     if (compareTimestamps(cursorTs, untilTs) >= 0) break;
+    let cappedTxTs: OplogTimestamp | null = null;
     const sliceManifest = await captureOplogSlice({
       config,
       storage,
@@ -567,9 +571,25 @@ async function captureBridgingSlices({
       untilTs,
       keyPrefix,
       updateState: false,
+      onCappedByActiveTxn: (txTs) => {
+        cappedTxTs = txTs;
+      },
       createMongoClient,
     });
-    if (!sliceManifest) break;
+    if (!sliceManifest) {
+      if (cappedTxTs) {
+        if (blockedSinceMs === null) blockedSinceMs = Date.now();
+        if (Date.now() - blockedSinceMs >= activeTxnWaitTimeoutMs) {
+          throw new Error(
+            `Failed to capture bridging oplog slices up to ${formatOplogTimestamp(untilTs)}: active transaction at ${formatOplogTimestamp(cappedTxTs)} did not conclude within ${Math.round(activeTxnWaitTimeoutMs / 1000)}s`,
+          );
+        }
+        await new Promise((r) => setTimeout(r, 250));
+        continue;
+      }
+      break;
+    }
+    blockedSinceMs = null;
     keys.push(sliceManifest.key);
 
     const endStr = sliceManifest.oplogWindow?.endTs;
@@ -677,8 +697,13 @@ export async function runShardedClusterBackup({
     // [configsvrPreTs, clusterTimeTs] cleanly without triggering mongodump's resharding check.
     const useSafeCsrsConfigDump = Boolean(configsvrDirectUri) && backupRunner === runBackup;
     const configsvrPreBounds = useSafeCsrsConfigDump
-      ? await getOplogBounds(configsvrDirectUri!, { phase: "pre" }).catch(() => null)
+      ? await getOplogBounds(configsvrDirectUri!, { phase: "pre", createMongoClient })
       : null;
+    if (useSafeCsrsConfigDump && !configsvrPreBounds?.newestTs) {
+      throw new Error(
+        "Failed to determine pre-backup CSRS oplog anchor; refusing to produce an unanchored sharded backup",
+      );
+    }
 
     const configsvrConfig: AppConfig = {
       ...config,
@@ -1125,7 +1150,11 @@ export async function resolveShardedPitrPlan(
       const prevEnd = sManifest?.oplogWindow?.previousEndTs
         ? parseOplogTimestamp(sManifest.oplogWindow.previousEndTs)
         : null;
-      if (prevEnd && compareTimestamps(prevEnd, expectedPrev) > 0) {
+      if (prevEnd) {
+        if (compareTimestamps(prevEnd, expectedPrev) > 0) {
+          throw new Error(`PITR timeline gap detected on configsvr before slice ${slice.key}`);
+        }
+      } else if (sManifest?.oplogWindow && compareTimestamps(slice.startTs, expectedPrev) > 0) {
         throw new Error(`PITR timeline gap detected on configsvr before slice ${slice.key}`);
       }
       verifiedSlices.push({ ...slice, manifest: sManifest });
@@ -1136,20 +1165,54 @@ export async function resolveShardedPitrPlan(
       const bestEnd = covEnd && compareTimestamps(covEnd, slice.endTs) > 0 ? covEnd : slice.endTs;
       if (compareTimestamps(bestEnd, lastCovered) > 0) lastCovered = bestEnd;
     }
+    if (compareTimestamps(lastCovered, targetTs) < 0) {
+      const nextSlice = allCfgSlices.find((s) => compareTimestamps(s.startTs, targetTs) > 0);
+      if (nextSlice) {
+        const nextManifest = await readManifest(storage, nextSlice.key);
+        const nextPrevEnd = nextManifest?.oplogWindow?.previousEndTs
+          ? parseOplogTimestamp(nextManifest.oplogWindow.previousEndTs)
+          : null;
+        if (
+          !nextManifest?.oplogWindow?.gapDetected &&
+          nextPrevEnd &&
+          compareTimestamps(nextPrevEnd, expectedPrev) <= 0
+        ) {
+          lastCovered = targetTs;
+        }
+      }
+    }
     if (compareTimestamps(lastCovered, targetTs) < 0 && typeof storage.getJson === "function") {
       const stateObj = await storage
-        .getJson<{ coverageEndTs?: string; gapDetected?: boolean }>(pitrStateKey(cfgScope))
+        .getJson<{ coverageEndTs?: string; lastTs?: string; gapDetected?: boolean }>(
+          pitrStateKey(cfgScope),
+        )
         .catch(() => null);
       const stateCov = stateObj?.data?.coverageEndTs
         ? parseOplogTimestamp(stateObj.data.coverageEndTs)
         : null;
+      const stateLast = stateObj?.data?.lastTs ? parseOplogTimestamp(stateObj.data.lastTs) : null;
       if (
         !stateObj?.data?.gapDetected &&
         stateCov &&
+        (!stateLast || compareTimestamps(stateLast, expectedPrev) <= 0) &&
         compareTimestamps(stateCov, lastCovered) > 0
       ) {
         lastCovered = stateCov;
       }
+    }
+    if (
+      compareTimestamps(targetTs, clusterTs) > 0 &&
+      verifiedSlices.length === 0 &&
+      compareTimestamps(lastCovered, targetTs) < 0
+    ) {
+      throw new Error(
+        `Target timestamp ${formatOplogTimestamp(targetTs)} is newer than sharded backup clusterTime (${formatOplogTimestamp(clusterTs)}), but no configsvr oplog slices are available to bridge the window`,
+      );
+    }
+    if (compareTimestamps(lastCovered, targetTs) < 0) {
+      throw new Error(
+        `PITR oplog coverage on configsvr ends at ${formatOplogTimestamp(lastCovered)}, which is before target ${formatOplogTimestamp(targetTs)}`,
+      );
     }
     configsvrPlan = {
       baseBackup: {
@@ -1275,6 +1338,7 @@ export async function restoreShardedCluster({
   let balancerStopped = false;
   let balancerWasEnabled = false;
   let replayedSlices = 0;
+  let oplogStats: ShardedRestoreResult["oplogStats"];
 
   try {
     await client.connect();
@@ -1529,7 +1593,20 @@ export async function restoreShardedCluster({
             await node.applier.handleUncommittedTxn(clusterCommits);
           }
           await node.applier.buildPendingIndexes();
+          node.applier.assertComplete();
         }
+        oplogStats = mergeOplogStats(activeNodes.map((n) => n.applier.getStats()));
+        log.info(
+          {
+            appliedEntries: oplogStats.appliedEntries,
+            skippedEntries: oplogStats.skippedEntries,
+            skipBreakdown: oplogStats.skipBreakdown,
+            indexesBuilt: oplogStats.indexesBuilt,
+            uncommittedTxns: oplogStats.uncommittedTxns,
+            partialTxns: oplogStats.partialTxns,
+          },
+          "Completed sharded cluster oplog replay and distributed transaction reconciliation",
+        );
       } finally {
         await Promise.allSettled(
           activeNodes.map(async (node) => {
@@ -1581,6 +1658,7 @@ export async function restoreShardedCluster({
       restoredShards,
       configsvrRestored: true,
       ...(pitrTarget ? { pitrTarget, replayedSlices } : {}),
+      ...(oplogStats ? { oplogStats } : {}),
     };
   } finally {
     if (balancerStopped && balancerWasEnabled) {
