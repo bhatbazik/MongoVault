@@ -41,7 +41,7 @@ import type {
   PhysicalStorageOptions,
 } from "./types/catalog.js";
 import type { AppConfig } from "./types/config.js";
-import type { OplogTimestamp } from "./types/oplog.js";
+import type { OplogApplierStats, OplogTimestamp } from "./types/oplog.js";
 import type {
   BackupCursorFile,
   BackupCursorMetadata,
@@ -595,9 +595,10 @@ export async function runPhysicalBackup({
             await extCursor.close().catch(() => {});
             extendedToTs = extendTargetTs;
           } catch (extErr) {
-            log.warn(
-              { err: extErr },
-              "$backupCursorExtend failed; anchoring physical backup oplogWindow to checkpointTimestamp instead of oplogEnd",
+            const msg = extErr instanceof Error ? extErr.message : String(extErr);
+            throw new Error(
+              `$backupCursorExtend failed; refusing to produce physical backup with incomplete journal coverage: ${msg}`,
+              { cause: extErr },
             );
           }
         } else if (!cursorMeta.oplogEnd?.ts) {
@@ -877,7 +878,16 @@ async function waitForLockFileCleared(dbPath: string, timeoutMs = 15_000): Promi
  *    `config.transactions`, `config.rangeDeletions`), `fsync`, and gracefully shut down (`force: false`).
  */
 export class PhysicalRecoveryCoordinator {
-  async run(ctx: PhysicalRecoveryContext): Promise<{ replayedEntries: number }> {
+  private async flushCheckpoint(client: MongoClient, step: string): Promise<void> {
+    const res = await client.db("admin").command({ fsync: 1 });
+    if (!res || res.ok !== 1) {
+      throw new Error(`WiredTiger fsync checkpoint failed during ${step}: ${JSON.stringify(res)}`);
+    }
+  }
+
+  async run(
+    ctx: PhysicalRecoveryContext,
+  ): Promise<{ replayedEntries: number; oplogStats?: OplogApplierStats }> {
     const { config, storage, logger, targetDbPath, manifest, pitrPlan, signal } = ctx;
     const isBackupCursor = manifest?.physical?.cursorType === "$backupCursor";
     const restoreToStr =
@@ -888,6 +898,7 @@ export class PhysicalRecoveryCoordinator {
 
     const baseArgs = this.buildBaseMongodArgs(config, manifest, targetDbPath);
     let replayedEntries = 0;
+    let oplogStats: OplogApplierStats | undefined;
 
     if (isBackupCursor && restoreToTs) {
       // Step 1: Prepare recovery markers (minvalid + oplogTruncateAfterPoint)
@@ -921,10 +932,7 @@ export class PhysicalRecoveryCoordinator {
           _id: "oplogTruncateAfterPoint" as unknown as ObjectId,
           oplogTruncateAfterPoint: bsonTarget,
         });
-        await client
-          .db("admin")
-          .command({ fsync: 1 })
-          .catch(() => {});
+        await this.flushCheckpoint(client, "step 1/3 (recovery markers)");
       });
 
       // Step 2: Recover from oplog as standalone (replays journal + oplog to restoreToTs)
@@ -937,10 +945,7 @@ export class PhysicalRecoveryCoordinator {
         targetDbPath,
         [...baseArgs, "--setParameter=recoverFromOplogAsStandalone=true"],
         async (client) => {
-          await client
-            .db("admin")
-            .command({ fsync: 1 })
-            .catch(() => {});
+          await this.flushCheckpoint(client, "step 2/3 (recoverFromOplogAsStandalone)");
         },
       );
     }
@@ -971,20 +976,19 @@ export class PhysicalRecoveryCoordinator {
             );
           }
           await applier.buildPendingIndexes({ standalone: true });
-          replayedEntries = applier.getStats().appliedEntries;
+          applier.assertComplete();
+          oplogStats = applier.getStats();
+          replayedEntries = oplogStats.appliedEntries;
         } finally {
           await applier.dispose();
         }
       }
 
       await this.resetReplicaSetState(client);
-      await client
-        .db("admin")
-        .command({ fsync: 1 })
-        .catch(() => {});
+      await this.flushCheckpoint(client, "final recovery step");
     });
 
-    return { replayedEntries };
+    return { replayedEntries, ...(oplogStats ? { oplogStats } : {}) };
   }
 
   private buildBaseMongodArgs(
@@ -1105,7 +1109,9 @@ export class PhysicalRecoveryCoordinator {
 
       await fn(tmpClient);
 
-      // Graceful shutdown (force: false) so WiredTiger writes a clean stable checkpoint
+      // Graceful shutdown (force: false) so WiredTiger writes a clean stable checkpoint.
+      // MongoDB drops the connection immediately upon shutdown, so an expected socket-close error is normal;
+      // cleanliness is verified by requiring the process to exit cleanly with code 0.
       await tmpClient
         .db("admin")
         .command({ shutdown: 1, force: false, timeoutSecs: 30 })
@@ -1113,6 +1119,11 @@ export class PhysicalRecoveryCoordinator {
       await tmpClient.close().catch(() => {});
       tmpClient = null;
       await Promise.race([procExit, new Promise((r) => setTimeout(r, 35_000))]);
+      if (proc.exitCode !== 0 || proc.signalCode !== null) {
+        throw new Error(
+          `Temporary recovery mongod did not shut down cleanly (exitCode=${String(proc.exitCode)}, signal=${String(proc.signalCode)}); WiredTiger checkpoint may be inconsistent`,
+        );
+      }
       await waitForLockFileCleared(targetDbPath);
     } finally {
       if (tmpClient) {
@@ -1394,6 +1405,7 @@ export async function restorePhysicalBackup({
 
   // Run multi-step WiredTiger recovery + optional PITR replay + RS state cleanup
   let replayedEntries = 0;
+  let oplogStats: OplogApplierStats | undefined;
   if (!skipRecovery) {
     const recoveryCtx: PhysicalRecoveryContext = {
       config,
@@ -1408,6 +1420,7 @@ export async function restorePhysicalBackup({
       recoveryRunner ?? ((c: PhysicalRecoveryContext) => new PhysicalRecoveryCoordinator().run(c));
     const recResult = await runner(recoveryCtx);
     replayedEntries = recResult.replayedEntries;
+    oplogStats = recResult.oplogStats;
   }
 
   if (!pitrPlan) {
@@ -1416,6 +1429,7 @@ export async function restorePhysicalBackup({
       restoredFiles: extractedCount,
       totalBytes,
       targetDbPath,
+      ...(oplogStats ? { oplogStats } : {}),
     };
   }
 
@@ -1427,5 +1441,6 @@ export async function restorePhysicalBackup({
     pitrTarget: formatOplogTimestamp(pitrPlan.targetTs),
     replayedSlices: pitrPlan.slices.length,
     replayedEntries,
+    ...(oplogStats ? { oplogStats } : {}),
   };
 }

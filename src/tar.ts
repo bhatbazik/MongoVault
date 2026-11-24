@@ -223,8 +223,12 @@ export async function* generateTarStream(
     let stat;
     try {
       stat = await fs.stat(file.fullPath);
-    } catch {
-      continue;
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `Physical backup file missing or unreadable during TAR streaming: ${file.name} (${msg})`,
+        { cause: err },
+      );
     }
     const expectedSize = stat.size;
     const headerBlock = createTarHeaderBlock(file.name, expectedSize, stat.mtimeMs);

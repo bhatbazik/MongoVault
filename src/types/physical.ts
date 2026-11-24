@@ -2,7 +2,7 @@ import type { MongoClient } from "mongodb";
 import type { BackupManifest } from "./catalog.js";
 import type { AppConfig } from "./config.js";
 import type { Logger } from "./logger.js";
-import type { PitrPlan } from "./oplog.js";
+import type { OplogApplierStats, PitrPlan } from "./oplog.js";
 import type { StorageClient } from "./storage.js";
 
 export interface BackupCursorMetadata {
@@ -61,7 +61,9 @@ export interface PhysicalRestoreOptions {
   /**
    * Optional dependency-injected recovery coordinator for testing.
    */
-  recoveryRunner?: (ctx: PhysicalRecoveryContext) => Promise<{ replayedEntries: number }>;
+  recoveryRunner?: (
+    ctx: PhysicalRecoveryContext,
+  ) => Promise<{ replayedEntries: number; oplogStats?: OplogApplierStats }>;
 }
 
 export interface PhysicalRestoreResult {
@@ -72,4 +74,5 @@ export interface PhysicalRestoreResult {
   pitrTarget?: string;
   replayedSlices?: number;
   replayedEntries?: number;
+  oplogStats?: OplogApplierStats;
 }
