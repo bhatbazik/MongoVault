@@ -570,24 +570,46 @@ export class S3StorageClient implements StorageClient {
             out.destroy(err instanceof Error ? err : new Error(String(err)));
             return;
           }
-          attempt++;
-          const backoffMs = Math.min(10_000, 500 * 2 ** (attempt - 1));
-          await new Promise((r) => setTimeout(r, backoffMs));
-          const resumed = await this.client.send(
-            new GetObjectCommand({
-              Bucket: this.bucket,
-              Key: key,
-              Range: `bytes=${bytesRead}-`,
-              IfMatch: etag,
-            }),
-            { abortSignal: signal },
-          );
-          currentStream = resumed.Body as Readable;
+          let resumedStream: Readable | null = null;
+          while (!resumedStream) {
+            attempt++;
+            const backoffMs = Math.min(10_000, 500 * 2 ** (attempt - 1));
+            await new Promise((r) => setTimeout(r, backoffMs));
+            try {
+              const resumed = await this.client.send(
+                new GetObjectCommand({
+                  Bucket: this.bucket,
+                  Key: key,
+                  Range: `bytes=${bytesRead}-`,
+                  IfMatch: etag,
+                }),
+                { abortSignal: signal },
+              );
+              resumedStream = resumed.Body as Readable;
+            } catch (resumeErr: unknown) {
+              if (
+                signal?.aborted ||
+                out.destroyed ||
+                (resumeErr as { name?: string })?.name === "AbortError" ||
+                isPreconditionFailed(resumeErr) ||
+                isNotFound(resumeErr) ||
+                attempt >= DOWNLOAD_MAX_RETRIES
+              ) {
+                out.destroy(resumeErr instanceof Error ? resumeErr : new Error(String(resumeErr)));
+                return;
+              }
+            }
+          }
+          currentStream = resumedStream;
         }
       }
     };
 
-    void pump();
+    void pump().catch((err) => {
+      if (!out.destroyed) {
+        out.destroy(err instanceof Error ? err : new Error(String(err)));
+      }
+    });
     return out;
   }
 

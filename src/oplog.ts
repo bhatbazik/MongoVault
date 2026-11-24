@@ -548,6 +548,7 @@ export async function captureOplogSlice({
   untilTs,
   keyPrefix,
   updateState = true,
+  onCappedByActiveTxn,
   createMongoClient = (u) => new MongoClient(u),
 }: CaptureOplogSliceOptions): Promise<BackupManifest | null> {
   const scope = scopeOf(config);
@@ -650,6 +651,7 @@ export async function captureOplogSlice({
           );
           effectiveUpperTs = txTs;
           cappedByActiveTx = true;
+          onCappedByActiveTxn?.(txTs);
         }
       }
     } catch (err: unknown) {
@@ -784,8 +786,13 @@ export async function captureOplogSlice({
           },
           "CRITICAL: MongoDB oplog rolled over while cursor was streaming. Timeline gap created.",
         );
+        // Never advance lastTs past un-uploaded entries; preserve the last confirmed archived timestamp
+        // while flagging gapDetected so operators and planners refuse inconsistent recovery.
+        const confirmedLastTs =
+          state?.lastTs ?? (cursorStartTs ? formatOplogTimestamp(cursorStartTs) : undefined);
         await storage.putJson(pitrStateKey(scope), {
-          lastTs: lastTs ? formatOplogTimestamp(lastTs) : state?.lastTs,
+          ...state,
+          ...(confirmedLastTs ? { lastTs: confirmedLastTs } : {}),
           updatedAt: new Date().toISOString(),
           gapDetected: true,
         });
@@ -1045,10 +1052,9 @@ export async function resolvePitrPlan(
     );
   }
 
-  const isInsufficientCoverage =
-    targetTs.i === 0xffffffff
-      ? lastCoveredTs.t < targetTs.t
-      : compareTimestamps(lastCoveredTs, targetTs) < 0;
+  // Require exact timestamp coverage (for ISO-second targets with i=0xffffffff, coverage must reach
+  // past the end of that second so writes at higher ordinals within the second are never silently missed).
+  const isInsufficientCoverage = compareTimestamps(lastCoveredTs, targetTs) < 0;
 
   if (isInsufficientCoverage) {
     throw new Error(
@@ -1178,6 +1184,7 @@ export function startOplogArchiver({
   storage,
   logger,
   notifier,
+  metrics,
   signal,
   createMongoClient = (u) => new MongoClient(u),
 }: StartOplogArchiverOptions): OplogArchiver {
@@ -1189,6 +1196,17 @@ export function startOplogArchiver({
   let activeTickPromise: Promise<void> | null = null;
   let activeAbortController: AbortController | null = null;
   let timer: NodeJS.Timeout | null = null;
+
+  function recordManifestMetrics(manifest: BackupManifest): void {
+    const endTsStr = manifest.oplogWindow?.coverageEndTs ?? manifest.oplogWindow?.endTs;
+    const endTs = endTsStr ? parseOplogTimestamp(endTsStr) : null;
+    metrics?.recordPitrSliceSuccess?.(
+      manifest.oplogWindow?.entries ?? 0,
+      manifest.size ?? 0,
+      endTs?.t ?? Math.floor(Date.now() / 1000),
+      Boolean(manifest.oplogWindow?.gapDetected),
+    );
+  }
 
   async function runTick(): Promise<void> {
     if (stopped || signal?.aborted) return;
@@ -1231,11 +1249,17 @@ export function startOplogArchiver({
             createMongoClient,
           });
           if (!result) break;
-          const anyCaptured =
-            Boolean(result.configsvr) || Object.values(result.shards).some(Boolean);
-          if (!anyCaptured) break;
+          const capturedList = [
+            ...(result.configsvr ? [result.configsvr] : []),
+            ...Object.values(result.shards).filter((m): m is BackupManifest => Boolean(m)),
+          ];
+          for (const m of capturedList) {
+            recordManifestMetrics(m);
+          }
+          if (capturedList.length === 0) break;
         }
       } else {
+        let capturedAny = false;
         while (!stopped && !tickController.signal.aborted) {
           const captured = await captureOplogSlice({
             config,
@@ -1245,10 +1269,30 @@ export function startOplogArchiver({
             createMongoClient,
           });
           if (!captured) break;
+          capturedAny = true;
+          recordManifestMetrics(captured);
+        }
+        if (!capturedAny && metrics?.recordPitrCoverage && typeof storage.getJson === "function") {
+          const stateObj = await storage
+            .getJson<PitrStateRecord>(pitrStateKey(scope))
+            .catch(() => null);
+          const st =
+            stateObj && "data" in stateObj ? stateObj.data : (stateObj as PitrStateRecord | null);
+          const covStr = st?.coverageEndTs ?? st?.lastTs;
+          const covTs = covStr ? parseOplogTimestamp(covStr) : null;
+          if (covTs) {
+            metrics.recordPitrCoverage(covTs.t, Boolean(st?.gapDetected));
+          }
         }
       }
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
+      const msgLower = err.message.toLowerCase();
+      const isGapErr =
+        msgLower.includes("cappedpositionlost") ||
+        msgLower.includes("oplog rolled over") ||
+        msgLower.includes("timeline diverged");
+      metrics?.recordPitrSliceFailure?.(isGapErr);
       logger.error({ err }, "Continuous PITR oplog slice capture failed");
       if (notifier) {
         await notifier.notifyFailure("pitr-oplog", err).catch(() => {});
