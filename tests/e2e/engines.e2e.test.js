@@ -121,7 +121,25 @@ describe("Real MongoDB 8.0 End-to-End Verification (All 3 Engines + PITR)", () =
         drillUri: drillRs.uri,
       });
 
-      // 1. Seed base collections + secondary index
+      // 1. Seed base collections + JSON schema validator + unique & TTL indexes + view
+      await client.db("shop").createCollection("users", {
+        validator: {
+          $jsonSchema: {
+            bsonType: "object",
+            required: ["name", "balance"],
+            properties: {
+              name: { bsonType: "string" },
+              balance: { bsonType: "number" },
+            },
+          },
+        },
+        validationLevel: "strict",
+        validationAction: "error",
+      });
+      await client
+        .db("shop")
+        .collection("users")
+        .createIndex({ name: 1 }, { unique: true, name: "name_unique" });
       await client
         .db("shop")
         .collection("users")
@@ -129,11 +147,22 @@ describe("Real MongoDB 8.0 End-to-End Verification (All 3 Engines + PITR)", () =
           { _id: "u1", name: "Alice", balance: 100 },
           { _id: "u2", name: "Bob", balance: 50 },
         ]);
+      await client.db("shop").createCollection("active_users", {
+        viewOn: "users",
+        pipeline: [{ $match: { balance: { $gt: 0 } } }],
+      });
       await client
         .db("shop")
         .collection("orders")
         .insertMany([{ _id: "o1", userId: "u1", sku: "SKU-1", amount: 25 }]);
-      await client.db("analytics").collection("events").insertOne({ _id: "e1", type: "signup" });
+      await client
+        .db("analytics")
+        .collection("events")
+        .createIndex({ createdAt: 1 }, { expireAfterSeconds: 86400, name: "events_ttl" });
+      await client
+        .db("analytics")
+        .collection("events")
+        .insertOne({ _id: "e1", type: "signup", createdAt: new Date() });
 
       // 2. Run encrypted full-cluster logical backup with --oplog
       const manifest = await runBackup({ config, storage, logger });
@@ -141,15 +170,21 @@ describe("Real MongoDB 8.0 End-to-End Verification (All 3 Engines + PITR)", () =
       expect(manifest.oplogWindow?.endTs).toBeTruthy();
       expect(manifest.encryption?.algorithm).toBe("aes-256-gcm-chunked");
       expect(manifest.collections["shop.users"]).toBe(2);
+      expect(manifest.schema?.collections["shop.users"]?.options?.validator).toBeDefined();
+      expect(manifest.schema?.views.some((v) => v.name === "shop.active_users")).toBe(true);
 
       // Verify encrypted archive integrity end-to-end
       const verified = await verifyBackup({ config, storage, logger }, manifest.key);
       expect(verified.sha256).toBe(manifest.sha256);
 
-      // Run automated restore drill against isolated drillRs
+      // Run automated restore drill against isolated drillRs (verifies counts, indexes, validators, views & read/write)
       const drillRes = await runDrill({ config, storage, logger });
       expect(drillRes.key).toBe(manifest.key);
       expect(drillRes.collections).toBeGreaterThanOrEqual(3);
+      expect(drillRes.indexesVerified).toBeGreaterThanOrEqual(5);
+      expect(drillRes.validatorsVerified).toBe(1);
+      expect(drillRes.viewsVerified).toBe(1);
+      expect(drillRes.readWriteVerified).toBe(true);
 
       // 3. Post-backup writes: single insert, new unique index (commitIndexBuild), and multi-doc ACID txn
       await client
@@ -188,7 +223,10 @@ describe("Real MongoDB 8.0 End-to-End Verification (All 3 Engines + PITR)", () =
       // 4. Catastrophic accidental writes AFTER targetTs
       await new Promise((r) => setTimeout(r, 1100)); // ensure distinct oplog second
       await client.db("shop").collection("orders").deleteMany({});
-      await client.db("shop").collection("users").insertOne({ _id: "u-bad", name: "PostDisaster" });
+      await client
+        .db("shop")
+        .collection("users")
+        .insertOne({ _id: "u-bad", name: "PostDisaster", balance: 0 });
       await client.db("analytics").collection("events").drop();
 
       const afterDisasterTs = await getLatestOplogTs(rs.uri);
@@ -207,6 +245,16 @@ describe("Real MongoDB 8.0 End-to-End Verification (All 3 Engines + PITR)", () =
       );
       expect(restoreRes.pitrTarget).toBe(pitrStr);
       expect(restoreRes.replayedEntries).toBeGreaterThan(0);
+      expect(restoreRes.oplogStats?.partialTxns).toBe(0);
+      expect(restoreRes.oplogStats?.unknownCommands).toEqual([]);
+
+      // Also run an automated PITR restore drill against isolated drillRs!
+      const pitrDrillRes = await runDrill({ config, storage, logger }, { pitr: pitrStr });
+      expect(pitrDrillRes.pitrTarget).toBe(pitrStr);
+      expect(pitrDrillRes.validatorsVerified).toBe(1);
+      expect(pitrDrillRes.viewsVerified).toBe(1);
+      expect(pitrDrillRes.readWriteVerified).toBe(true);
+      expect(pitrDrillRes.oplogStats?.partialTxns).toBe(0);
 
       // Verify exact PITR state
       const u1 = await client.db("shop").collection("users").findOne({ _id: "u1" });
@@ -225,8 +273,22 @@ describe("Real MongoDB 8.0 End-to-End Verification (All 3 Engines + PITR)", () =
       const indexes = await client.db("shop").collection("orders").indexes();
       expect(indexes.some((idx) => idx.name === "sku_unique" && idx.unique === true)).toBe(true);
 
-      // Verify analytics.events drop after targetTs was undone
+      // Verify analytics.events drop after targetTs was undone & restored constraints are enforced
       expect(await client.db("analytics").collection("events").countDocuments()).toBe(1);
+      await expect(
+        client
+          .db("shop")
+          .collection("users")
+          .insertOne({ _id: "u-invalid", name: "MissingBalance" }),
+      ).rejects.toThrow(/validation/i);
+      await expect(
+        client
+          .db("shop")
+          .collection("users")
+          .insertOne({ _id: "u-dup", name: "Alice", balance: 1 }),
+      ).rejects.toThrow(/E11000|duplicate key/i);
+      const activeViewDocs = await client.db("shop").collection("active_users").find({}).toArray();
+      expect(activeViewDocs.length).toBe(2);
 
       // 6. Verify selective namespace-filtered PITR restore into an isolated target database on drillRs
       const selectiveRes = await restoreBackup(
@@ -457,12 +519,25 @@ describe("Real MongoDB 8.0 End-to-End Verification (All 3 Engines + PITR)", () =
       const verified = await verifyBackup({ config, storage, logger }, clusterBackup.manifest.key);
       expect(verified.sha256).toBe(clusterBackup.manifest.sha256);
 
-      // 3. Post-backup writes: new inserts + REAL cross-shard distributed ACID transaction!
+      // 3. Post-backup writes: new insert, capture pre-commit timestamp, then REAL cross-shard distributed ACID transaction!
       await mongosClient.db("globaldb").collection("accounts").insertOne({
         _id: "acct-pitr-new",
         balance: 500,
         phase: "pitr",
       });
+
+      const [preCfgTs, preS1Ts, preS2Ts] = await Promise.all([
+        getLatestOplogTs(cluster.cfgRs.uri),
+        getLatestOplogTs(cluster.shard01.uri),
+        getLatestOplogTs(cluster.shard02.uri),
+      ]);
+      await Promise.all([
+        waitForMajorityCatchup(cluster.cfgRs.uri, preCfgTs),
+        waitForMajorityCatchup(cluster.shard01.uri, preS1Ts),
+        waitForMajorityCatchup(cluster.shard02.uri, preS2Ts),
+      ]);
+      const preCommitClusterTs = await getClusterTime(cluster.mongosUri);
+      await new Promise((r) => setTimeout(r, 1100)); // distinct oplog second before distributed commit
 
       const session = mongosClient.startSession();
       try {
@@ -522,7 +597,29 @@ describe("Real MongoDB 8.0 End-to-End Verification (All 3 Engines + PITR)", () =
       ]);
       await captureShardedOplogSlices({ config, storage, logger });
 
-      // 5. Sharded PITR restore (real CsrsRestorer + shard restores + streaming OplogApplier + cross-shard txn reconciliation + flushRouterConfig)
+      // 5a. First prove sharded PITR recovery immediately BEFORE the distributed commit!
+      const prePitrStr = formatOplogTimestamp(preCommitClusterTs);
+      const preRestoreRes = await restoreShardedCluster({
+        config,
+        storage,
+        logger,
+        pitr: prePitrStr,
+        drop: true,
+      });
+      expect(preRestoreRes.oplogStats?.partialTxns).toBe(0);
+      expect(await mongosClient.db("globaldb").collection("accounts").countDocuments()).toBe(41);
+      const preAcct1 = await mongosClient
+        .db("globaldb")
+        .collection("accounts")
+        .findOne({ _id: s1DocId });
+      const preAcct2 = await mongosClient
+        .db("globaldb")
+        .collection("accounts")
+        .findOne({ _id: s2DocId });
+      expect(preAcct1.balance).toBe(1000);
+      expect(preAcct2.balance).toBe(1000);
+
+      // 5b. Now prove sharded PITR recovery immediately AFTER the distributed commit!
       const pitrStr = formatOplogTimestamp(targetClusterTs);
       const restoreRes = await restoreShardedCluster({
         config,
@@ -534,6 +631,8 @@ describe("Real MongoDB 8.0 End-to-End Verification (All 3 Engines + PITR)", () =
       expect(restoreRes.configsvrRestored).toBe(true);
       expect(restoreRes.restoredShards.sort()).toEqual(["shard01", "shard02"]);
       expect(restoreRes.pitrTarget).toBe(pitrStr);
+      expect(restoreRes.oplogStats?.partialTxns).toBe(0);
+      expect(restoreRes.oplogStats?.unknownCommands).toEqual([]);
 
       // 6. Verify exact cluster state via mongos!
       const totalRestored = await mongosClient
