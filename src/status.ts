@@ -11,6 +11,15 @@ import {
   parseOplogTimestamp,
   pitrStateKey,
 } from "./oplog.js";
+import {
+  badge,
+  renderBanner,
+  renderKeyValue,
+  renderPanel,
+  renderTable,
+  style,
+  type KeyValueRow,
+} from "./tui.js";
 import type { AppConfig } from "./types/config.js";
 import type { Logger } from "./types/logger.js";
 import type {
@@ -249,119 +258,184 @@ export async function getStatus({
 }
 
 export function formatStatus(status: SystemStatus): string {
-  const lines: string[] = [];
+  const sections: string[] = [renderBanner("System Status")];
 
   // Cluster Section
-  lines.push("Cluster Topology & Health:");
-  lines.push("===========================");
-  if (!status.cluster.connected) {
-    lines.push(`  Connection: FAILED (${status.cluster.error || "unable to connect"})`);
-  } else {
+  const clusterRows: KeyValueRow[] = [];
+  if (status.cluster.connected) {
     const topo = status.cluster.setName
       ? `Replica Set [${status.cluster.setName}]`
       : status.cluster.role === "mongos"
         ? "Sharded Cluster (mongos)"
         : "Standalone Instance";
-    lines.push(`  Topology:        ${topo}`);
-    lines.push(`  Server Version:  MongoDB v${status.cluster.version}`);
-    lines.push(
-      `  Node Address:    ${status.cluster.me || "unknown"} [${status.cluster.role?.toUpperCase()}]`,
+    clusterRows.push(
+      { label: "Topology", value: topo, tone: "info" },
+      { label: "Server Version", value: `MongoDB v${status.cluster.version}` },
+      {
+        label: "Node Address",
+        value: `${status.cluster.me || "unknown"} [${status.cluster.role?.toUpperCase()}]`,
+      },
     );
     if (status.cluster.primaryHost) {
-      lines.push(`  Primary Host:    ${status.cluster.primaryHost}`);
+      clusterRows.push({ label: "Primary Host", value: status.cluster.primaryHost });
     }
-    lines.push(`  Read Preference: ${status.cluster.readPreference}`);
+    clusterRows.push({
+      label: "Read Preference",
+      value: status.cluster.readPreference || "secondaryPreferred",
+    });
     if (status.cluster.oplog) {
-      if (status.cluster.oplog.available) {
-        lines.push(
-          `  Oplog Window:    ${status.cluster.oplog.oldestTs} -> ${status.cluster.oplog.newestTs} (${status.cluster.oplog.retentionHours} hours)`,
-        );
-      } else {
-        lines.push(`  Oplog Window:    Not Available / Empty`);
-      }
+      clusterRows.push(
+        status.cluster.oplog.available
+          ? {
+              label: "Oplog Window",
+              value: `${status.cluster.oplog.oldestTs} -> ${status.cluster.oplog.newestTs} (${status.cluster.oplog.retentionHours} hours)`,
+              tone: "success",
+            }
+          : { label: "Oplog Window", value: "Not Available / Empty", tone: "warn" },
+      );
     }
   }
-  lines.push("");
+  const clusterLines = !status.cluster.connected
+    ? [`  ${badge("Connection: FAILED", "error")} (${status.cluster.error || "unable to connect"})`]
+    : renderKeyValue(clusterRows, { indent: 1 });
+  sections.push(
+    renderPanel(clusterLines, {
+      title: "Cluster Topology & Health",
+      tone: status.cluster.connected ? "brand" : "error",
+    }),
+  );
 
   // Storage Section
-  lines.push("Storage Destination:");
-  lines.push("====================");
-  lines.push(`  Backend Type:    ${status.storage.type.toUpperCase()}`);
-  lines.push(`  Destination:     ${status.storage.destination}`);
-  lines.push(
-    `  Status:          ${status.storage.accessible ? "OK" : `UNREACHABLE (${status.storage.error})`}`,
-  );
-  lines.push(
-    `  Total Backups:   ${status.storage.totalBackups} (${formatBytes(status.storage.totalSizeBytes)})`,
-  );
+  const storageRows: KeyValueRow[] = [
+    { label: "Backend Type", value: status.storage.type.toUpperCase() },
+    { label: "Destination", value: status.storage.destination },
+    {
+      label: "Status",
+      value: status.storage.accessible
+        ? badge("OK", "success")
+        : badge(`UNREACHABLE (${status.storage.error})`, "error"),
+    },
+    {
+      label: "Total Backups",
+      value: `${status.storage.totalBackups} (${formatBytes(status.storage.totalSizeBytes)})`,
+    },
+  ];
   if (status.storage.latestBackup) {
     const lat = status.storage.latestBackup;
     const flags = [
-      lat.encrypted ? "encrypted" : "unencrypted",
+      lat.encrypted ? badge("encrypted", "success") : badge("unencrypted", "warn"),
       lat.oplog ? "oplog-consistent" : "snapshot-only",
-    ].join(", ");
-    lines.push(
-      `  Latest Backup:   ${formatDate(lat.createdAt)} (${formatBytes(lat.sizeBytes)}, ${flags})`,
-    );
+    ].join(" · ");
+    storageRows.push({
+      label: "Latest Backup",
+      value: `${formatDate(lat.createdAt)} (${formatBytes(lat.sizeBytes)})  ${flags}`,
+    });
   }
-  lines.push("");
+  sections.push(
+    renderPanel(renderKeyValue(storageRows, { indent: 1 }), {
+      title: "Storage Destination",
+      tone: status.storage.accessible ? "info" : "error",
+    }),
+  );
 
   // PITR Section
-  lines.push("Point-in-Time Recovery (PITR):");
-  lines.push("==============================");
-  lines.push(
-    `  Status:          ${status.pitr.enabled ? `Active (${status.pitr.flushIntervalSeconds}s flush interval)` : "Disabled"}`,
-  );
-  lines.push(`  Archived Slices: ${status.pitr.slicesCount}`);
+  const pitrRows: KeyValueRow[] = [
+    {
+      label: "Status",
+      value: status.pitr.enabled
+        ? badge(`Active (${status.pitr.flushIntervalSeconds}s flush interval)`, "success")
+        : badge("Disabled", "muted"),
+    },
+    { label: "Archived Slices", value: String(status.pitr.slicesCount) },
+  ];
   if (status.pitr.earliestTs && status.pitr.latestTs) {
-    lines.push(`  Timeline Window: ${status.pitr.earliestTs} -> ${status.pitr.latestTs}`);
-    lines.push(
-      `  Contiguity:      ${status.pitr.timelineContinuous ? "Continuous (no gaps detected)" : `WARNING: ${status.pitr.gapWarning}`}`,
+    pitrRows.push(
+      { label: "Timeline Window", value: `${status.pitr.earliestTs} -> ${status.pitr.latestTs}` },
+      {
+        label: "Contiguity",
+        value: status.pitr.timelineContinuous
+          ? badge("Continuous (no gaps detected)", "success")
+          : badge(`WARNING: ${status.pitr.gapWarning}`, "warn"),
+      },
     );
   }
-  lines.push("");
+  sections.push(
+    renderPanel(renderKeyValue(pitrRows, { indent: 1 }), {
+      title: "Point-in-Time Recovery (PITR)",
+      tone: !status.pitr.enabled ? "default" : status.pitr.timelineContinuous ? "success" : "warn",
+    }),
+  );
 
-  // Running Operation Section
-  lines.push("Running Operations:");
-  lines.push("===================");
-  if (status.operation.running) {
-    lines.push(`  Status:          ACTIVE (${status.operation.lockType} lock)`);
-    lines.push(`  Holder:          ${status.operation.holder || "unknown"}`);
-    lines.push(`  Started At:      ${status.operation.acquiredAt || "unknown"}`);
-    if (status.operation.expiresAt) {
-      lines.push(`  Lease Expires:   ${status.operation.expiresAt}`);
-    }
-  } else {
-    lines.push("  Status:          Idle (no active backup/restore operation)");
-  }
-  lines.push("");
+  // Running Operation & Engine/Compliance Sections
+  const opRows: KeyValueRow[] = status.operation.running
+    ? [
+        { label: "Status", value: badge(`ACTIVE (${status.operation.lockType} lock)`, "info") },
+        { label: "Holder", value: status.operation.holder || "unknown" },
+        { label: "Started At", value: status.operation.acquiredAt || "unknown" },
+        ...(status.operation.expiresAt
+          ? [{ label: "Lease Expires", value: status.operation.expiresAt }]
+          : []),
+      ]
+    : [{ label: "Status", value: badge("Idle (no active backup/restore operation)", "muted") }];
+  sections.push(
+    renderPanel(renderKeyValue(opRows, { indent: 1 }), {
+      title: "Running Operations",
+      tone: status.operation.running ? "info" : "default",
+    }),
+  );
 
-  // Engine & Security Section
-  lines.push("Engine & Compliance:");
-  lines.push("====================");
-  lines.push(`  Backup Engine:   ${(status.engine || "logical").toUpperCase()}`);
-  if (status.objectLock?.enabled) {
-    lines.push(
-      `  S3 Object Lock:  ACTIVE (WORM ${status.objectLock.mode}, ${status.objectLock.retentionDays} days retention)`,
-    );
-  } else {
-    lines.push("  S3 Object Lock:  Disabled");
-  }
-  if (status.sharding) {
-    lines.push(
-      `  Sharded Cluster: ${status.sharding.isSharded ? "Active (Multi-Shard Coordinated)" : "Inactive"}`,
-    );
-  }
+  const engineRows: KeyValueRow[] = [
+    { label: "Backup Engine", value: (status.engine || "logical").toUpperCase(), tone: "info" },
+    {
+      label: "S3 Object Lock",
+      value: status.objectLock?.enabled
+        ? badge(
+            `ACTIVE (WORM ${status.objectLock.mode}, ${status.objectLock.retentionDays}d retention)`,
+            "success",
+          )
+        : style.dim("Disabled"),
+    },
+    ...(status.sharding
+      ? [
+          {
+            label: "Sharded Cluster",
+            value: status.sharding.isSharded
+              ? badge("Active (Multi-Shard Coordinated)", "info")
+              : style.dim("Inactive"),
+          },
+        ]
+      : []),
+  ];
+  sections.push(
+    renderPanel(renderKeyValue(engineRows, { indent: 1 }), {
+      title: "Engine & Compliance",
+    }),
+  );
 
   // Recent Backups Table
   if (status.recentBackups && status.recentBackups.length > 0) {
-    lines.push("");
-    lines.push("Recent Completed Backups:");
-    lines.push("=========================");
-    for (const b of status.recentBackups) {
-      lines.push(`  • ${b.key} | ${formatDate(b.createdAt)} | ${formatBytes(b.size || 0)}`);
-    }
+    const tbl = renderTable(
+      [
+        { header: "Backup Key", maxWidth: 56 },
+        { header: "Created" },
+        { header: "Size", align: "right" },
+        { header: "Security" },
+      ],
+      status.recentBackups.map((b) => [
+        b.key,
+        formatDate(b.createdAt),
+        formatBytes(b.size || 0),
+        b.encrypted ? badge("AES-256", "success") : style.dim("plain"),
+      ]),
+      { indent: 1 },
+    );
+    sections.push(
+      renderPanel(tbl.split("\n"), {
+        title: "Recent Completed Backups",
+        subtitle: `latest ${status.recentBackups.length}`,
+      }),
+    );
   }
 
-  return lines.join("\n");
+  return sections.join("\n\n");
 }

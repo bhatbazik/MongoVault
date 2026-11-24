@@ -5,6 +5,7 @@ import { MongoClient } from "mongodb";
 import { createDecryptor, createEncryptor, keyId } from "./crypto.js";
 import { fromBsonTimestamp } from "./oplog.js";
 import { checkDatabaseTools, checkTool } from "./tools.js";
+import { badge, padVisibleEnd, renderBanner, renderPanel, style } from "./tui.js";
 import type { AppConfig } from "./types/config.js";
 import type { StorageClient } from "./types/storage.js";
 
@@ -370,21 +371,44 @@ export async function runPreflightCheck({
 }
 
 export function formatPreflightCheck(result: PreflightCheckResult): string {
+  const passedCount = result.checks.filter((c) => c.passed).length;
+  const totalCount = result.checks.length;
+  const nameWidth = result.checks.reduce((max, c) => Math.max(max, c.name.length), 26);
+
   const lines: string[] = [];
-  lines.push("MongoVault Preflight System Verification:");
-  lines.push("==========================================");
-
   for (const check of result.checks) {
-    const symbol = check.passed ? "✓ PASS" : "✗ FAIL";
-    lines.push(`  [${symbol}] ${check.name.padEnd(30)} : ${check.message}`);
+    const isWarn = check.passed && check.message.includes("WARNING:");
+    const statusBadge = !check.passed
+      ? badge("FAIL", "error")
+      : isWarn
+        ? badge("WARN", "warn")
+        : badge("PASS", "success");
+    const msg = !check.passed
+      ? style.red(check.message)
+      : isWarn
+        ? style.yellow(check.message)
+        : check.message;
+    lines.push(
+      ` ${padVisibleEnd(statusBadge, 8)} ${padVisibleEnd(style.bold(check.name), nameWidth)}  ${msg}`,
+    );
   }
 
-  lines.push("==========================================");
+  lines.push("");
   if (result.allPassed) {
-    lines.push("All system prerequisites PASSED. Ready for backup and restore operations.");
+    lines.push(
+      ` ${badge("All system prerequisites PASSED. Ready for backup and restore operations.", "success")}`,
+    );
   } else {
-    lines.push("One or more prerequisite checks FAILED. Please resolve the errors above.");
+    lines.push(
+      ` ${badge("One or more prerequisite checks FAILED. Please resolve the errors above.", "error")}`,
+    );
   }
 
-  return lines.join("\n");
+  const panel = renderPanel(lines, {
+    title: "MongoVault Preflight System Verification",
+    subtitle: `${passedCount}/${totalCount} passed`,
+    tone: result.allPassed ? "success" : "error",
+  });
+
+  return `${renderBanner("Preflight Check")}\n\n${panel}`;
 }

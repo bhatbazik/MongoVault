@@ -15,6 +15,7 @@ import {
 import { PruneCommand } from "./prune.js";
 import { RestoreCommand } from "./restore.js";
 import { StatusCommand } from "./status.js";
+import { TuiCommand } from "./tui.js";
 import type { CommandHandler } from "./types.js";
 import { VerifyCommand } from "./verify.js";
 
@@ -25,6 +26,8 @@ export * from "./types.js";
  */
 export class CommandRegistry {
   private static readonly commands = new Map<string, CommandHandler>([
+    ["tui", new TuiCommand()],
+    ["ui", new TuiCommand()],
     ["status", new StatusCommand()],
     ["check", new CheckCommand()],
     ["describe", new DescribeCommand()],

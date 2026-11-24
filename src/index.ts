@@ -2,6 +2,7 @@
 import "dotenv/config";
 import { runCli } from "./cli.js";
 import { loadConfig } from "./config.js";
+import { renderErrorBox } from "./tui.js";
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
@@ -25,9 +26,13 @@ async function main(): Promise<void> {
 main().catch((error: unknown) => {
   const err = error as { name?: string; message?: string; stack?: string };
   if (err.name === "ConfigError") {
-    console.error(err.message);
+    console.error(renderErrorBox("Configuration Error", error));
   } else {
-    console.error("Fatal error:", err.stack || err.message || error);
+    console.error(
+      renderErrorBox("Fatal Error", error, {
+        showStack: process.env.LOG_LEVEL === "debug" || process.env.LOG_LEVEL === "trace",
+      }),
+    );
   }
   process.exit(1);
 });

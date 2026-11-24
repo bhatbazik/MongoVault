@@ -1,5 +1,15 @@
-import { formatDate, formatDuration, formatBytes } from "../format.js";
+import { formatBytes, formatDate, formatDuration } from "../format.js";
 import { describeBackup } from "../restore.js";
+import {
+  badge,
+  renderBanner,
+  renderBar,
+  renderKeyValue,
+  renderPanel,
+  renderTable,
+  style,
+  type KeyValueRow,
+} from "../tui.js";
 import type { CliCommandContext, CommandHandler } from "./types.js";
 
 export class DescribeCommand implements CommandHandler {
@@ -12,53 +22,111 @@ export class DescribeCommand implements CommandHandler {
       );
       if (values.json) {
         console.log(JSON.stringify({ key, checksum, manifest }, null, 2));
-      } else if (manifest) {
-        console.log("\nBackup Metadata Details");
-        console.log("=======================");
-        console.log(`Key:          ${manifest.key}`);
-        console.log(`Engine:       ${(manifest.engine || "logical").toUpperCase()}`);
-        console.log(`Database:     ${manifest.database}`);
-        console.log(`Created At:   ${formatDate(manifest.createdAt)}`);
-        console.log(`Completed At: ${formatDate(manifest.completedAt)}`);
-        console.log(`Duration:     ${formatDuration(manifest.durationMs)}`);
-        console.log(`Archive Size: ${formatBytes(manifest.size)} (${manifest.size} bytes)`);
-        console.log(`SHA-256:      ${manifest.sha256}`);
-        console.log(`Compression:  ${manifest.compression}`);
-        if (manifest.encryption) {
-          console.log(
-            `Encryption:   ${manifest.encryption.algorithm} (Key ID: ${manifest.encryption.keyId})`,
-          );
-        } else {
-          console.log("Encryption:   None (Unencrypted)");
-        }
-        if (manifest.oplogWindow) {
-          console.log(
-            `Oplog Window: ${manifest.oplogWindow.startTs} -> ${manifest.oplogWindow.endTs}`,
-          );
-        }
-        if (manifest.physical) {
-          console.log(
-            `Physical:     ${manifest.physical.cursorType} (${manifest.physical.filesCount} files, dbPath: ${manifest.physical.dbPath})`,
-          );
-        }
-        if (manifest.sharding) {
-          console.log(
-            `Sharding:     ${Object.keys(manifest.sharding.shards).length} shards (clusterTime: ${manifest.sharding.clusterTime})`,
-          );
-        }
-        if (manifest.excludedCollections && manifest.excludedCollections.length > 0) {
-          console.log(`Excluded:     ${manifest.excludedCollections.join(", ")}`);
-        }
-        if (manifest.collections && Object.keys(manifest.collections).length > 0) {
-          console.log("\nCollections & Document Counts:");
-          console.log("------------------------------");
-          for (const [coll, count] of Object.entries(manifest.collections)) {
-            console.log(`  • ${coll.padEnd(35)} : ${count.toLocaleString()} docs`);
-          }
-        }
-      } else {
-        console.log(`Backup found: ${key} (No .manifest.json available)`);
+        return;
       }
+
+      if (!manifest) {
+        console.log(
+          `\n${renderBanner("Describe Backup")}\n\n${renderPanel(
+            [`  ${badge(`Backup found: ${key} (No .manifest.json available)`, "warn")}`],
+            { title: "Backup Metadata", tone: "warn" },
+          )}`,
+        );
+        return;
+      }
+
+      const rows: KeyValueRow[] = [
+        { label: "Key", value: manifest.key },
+        { label: "Engine", value: (manifest.engine || "logical").toUpperCase(), tone: "info" },
+        { label: "Database", value: manifest.database },
+        { label: "Created At", value: formatDate(manifest.createdAt) },
+        { label: "Completed At", value: formatDate(manifest.completedAt) },
+        { label: "Duration", value: formatDuration(manifest.durationMs) },
+        {
+          label: "Archive Size",
+          value: `${formatBytes(manifest.size)} ${style.dim(`(${manifest.size.toLocaleString()} bytes)`)}`,
+        },
+        { label: "SHA-256", value: manifest.sha256 },
+        { label: "Compression", value: manifest.compression },
+        {
+          label: "Encryption",
+          value: manifest.encryption
+            ? badge(
+                `${manifest.encryption.algorithm} (Key ID: ${manifest.encryption.keyId})`,
+                "success",
+              )
+            : badge("None (Unencrypted)", "warn"),
+        },
+      ];
+
+      if (manifest.oplogWindow) {
+        rows.push({
+          label: "Oplog Window",
+          value: `${manifest.oplogWindow.startTs} -> ${manifest.oplogWindow.endTs}`,
+          tone: "info",
+        });
+      }
+      if (manifest.physical) {
+        rows.push({
+          label: "Physical",
+          value: `${manifest.physical.cursorType} (${manifest.physical.filesCount} files, dbPath: ${manifest.physical.dbPath})`,
+        });
+      }
+      if (manifest.sharding) {
+        rows.push({
+          label: "Sharding",
+          value: `${Object.keys(manifest.sharding.shards).length} shards (clusterTime: ${manifest.sharding.clusterTime})`,
+        });
+      }
+      if (manifest.excludedCollections && manifest.excludedCollections.length > 0) {
+        rows.push({ label: "Excluded", value: manifest.excludedCollections.join(", ") });
+      }
+      if (manifest.schema) {
+        const schemaColls = Object.values(manifest.schema.collections || {});
+        const idxCount = schemaColls.reduce((sum, c) => sum + (c.indexes?.length ?? 0), 0);
+        const valCount = schemaColls.filter((c) => Boolean(c.options?.validator)).length;
+        const viewCount = manifest.schema.views?.length ?? 0;
+        rows.push({
+          label: "Schema Recorded",
+          value: `${idxCount} indexes · ${valCount} validators · ${viewCount} views`,
+          tone: "success",
+        });
+      }
+
+      const sections = [
+        renderBanner("Backup Metadata"),
+        renderPanel(renderKeyValue(rows, { indent: 1 }), {
+          title: "Backup Metadata Details",
+          tone: "brand",
+        }),
+      ];
+
+      const entries = Object.entries(manifest.collections || {});
+      if (entries.length > 0) {
+        const totalDocs = entries.reduce((sum, [, c]) => sum + c, 0);
+        const sorted = [...entries].sort((a, b) => b[1] - a[1]);
+        const tbl = renderTable(
+          [
+            { header: "Namespace", maxWidth: 44 },
+            { header: "Documents", align: "right" },
+            { header: "Share" },
+          ],
+          sorted.map(([coll, count]) => {
+            const ratio = totalDocs > 0 ? count / totalDocs : 0;
+            const pct = `${(ratio * 100).toFixed(1)}%`;
+            return [coll, count.toLocaleString(), `${renderBar(ratio, 12)} ${style.dim(pct)}`];
+          }),
+          { indent: 1 },
+        );
+        sections.push(
+          renderPanel(tbl.split("\n"), {
+            title: "Collections & Document Counts",
+            subtitle: `${entries.length} collections · ${totalDocs.toLocaleString()} docs`,
+          }),
+        );
+      }
+
+      console.log(`\n${sections.join("\n\n")}`);
     } catch (error) {
       logger.error({ err: error }, "Failed to describe backup");
       process.exit(1);

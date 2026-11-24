@@ -25,6 +25,7 @@
     "typecheck": "tsc --noEmit",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js daemon",
+    "tui": "node dist/index.js tui",
     "status": "node dist/index.js status",
     "describe": "node dist/index.js describe",
     "diagnostic": "node dist/index.js diagnostic",

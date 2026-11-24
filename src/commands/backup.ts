@@ -3,6 +3,15 @@ import { databasePrefix, isClusterScope, scopeOf } from "../catalog.js";
 import { EngineRegistry } from "../engines.js";
 import { formatBytes, formatDuration } from "../format.js";
 import { acquireHybridLock } from "../lock.js";
+import {
+  badge,
+  createSpinner,
+  renderBanner,
+  renderErrorBox,
+  renderKeyValue,
+  renderPanel,
+  type KeyValueRow,
+} from "../tui.js";
 import type { AppConfig } from "../types/config.js";
 import type { CliCommandContext, CommandHandler } from "./types.js";
 
@@ -15,13 +24,21 @@ export class BackupCommand implements CommandHandler {
 
     if (targetOplog && !isClusterScope(targetDb)) {
       console.error(
-        "Error: --oplog can only be used with full cluster backup (database: * or all)",
+        renderErrorBox(
+          "Invalid Backup Flags",
+          new Error("--oplog can only be used with full cluster backup (database: * or all)"),
+        ),
       );
       process.exit(1);
     }
     if (isClusterScope(targetDb) && config.mongo.excludeCollections?.length > 0) {
       console.error(
-        "Error: MONGODB_EXCLUDE_COLLECTIONS cannot be used with full cluster backup (database: * or all)",
+        renderErrorBox(
+          "Invalid Backup Configuration",
+          new Error(
+            "MONGODB_EXCLUDE_COLLECTIONS cannot be used with full cluster backup (database: * or all)",
+          ),
+        ),
       );
       process.exit(1);
     }
@@ -55,9 +72,21 @@ export class BackupCommand implements CommandHandler {
     });
 
     if (!releaseLock) {
-      console.error("Error: Another backup is already in progress (failed to acquire backup lock)");
+      console.error(
+        renderErrorBox(
+          "Backup Lock Busy",
+          new Error("Another backup is already in progress (failed to acquire backup lock)"),
+        ),
+      );
       process.exit(1);
     }
+
+    const spinner = createSpinner(
+      `Streaming ${values.engine || config.engine || "logical"} backup`,
+      {
+        enabled: !values.json && Boolean(process.stderr.isTTY),
+      },
+    );
 
     try {
       const engine = EngineRegistry.resolveForBackup({
@@ -74,20 +103,45 @@ export class BackupCommand implements CommandHandler {
         dbPath: values["db-path"],
       });
 
+      spinner.succeed("Backup uploaded and verified");
+
       if (values.json) {
         console.log(JSON.stringify(manifest, null, 2));
       } else {
-        console.log("\nBackup Completed Successfully");
-        console.log(`Engine:     ${manifest.engine || "logical"}`);
-        console.log(`Key:        ${manifest.key}`);
-        console.log(`Size:       ${formatBytes(manifest.size)}`);
-        console.log(`Duration:   ${formatDuration(manifest.durationMs)}`);
-        console.log(`SHA-256:    ${manifest.sha256}`);
-        console.log(`Encrypted:  ${Boolean(manifest.encryption)}`);
-        console.log(`Oplog:      ${Boolean(manifest.oplog)}`);
+        const rows: KeyValueRow[] = [
+          { label: "Engine", value: (manifest.engine || "logical").toUpperCase(), tone: "info" },
+          { label: "Key", value: manifest.key },
+          { label: "Size", value: formatBytes(manifest.size) },
+          { label: "Duration", value: formatDuration(manifest.durationMs) },
+          { label: "SHA-256", value: manifest.sha256 },
+          {
+            label: "Encrypted",
+            value: manifest.encryption
+              ? badge(manifest.encryption.algorithm || "AES-256-GCM", "success")
+              : badge("false (unencrypted)", "warn"),
+          },
+          {
+            label: "Oplog",
+            value: manifest.oplog
+              ? badge(
+                  manifest.oplogWindow
+                    ? `enabled (${manifest.oplogWindow.startTs} -> ${manifest.oplogWindow.endTs})`
+                    : "enabled",
+                  "success",
+                )
+              : "false",
+          },
+        ];
+        console.log(
+          `\n${renderBanner("Backup")}\n\n${renderPanel(renderKeyValue(rows, { indent: 1 }), {
+            title: "Backup Completed Successfully",
+            tone: "success",
+          })}`,
+        );
       }
       await notifier.notifySuccess("backup", manifest);
     } catch (error) {
+      spinner.fail("Backup failed");
       await notifier.notifyFailure(
         "backup",
         error instanceof Error ? error : new Error(String(error)),
