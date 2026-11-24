@@ -57,6 +57,14 @@ const IGNORED_SAFE_OPLOG_COMMANDS = new Set([
   "migrateCloneStart",
   "migrateCloneComplete",
   "noop",
+  // MongoDB 9.0+ authoritative shard catalog notifications (reconciled post-restore from CSRS)
+  "createDatabaseMetadata",
+  "dropDatabaseMetadata",
+  "invalidateCollectionMetadata",
+  "invalidateAllCollectionMetadata",
+  "invalidateAllDatabaseMetadata",
+  "updateCollectionMetadata",
+  "setAllowChunkOperations",
 ]);
 
 const KNOWN_OPLOG_COMMANDS = new Set([

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { PassThrough, Readable } from "node:stream";
 import { createGunzip } from "node:zlib";
-import { BSON, Binary, MongoClient } from "mongodb";
+import { BSON, Binary, Long, MongoClient } from "mongodb";
 import { linkedController, settleAll } from "./abort.js";
 import { streamArchiveCollections } from "./archive-stream.js";
 import { runBackup } from "./backup.js";
@@ -1659,15 +1659,126 @@ export async function restoreShardedCluster({
       }
     }
 
-    // 5. Flush routing metadata on mongos AND every shard primary
-    await client
-      .db("admin")
-      .command({ flushRouterConfig: 1 })
-      .catch(() => {});
-    for (const shardUri of shardUris.values()) {
+    // 5. Synchronize routing & authoritative shard catalog metadata across CSRS, all shards, and mongos
+    // Order matters (especially on MongoDB 9.0 Authoritative Shards):
+    //   5a. Flush CSRS RoutingInformationCache so CSRS serves the restored config.{databases,collections,chunks}
+    //   5b. On each shard primary, commit restored DB/collection metadata into config.shard.catalog.*
+    //       (MongoDB 9.0+) or flush routing/database cache updates (MongoDB 7.0/8.0), then flushRouterConfig
+    //   5c. Flush mongos router cache LAST so subsequent queries see fully converged CSRS + shard metadata
+    let restoredConfigDbs: Array<{ _id: string; primary?: string; version?: unknown }> = [];
+    let restoredConfigColls: Array<{ _id: string }> = [];
+
+    if (targetTopology?.configsvr?.host) {
+      const cfgSyncClient = createMongoClient(targetConfigsvrUri);
+      try {
+        await cfgSyncClient.connect();
+        await cfgSyncClient
+          .db("admin")
+          .command({ flushRouterConfig: 1 })
+          .catch(() => {});
+        const cfgDb = cfgSyncClient.db("config");
+        if (typeof cfgDb.collection === "function") {
+          const dbsColl = cfgDb.collection<{ _id: string; primary?: string; version?: unknown }>(
+            "databases",
+          );
+          if (typeof dbsColl.find === "function") {
+            restoredConfigDbs = await dbsColl
+              .find({})
+              .toArray()
+              .catch(() => []);
+          }
+          const collsColl = cfgDb.collection<{ _id: string }>("collections");
+          if (typeof collsColl.find === "function") {
+            const allColls = await collsColl
+              .find({})
+              .toArray()
+              .catch(() => []);
+            restoredConfigColls = allColls.filter(
+              (c) => typeof c._id === "string" && c._id !== "config.system.sessions",
+            );
+          }
+        }
+      } catch {
+        // Non-fatal on mocked or unreachable direct configsvr clients
+      } finally {
+        await cfgSyncClient.close().catch(() => {});
+      }
+    }
+
+    const dbPrimaryMap = new Map<string, string>();
+    for (const dbDoc of restoredConfigDbs) {
+      if (typeof dbDoc._id === "string" && typeof dbDoc.primary === "string") {
+        dbPrimaryMap.set(dbDoc._id, dbDoc.primary);
+      }
+    }
+
+    for (const [shardId, shardUri] of shardUris.entries()) {
       const sClient = createMongoClient(shardUri);
       try {
         await sClient.connect();
+        // MongoDB 9.0+ Authoritative Shards: commit restored CSRS metadata into each shard's
+        // durable `config.shard.catalog.*` and reinstall in-memory CSS/DSS caches.
+        if (
+          (restoredConfigDbs.length > 0 || restoredConfigColls.length > 0) &&
+          typeof sClient.startSession === "function"
+        ) {
+          const syncSession = sClient.startSession();
+          let txnSeq = 1;
+          try {
+            for (const dbDoc of restoredConfigDbs) {
+              if (dbDoc.primary === shardId && dbDoc.version) {
+                await sClient
+                  .db(dbDoc._id)
+                  .command(
+                    {
+                      _shardsvrCommitCreateDatabaseMetadata: 1,
+                      dbVersion: dbDoc.version,
+                      txnNumber: Long.fromNumber(txnSeq++),
+                      writeConcern: { w: "majority" },
+                    },
+                    { session: syncSession },
+                  )
+                  .catch(() => {});
+              }
+            }
+            for (const collDoc of restoredConfigColls) {
+              const dot = collDoc._id.indexOf(".");
+              if (dot <= 0) continue;
+              const dbName = collDoc._id.slice(0, dot);
+              const primaryShardId = dbPrimaryMap.get(dbName);
+              if (!primaryShardId) continue;
+              await sClient
+                .db("admin")
+                .command(
+                  {
+                    _shardsvrCommitCreateCollectionMetadata: collDoc._id,
+                    primaryShardId,
+                    txnNumber: Long.fromNumber(txnSeq++),
+                    writeConcern: { w: "majority" },
+                  },
+                  { session: syncSession },
+                )
+                .catch(() => {});
+            }
+          } finally {
+            await syncSession.endSession().catch(() => {});
+          }
+        }
+
+        // MongoDB 7.0 / 8.0 legacy cache refresh (no-op / deprecated on MongoDB 9.0+)
+        for (const dbDoc of restoredConfigDbs) {
+          await sClient
+            .db("admin")
+            .command({ _flushDatabaseCacheUpdates: dbDoc._id, syncFromConfig: true })
+            .catch(() => {});
+        }
+        for (const collDoc of restoredConfigColls) {
+          await sClient
+            .db("admin")
+            .command({ _flushRoutingTableCacheUpdates: collDoc._id, syncFromConfig: true })
+            .catch(() => {});
+        }
+
         await sClient
           .db("admin")
           .command({ flushRouterConfig: 1 })
@@ -1678,6 +1789,11 @@ export async function restoreShardedCluster({
         await sClient.close().catch(() => {});
       }
     }
+
+    await client
+      .db("admin")
+      .command({ flushRouterConfig: 1 })
+      .catch(() => {});
 
     if (balancerStopped && balancerWasEnabled) {
       await balancer.start();

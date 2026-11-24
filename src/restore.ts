@@ -44,6 +44,7 @@ export const CLUSTER_SYSTEM_NS_EXCLUDE = [
   "config.lockpings",
   "config.mongos",
   "config.cache.*",
+  "config.shard.catalog.*",
 ];
 
 export class IntegrityError extends Error {
