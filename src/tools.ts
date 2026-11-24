@@ -24,8 +24,7 @@ import type {
 
 const KILL_GRACE_MS = 10_000;
 const TAIL_LINES = 40;
-const DUMPED =
-  /(?:done dumping|dumped)\s+["']?([^.\s"']+)["']?\.["']?(.+?)["']?\s+\(([\d,]+)\s+documents?\)/i;
+const DUMPED = /(?:done dumping|dumped)\s+(.+?)\s+\(([\d,]+)\s+documents?\)/i;
 const RESTORED =
   /([\d,]+)\s+document\(s\)\s+restored\s+successfully\.\s+([\d,]+)\s+document\(s\)\s+failed/i;
 
@@ -35,13 +34,33 @@ export function isClusterDatabase(database?: string | null): boolean {
 
 export function parseDumpLine(line: string): DumpLineResult | null {
   const match = DUMPED.exec(line);
-  if (!match || !match[1] || !match[2] || !match[3]) {
+  if (!match || !match[1] || !match[2]) {
+    return null;
+  }
+  let ns = match[1].trim();
+  // Strip outer Go %#q backticks or quotes used by mongodb-database-tools >= 100.14 (`db.coll`, "db.coll")
+  if (
+    ns.length >= 2 &&
+    ((ns.startsWith("`") && ns.endsWith("`")) ||
+      (ns.startsWith('"') && ns.endsWith('"')) ||
+      (ns.startsWith("'") && ns.endsWith("'")))
+  ) {
+    ns = ns.slice(1, -1);
+  }
+  const dot = ns.indexOf(".");
+  if (dot <= 0 || dot === ns.length - 1) {
+    return null;
+  }
+  const stripOuterQuotes = (value: string) => value.replace(/^["'`]|["'`]$/g, "");
+  const database = stripOuterQuotes(ns.slice(0, dot));
+  const collection = stripOuterQuotes(ns.slice(dot + 1));
+  if (!database || !collection) {
     return null;
   }
   return {
-    database: match[1],
-    collection: match[2],
-    documents: Number(match[3].replace(/,/g, "")),
+    database,
+    collection,
+    documents: Number(match[2].replace(/,/g, "")),
   };
 }
 
@@ -63,12 +82,18 @@ export function runTool(
 ): RunToolResult {
   const child = spawn(command, args, { stdio: stdio as StdioOptions });
   const tail: string[] = [];
+  let rl: readline.Interface | null = null;
+  let stderrClosed: Promise<void> = Promise.resolve();
 
   if (child.stderr) {
-    readline.createInterface({ input: child.stderr, crlfDelay: Infinity }).on("line", (line) => {
+    rl = readline.createInterface({ input: child.stderr, crlfDelay: Infinity });
+    rl.on("line", (line) => {
       tail.push(line);
       if (tail.length > TAIL_LINES) tail.shift();
       onLine(line);
+    });
+    stderrClosed = new Promise<void>((resolve) => {
+      rl!.once("close", resolve);
     });
   }
 
@@ -109,10 +134,13 @@ export function runTool(
 
     child.once("close", (code, exitSignal) => {
       cleanup();
-      if (failure) return reject(failure);
-      if (code === 0) return resolve();
-      const output = tail.length ? `\n${tail.join("\n")}` : "";
-      reject(new Error(`${command} exited with ${code ?? exitSignal}${output}`));
+      rl?.close();
+      void stderrClosed.then(() => {
+        if (failure) return reject(failure);
+        if (code === 0) return resolve();
+        const output = tail.length ? `\n${tail.join("\n")}` : "";
+        reject(new Error(`${command} exited with ${code ?? exitSignal}${output}`));
+      });
     });
   });
 

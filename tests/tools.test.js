@@ -30,6 +30,23 @@ describe("tools parsers", () => {
       collection: "audit logs.v2",
       documents: 42,
     });
+
+    // mongodb-database-tools >= 100.14 uses Go %#q backtick-quoted namespaces
+    const line4 = "2026-11-24T16:08:44.123+0000\tdone dumping `shop.users` (2 documents)";
+    expect(parseDumpLine(line4)).toEqual({
+      database: "shop",
+      collection: "users",
+      documents: 2,
+    });
+
+    const line5 = "2026-11-24T16:08:44.123+0000\tdone dumping `admin.system.users` (1 document)";
+    expect(parseDumpLine(line5)).toEqual({
+      database: "admin",
+      collection: "system.users",
+      documents: 1,
+    });
+
+    expect(parseDumpLine("dumped 2 documents")).toBeNull();
   });
 
   it("parses mongorestore completion line with commas and counts", () => {
