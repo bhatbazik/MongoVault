@@ -9,7 +9,7 @@ import {
 } from "node:crypto";
 import { Transform, type TransformCallback } from "node:stream";
 import type { BackupManifest } from "./types/catalog.js";
-import type { EncryptionEnvelope, Encryptor } from "./types/crypto.js";
+import type { EncryptionEnvelope, Encryptor, VerifyManifestOptions } from "./types/crypto.js";
 
 export const ALGORITHM = "aes-256-gcm";
 export const CHUNKED_ALGORITHM = "aes-256-gcm-chunked";
@@ -20,10 +20,30 @@ export const TAG_LENGTH = 16;
 export const MAX_FRAME_SIZE = 10 * 1024 * 1024; // 10 MB max frame size safety limit
 export const MAX_FRAME_INDEX = 0xffffffff;
 
+function decodeStrictBase64(value: string, label: string): Buffer {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length % 4 !== 0 ||
+    !/^[A-Za-z0-9+/]+={0,2}$/.test(value)
+  ) {
+    throw new Error(`Invalid base64 encoding for ${label}`);
+  }
+  return Buffer.from(value, "base64");
+}
+
 export function parseKey(value: string): Buffer {
-  const key = /^[0-9a-f]{64}$/i.test(value)
-    ? Buffer.from(value, "hex")
-    : Buffer.from(value, "base64");
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`Encryption key must be ${KEY_LENGTH} bytes (base64 or hex encoded)`);
+  }
+  let key: Buffer;
+  if (/^[0-9a-f]{64}$/i.test(value)) {
+    key = Buffer.from(value, "hex");
+  } else if (value.length % 4 === 0 && /^[A-Za-z0-9+/]+={0,2}$/.test(value)) {
+    key = Buffer.from(value, "base64");
+  } else {
+    throw new Error(`Encryption key must be ${KEY_LENGTH} bytes (base64 or hex encoded)`);
+  }
   if (key.length !== KEY_LENGTH) {
     throw new Error(`Encryption key must be ${KEY_LENGTH} bytes (base64 or hex encoded)`);
   }
@@ -81,21 +101,27 @@ export class ChunkedAeadEncryptStream extends Transform {
 
   override _transform(chunk: Buffer, _encoding: BufferEncoding, callback: TransformCallback): void {
     try {
+      if (chunk.length === 0) {
+        callback();
+        return;
+      }
       this.#buffer.push(chunk);
       this.#bufferedBytes += chunk.length;
 
-      while (this.#bufferedBytes >= this.#chunkSize) {
+      if (this.#bufferedBytes >= this.#chunkSize) {
         const combined =
           this.#buffer.length === 1 && this.#buffer[0]
             ? this.#buffer[0]
             : Buffer.concat(this.#buffer);
-        const slice = combined.subarray(0, this.#chunkSize);
-        const remainder = combined.subarray(this.#chunkSize);
-
+        let offset = 0;
+        while (combined.length - offset >= this.#chunkSize) {
+          const slice = combined.subarray(offset, offset + this.#chunkSize);
+          offset += this.#chunkSize;
+          this.#encryptAndEmit(slice, false);
+        }
+        const remainder = combined.subarray(offset);
         this.#buffer = remainder.length ? [remainder] : [];
         this.#bufferedBytes = remainder.length;
-
-        this.#encryptAndEmit(slice, false);
       }
       callback();
     } catch (err) {
@@ -141,6 +167,7 @@ export class ChunkedAeadDecryptStream extends Transform {
   #frameIndex: number = 0;
   #buffer: Buffer[] = [];
   #bufferedBytes: number = 0;
+  #expectedFrameSize: number | null = null;
   #seenFinal: boolean = false;
 
   constructor(dataKey: Buffer, baseNonce: Buffer) {
@@ -154,53 +181,99 @@ export class ChunkedAeadDecryptStream extends Transform {
       if (this.#seenFinal && chunk.length > 0) {
         throw new Error("Unexpected trailing bytes after final AEAD frame");
       }
+      if (chunk.length === 0) {
+        callback();
+        return;
+      }
       this.#buffer.push(chunk);
       this.#bufferedBytes += chunk.length;
 
-      while (this.#bufferedBytes >= 5 + IV_LENGTH + TAG_LENGTH) {
+      while (true) {
+        if (this.#expectedFrameSize === null) {
+          if (this.#bufferedBytes < 5 + IV_LENGTH + TAG_LENGTH) {
+            break;
+          }
+          let cipherLength: number;
+          if (this.#buffer[0] && this.#buffer[0].length >= 4) {
+            cipherLength = this.#buffer[0].readUInt32BE(0);
+          } else {
+            const head = Buffer.concat(this.#buffer);
+            this.#buffer = [head];
+            cipherLength = head.readUInt32BE(0);
+          }
+          if (cipherLength > MAX_FRAME_SIZE) {
+            throw new Error(`AEAD frame size exceeds limit (${cipherLength} > ${MAX_FRAME_SIZE})`);
+          }
+          this.#expectedFrameSize = 5 + IV_LENGTH + cipherLength + TAG_LENGTH;
+        }
+
+        if (this.#bufferedBytes < this.#expectedFrameSize) {
+          break;
+        }
+
         if (this.#seenFinal) {
           throw new Error("Unexpected trailing frame after final AEAD frame");
         }
+
         const combined =
           this.#buffer.length === 1 && this.#buffer[0]
             ? this.#buffer[0]
             : Buffer.concat(this.#buffer);
-        const cipherLength = combined.readUInt32BE(0);
-        if (cipherLength > MAX_FRAME_SIZE) {
-          throw new Error(`AEAD frame size exceeds limit (${cipherLength} > ${MAX_FRAME_SIZE})`);
+        let offset = 0;
+
+        while (combined.length - offset >= 5 + IV_LENGTH + TAG_LENGTH) {
+          const cipherLength = combined.readUInt32BE(offset);
+          if (cipherLength > MAX_FRAME_SIZE) {
+            throw new Error(`AEAD frame size exceeds limit (${cipherLength} > ${MAX_FRAME_SIZE})`);
+          }
+          const totalFrameSize = 5 + IV_LENGTH + cipherLength + TAG_LENGTH;
+          if (combined.length - offset < totalFrameSize) {
+            this.#expectedFrameSize = totalFrameSize;
+            break;
+          }
+          if (this.#seenFinal) {
+            throw new Error("Unexpected trailing frame after final AEAD frame");
+          }
+
+          const flag = combined.readUInt8(offset + 4);
+          if (flag !== 0 && flag !== 1) {
+            throw new Error(`Invalid AEAD frame flag: ${flag}`);
+          }
+          const isFinal = flag === 1;
+          const nonce = combined.subarray(offset + 5, offset + 5 + IV_LENGTH);
+          const ciphertext = combined.subarray(
+            offset + 5 + IV_LENGTH,
+            offset + 5 + IV_LENGTH + cipherLength,
+          );
+          const authTag = combined.subarray(
+            offset + 5 + IV_LENGTH + cipherLength,
+            offset + totalFrameSize,
+          );
+
+          const frameIdx = this.#frameIndex;
+          const expectedNonce = deriveNonce(this.#baseNonce, frameIdx);
+          if (!nonce.equals(expectedNonce)) {
+            throw new Error(`AEAD frame sequence corrupted or reordered at frame ${frameIdx}`);
+          }
+
+          const decipher = createDecipheriv(ALGORITHM, this.#dataKey, nonce);
+          decipher.setAuthTag(authTag);
+          const aad = computeAad(frameIdx, isFinal);
+          decipher.setAAD(aad);
+
+          const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+
+          this.#frameIndex++;
+          if (isFinal) {
+            this.#seenFinal = true;
+          }
+          offset += totalFrameSize;
+          this.#expectedFrameSize = null;
+
+          this.push(plaintext);
         }
-        const totalFrameSize = 5 + IV_LENGTH + cipherLength + TAG_LENGTH;
 
-        if (combined.length < totalFrameSize) {
-          this.#buffer = [combined];
-          this.#bufferedBytes = combined.length;
-          break;
-        }
-
-        const isFinal = combined.readUInt8(4) === 1;
-        const nonce = combined.subarray(5, 5 + IV_LENGTH);
-        const ciphertext = combined.subarray(5 + IV_LENGTH, 5 + IV_LENGTH + cipherLength);
-        const authTag = combined.subarray(5 + IV_LENGTH + cipherLength, totalFrameSize);
-
-        const frameIdx = this.#frameIndex;
-        const expectedNonce = deriveNonce(this.#baseNonce, frameIdx);
-        if (!nonce.equals(expectedNonce)) {
-          throw new Error(`AEAD frame sequence corrupted or reordered at frame ${frameIdx}`);
-        }
-
-        const decipher = createDecipheriv(ALGORITHM, this.#dataKey, nonce);
-        decipher.setAuthTag(authTag);
-        const aad = computeAad(frameIdx, isFinal);
-        decipher.setAAD(aad);
-
-        const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
-
-        this.#frameIndex++;
-        if (isFinal) {
-          this.#seenFinal = true;
-        }
-
-        const remainder = combined.subarray(totalFrameSize);
+        const remainder = combined.subarray(offset);
         if (this.#seenFinal && remainder.length > 0) {
           throw new Error(
             `Unexpected trailing data after final AEAD frame (${remainder.length} bytes)`,
@@ -208,8 +281,9 @@ export class ChunkedAeadDecryptStream extends Transform {
         }
         this.#buffer = remainder.length ? [remainder] : [];
         this.#bufferedBytes = remainder.length;
-
-        this.push(plaintext);
+        if (this.#expectedFrameSize !== null && this.#bufferedBytes < this.#expectedFrameSize) {
+          break;
+        }
       }
       callback();
     } catch (err) {
@@ -251,10 +325,16 @@ export function createDecryptor(
   masterKeys: Buffer | Buffer[],
   envelope: EncryptionEnvelope,
 ): Transform {
+  if (!envelope || typeof envelope !== "object") {
+    throw new Error("Missing or invalid encryption envelope");
+  }
   if (envelope.algorithm !== CHUNKED_ALGORITHM) {
     throw new Error(`Unsupported encryption algorithm: ${envelope.algorithm}`);
   }
   const keys = Array.isArray(masterKeys) ? masterKeys : [masterKeys];
+  if (keys.length === 0) {
+    throw new Error("No encryption keys configured in key ring");
+  }
   const matchedKey = keys.find((k) => keyId(k) === envelope.keyId);
   if (!matchedKey) {
     const configuredIds = keys.map((k) => keyId(k)).join(", ");
@@ -262,8 +342,11 @@ export function createDecryptor(
       `Backup was encrypted with key ${envelope.keyId}, but configured key ring has: [${configuredIds}]`,
     );
   }
+  const ivBuffer = decodeStrictBase64(envelope.iv, "encryption IV");
+  if (ivBuffer.length !== IV_LENGTH) {
+    throw new Error(`Invalid encryption IV length: expected ${IV_LENGTH}, got ${ivBuffer.length}`);
+  }
   const dataKey = unwrap(matchedKey, envelope.wrappedKey);
-  const ivBuffer = Buffer.from(envelope.iv, "base64");
 
   return new ChunkedAeadDecryptStream(dataKey, ivBuffer);
 }
@@ -288,7 +371,13 @@ function wrap(masterKey: Buffer, dataKey: Buffer): string {
 }
 
 function unwrap(masterKey: Buffer, wrapped: string): Buffer {
-  const buffer = Buffer.from(wrapped, "base64");
+  const buffer = decodeStrictBase64(wrapped, "wrapped data key");
+  const minWrappedBytes = IV_LENGTH + TAG_LENGTH + KEY_LENGTH;
+  if (buffer.length < minWrappedBytes) {
+    throw new Error(
+      `Invalid wrapped data key length: expected at least ${minWrappedBytes} bytes, got ${buffer.length}`,
+    );
+  }
   const iv = buffer.subarray(0, IV_LENGTH);
   const tag = buffer.subarray(IV_LENGTH, IV_LENGTH + TAG_LENGTH);
   const encrypted = buffer.subarray(IV_LENGTH + TAG_LENGTH);
@@ -296,7 +385,13 @@ function unwrap(masterKey: Buffer, wrapped: string): Buffer {
   const derivedKey = deriveWrapKey(masterKey);
   const decipher = createDecipheriv(ALGORITHM, derivedKey, iv);
   decipher.setAuthTag(tag);
-  return Buffer.concat([decipher.update(encrypted), decipher.final()]);
+  const unwrapped = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+  if (unwrapped.length !== KEY_LENGTH) {
+    throw new Error(
+      `Invalid unwrapped data key length: expected ${KEY_LENGTH}, got ${unwrapped.length}`,
+    );
+  }
+  return unwrapped;
 }
 
 function canonicalManifestPayload(
@@ -323,8 +418,10 @@ function canonicalManifestPayload(
     ...(manifest.oplogWindow ? { oplogWindow: manifest.oplogWindow } : {}),
     excludedCollections: manifest.excludedCollections ?? [],
     collections: manifest.collections ?? {},
+    ...(manifest.schema ? { schema: manifest.schema } : {}),
     ...(manifest.physical ? { physical: manifest.physical } : {}),
     ...(manifest.sharding ? { sharding: manifest.sharding } : {}),
+    ...(manifest.objectLock ? { objectLock: manifest.objectLock } : {}),
     encryption: cleanEncryption,
   });
 }
@@ -340,15 +437,53 @@ export function signManifest(
 export function verifyManifest(
   masterKeys: Buffer | Buffer[],
   manifest: BackupManifest | Record<string, unknown>,
+  options: VerifyManifestOptions = {},
 ): boolean {
-  const enc = (manifest as Partial<BackupManifest>).encryption;
-  const sig = (manifest as Partial<BackupManifest>).signature;
+  const partial = manifest as Partial<BackupManifest>;
+  const enc = partial.encryption;
+  const sig = partial.signature;
+  const manifestKeyStr = partial.key ?? "unknown";
+
+  if (sig !== undefined && sig !== null) {
+    if (sig.algorithm !== "HMAC-SHA256") {
+      throw new Error(
+        `Unsupported manifest signature algorithm for ${manifestKeyStr}: ${String(sig.algorithm)}`,
+      );
+    }
+    if (!sig.hmac) {
+      throw new Error(`Invalid manifest signature for ${manifestKeyStr}: missing hmac`);
+    }
+  }
+
+  if (sig?.hmac && enc?.manifestHmac && sig.hmac !== enc.manifestHmac) {
+    throw new Error(`Conflicting HMAC signatures in manifest for ${manifestKeyStr}`);
+  }
+  if (sig?.keyId && enc?.keyId && sig.keyId !== enc.keyId) {
+    throw new Error(`Conflicting keyIds in manifest signatures for ${manifestKeyStr}`);
+  }
+
+  const keys = Array.isArray(masterKeys) ? masterKeys : [masterKeys];
   const hmacHex = sig?.hmac || enc?.manifestHmac;
   const targetKeyId = sig?.keyId || enc?.keyId;
 
-  if (!hmacHex) return true;
+  if (!hmacHex) {
+    if (enc) {
+      throw new Error(
+        `Encrypted backup manifest for ${manifestKeyStr} is missing required HMAC signature`,
+      );
+    }
+    if (options.requireSigned || (keys.length > 0 && !options.allowUnsigned)) {
+      throw new Error(`Backup manifest for ${manifestKeyStr} is unsigned (missing HMAC signature)`);
+    }
+    return true;
+  }
 
-  const keys = Array.isArray(masterKeys) ? masterKeys : [masterKeys];
+  if (!/^[0-9a-f]{64}$/i.test(String(hmacHex))) {
+    throw new Error(
+      `Manifest HMAC verification failed for ${manifestKeyStr}: malformed HMAC digest`,
+    );
+  }
+
   const matchedKey = targetKeyId
     ? keys.find((k) => keyId(k) === targetKeyId)
     : keys.find((k) => {
@@ -375,6 +510,6 @@ export function verifyManifest(
   }
 
   throw new Error(
-    `Manifest HMAC verification failed for ${(manifest as Partial<BackupManifest>).key}: manifest has been tampered with`,
+    `Manifest HMAC verification failed for ${partial.key}: manifest has been tampered with`,
   );
 }

@@ -104,14 +104,38 @@ describe("S3StorageClient & Storage Factory", () => {
     });
 
     const ac = new AbortController();
-    ac.abort();
-    await s3.upload("app/b1.gz", Buffer.from("abc"), {
-      signal: ac.signal,
-      onProgress: vi.fn(),
-      expectedSizeBytes: 1024,
+    ac.abort(new Error("pre-aborted"));
+    await expect(
+      s3.upload("app/b1.gz", Buffer.from("abc"), {
+        signal: ac.signal,
+        onProgress: vi.fn(),
+        expectedSizeBytes: 1024,
+      }),
+    ).rejects.toThrow(/aborted/i);
+    expect(mockUploadDone).not.toHaveBeenCalled();
+
+    // Mid-flight abort awaits upload.abort() before rejecting
+    const midAc = new AbortController();
+    let abortResolved = false;
+    let rejectDone;
+    mockUploadDone.mockImplementationOnce(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectDone = reject;
+        }),
+    );
+    mockUploadAbort.mockImplementationOnce(async () => {
+      await new Promise((r) => setTimeout(r, 25));
+      abortResolved = true;
+      rejectDone(Object.assign(new Error("Upload aborted"), { name: "AbortError" }));
     });
-    expect(mockUploadDone).toHaveBeenCalledTimes(1);
-    expect(mockUploadAbort).toHaveBeenCalled();
+    const uploadPromise = s3.upload("app/b1-mid.gz", Buffer.from("abc"), {
+      signal: midAc.signal,
+    });
+    midAc.abort(new Error("cancel mid-flight"));
+    await expect(uploadPromise).rejects.toThrow(/aborted/i);
+    expect(abortResolved).toBe(true);
+    expect(mockUploadAbort).toHaveBeenCalledTimes(1);
 
     // head 200 and 404
     mockSend.mockResolvedValueOnce({

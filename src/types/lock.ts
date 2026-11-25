@@ -1,10 +1,17 @@
 import type { Logger } from "./logger.js";
 import type { StorageClient } from "./storage.js";
 
-export type ReleaseLockFn = () => Promise<void>;
+export interface ReleaseLockFn {
+  (): Promise<void>;
+  assertValid?: () => void;
+  signal?: AbortSignal;
+}
 
 export interface LockPayload {
   pid: number;
+  hostname?: string;
+  instanceId?: string;
+  pidStartTime?: string;
   token: string;
   acquiredAt: string;
   lastHeartbeatAt?: string;

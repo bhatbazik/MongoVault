@@ -7,12 +7,14 @@ export interface BackupScope {
 
 export interface ArchiveKeyOptions {
   encrypted?: boolean;
+  suffix?: string;
 }
 
 export interface BackupSummary {
   key: string;
   size: number;
   createdAt: Date;
+  lastModified?: Date;
   encrypted: boolean;
   complete: boolean;
 }

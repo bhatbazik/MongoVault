@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { withFileLockMutex } from "./storage.js";
 import type {
   AcquireDistributedLockOptions,
   AcquireHybridLockOptions,
@@ -12,92 +13,175 @@ import type {
 import type { StorageClient } from "./types/storage.js";
 
 const UNREADABLE_GRACE_MS = 5_000;
+const PROCESS_INSTANCE_ID = randomUUID();
+const activeLocalTokens = new Set<string>();
+
+async function getLinuxPidStartTime(pid: number): Promise<string | undefined> {
+  try {
+    const raw = await fs.readFile(`/proc/${pid}/stat`, "utf8");
+    const rparen = raw.lastIndexOf(")");
+    if (rparen === -1) return undefined;
+    const fields = raw
+      .slice(rparen + 2)
+      .trim()
+      .split(/\s+/);
+    // Field 22 in /proc/<pid>/stat is starttime -> index 19 after comm
+    return fields[19];
+  } catch {
+    return undefined;
+  }
+}
+
+async function writeLockExclusiveLocal(file: string, content: string): Promise<boolean> {
+  const initTmp = `${file}.init.${randomUUID()}`;
+  const handle = await fs.open(initTmp, "w", 0o600);
+  try {
+    await handle.writeFile(content, "utf8");
+    await handle.sync();
+    await handle.close();
+    try {
+      await fs.link(initTmp, file);
+      return true;
+    } catch (err: unknown) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "EEXIST") return false;
+      if (code === "EPERM" || code === "EXDEV" || code === "ENOTSUP") {
+        try {
+          await fs.writeFile(file, content, { flag: "wx", mode: 0o600 });
+          return true;
+        } catch (wxErr: unknown) {
+          if ((wxErr as NodeJS.ErrnoException).code === "EEXIST") return false;
+          throw wxErr;
+        }
+      }
+      throw err;
+    }
+  } finally {
+    await handle.close().catch(() => {});
+    await fs.rm(initTmp, { force: true }).catch(() => {});
+  }
+}
 
 export async function acquireLock(
   file: string,
   {
     staleAfterMs,
-    heartbeatIntervalMs = Math.min(10_000, Math.max(1_000, Math.floor(staleAfterMs / 3))),
+    heartbeatIntervalMs = Math.min(10_000, Math.max(10, Math.floor(staleAfterMs / 3))),
     logger,
     onLost,
   }: AcquireLockOptions,
 ): Promise<ReleaseLockFn | null> {
   await fs.mkdir(path.dirname(file), { recursive: true });
   const token = randomUUID();
+  const pidStartTime = await getLinuxPidStartTime(process.pid);
+  const hostname = os.hostname();
 
   const createPayload = (): LockPayload => ({
     pid: process.pid,
+    hostname,
+    instanceId: PROCESS_INSTANCE_ID,
+    ...(pidStartTime ? { pidStartTime } : {}),
     token,
     acquiredAt: new Date().toISOString(),
     lastHeartbeatAt: new Date().toISOString(),
   });
 
-  const setupHeartbeat = (): NodeJS.Timeout => {
+  const buildHandle = (): ReleaseLockFn => {
+    activeLocalTokens.add(token);
+    let released = false;
     let lost = false;
     let inFlight = false;
+    let lostError: Error | null = null;
+    let lastSuccessfulHeartbeat = Date.now();
+    const lockController = new AbortController();
+
+    const triggerLost = (err: Error) => {
+      if (released || lost) return;
+      lost = true;
+      lostError = err;
+      clearInterval(timer);
+      activeLocalTokens.delete(token);
+      logger?.error({ file }, err.message);
+      lockController.abort(err);
+      onLost?.(err);
+    };
+
     const timer = setInterval(async () => {
-      if (lost || inFlight) return;
+      if (released || lost || inFlight) return;
       inFlight = true;
       try {
-        const owner = await readLock(file);
-        if (!owner || owner.token !== token) {
-          lost = true;
-          clearInterval(timer);
-          const err = new Error(
-            `Local lock lost on "${file}": lock file was modified or removed by another process`,
-          );
-          logger?.error({ file }, err.message);
-          onLost?.(err);
-          return;
-        }
-        const now = new Date();
-        await fs.utimes(file, now, now);
+        await withFileLockMutex(file, async () => {
+          if (released || lost) return;
+          const owner = await readLock(file);
+          if (!owner || owner.token !== token) {
+            const err = new Error(
+              `Local lock lost on "${file}": lock file was modified or removed by another process`,
+            );
+            triggerLost(err);
+            return;
+          }
+          const now = new Date();
+          await fs.utimes(file, now, now);
+          lastSuccessfulHeartbeat = Date.now();
+        });
       } catch (err: unknown) {
-        logger?.warn({ err, file }, "Failed to update local lock heartbeat timestamp");
+        const error = err instanceof Error ? err : new Error(String(err));
+        logger?.warn({ err: error, file }, "Failed to update local lock heartbeat timestamp");
+        if (!released && !lost && Date.now() - lastSuccessfulHeartbeat > staleAfterMs) {
+          triggerLost(error);
+        }
       } finally {
         inFlight = false;
       }
     }, heartbeatIntervalMs);
     timer.unref();
-    return timer;
+
+    const releaseFn: ReleaseLockFn = async () => {
+      if (released) return;
+      released = true;
+      clearInterval(timer);
+      activeLocalTokens.delete(token);
+      await release(file, token);
+    };
+    releaseFn.signal = lockController.signal;
+    releaseFn.assertValid = () => {
+      if (lostError) throw lostError;
+      if (!released && Date.now() - lastSuccessfulHeartbeat > staleAfterMs) {
+        const err = new Error(
+          `Local lock lease expired on "${file}" after ${staleAfterMs}ms without heartbeat`,
+        );
+        triggerLost(err);
+        throw err;
+      }
+    };
+    return releaseFn;
   };
 
-  try {
-    await fs.writeFile(file, JSON.stringify(createPayload()), { flag: "wx" });
-    const timer = setupHeartbeat();
-    return async () => {
-      clearInterval(timer);
-      await release(file, token);
-    };
-  } catch (error: unknown) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  if (await writeLockExclusiveLocal(file, JSON.stringify(createPayload()))) {
+    return buildHandle();
   }
 
-  if (!(await isStale(file, staleAfterMs))) {
-    return null;
-  }
+  const acquiredAfterTakeover = await withFileLockMutex(file, async (assertHeld) => {
+    if (!(await isStale(file, staleAfterMs))) {
+      return false;
+    }
 
-  // Atomic stale lock takeover using atomic rename to prevent TOCTOU race
-  const tombstone = `${file}.stale.${randomUUID()}`;
-  try {
-    await fs.rename(file, tombstone);
-    await fs.rm(tombstone, { force: true });
-  } catch {
-    // Another concurrent process already claimed or removed the stale lock
-    return null;
-  }
+    assertHeld();
+    const tombstone = `${file}.stale.${randomUUID()}`;
+    try {
+      await fs.rename(file, tombstone);
+      await fs.rm(tombstone, { force: true });
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        return false;
+      }
+    }
 
-  // Now safely re-attempt acquisition
-  try {
-    await fs.writeFile(file, JSON.stringify(createPayload()), { flag: "wx" });
-    const timer = setupHeartbeat();
-    return async () => {
-      clearInterval(timer);
-      await release(file, token);
-    };
-  } catch {
-    return null;
-  }
+    assertHeld();
+    return writeLockExclusiveLocal(file, JSON.stringify(createPayload()));
+  });
+
+  return acquiredAfterTakeover ? buildHandle() : null;
 }
 
 export async function readLock(file: string): Promise<LockPayload | null> {
@@ -109,10 +193,12 @@ export async function readLock(file: string): Promise<LockPayload | null> {
 }
 
 async function release(file: string, token: string): Promise<void> {
-  const owner = await readLock(file);
-  if (owner?.token === token) {
-    await fs.rm(file, { force: true });
-  }
+  await withFileLockMutex(file, async () => {
+    const owner = await readLock(file);
+    if (owner?.token === token) {
+      await fs.rm(file, { force: true });
+    }
+  });
 }
 
 export async function isStale(file: string, staleAfterMs: number): Promise<boolean> {
@@ -130,13 +216,32 @@ export async function isStale(file: string, staleAfterMs: number): Promise<boole
     return age > UNREADABLE_GRACE_MS;
   }
 
-  // First priority: check owner process liveness.
-  // If the owner process is not alive on this host, the lock is stale immediately.
+  if (owner.hostname && owner.hostname !== os.hostname()) {
+    return age > staleAfterMs;
+  }
+
+  if (owner.pid === process.pid) {
+    if (
+      owner.instanceId &&
+      owner.instanceId !== PROCESS_INSTANCE_ID &&
+      !activeLocalTokens.has(owner.token)
+    ) {
+      return true;
+    }
+    return age > staleAfterMs;
+  }
+
   if (!isAlive(owner.pid)) {
     return true;
   }
 
-  // If the owner process is alive, the lock is only stale if its heartbeat lease has expired.
+  if (owner.pidStartTime) {
+    const currentStart = await getLinuxPidStartTime(owner.pid);
+    if (currentStart !== undefined && currentStart !== owner.pidStartTime) {
+      return true;
+    }
+  }
+
   return age > staleAfterMs;
 }
 
@@ -164,51 +269,65 @@ export async function acquireDistributedLock(
     return null;
   }
 
+  const effectiveHeartbeatMs = Math.min(heartbeatIntervalMs, Math.max(10, Math.floor(ttlMs / 3)));
   const token = await storage.acquireLock(lockKey, { holder, ttlMs });
   if (!token) return null;
 
   let lastSuccessfulHeartbeat = Date.now();
+  let released = false;
   let lost = false;
   let inFlight = false;
+  let lostError: Error | null = null;
+  const lockController = new AbortController();
+
+  const triggerLost = (err: Error) => {
+    if (released || lost) return;
+    lost = true;
+    lostError = err;
+    clearInterval(timer);
+    logger?.error({ lockKey }, err.message);
+    lockController.abort(err);
+    onLost?.(err);
+  };
 
   const timer = setInterval(async () => {
-    if (lost || inFlight) return;
+    if (released || lost || inFlight) return;
     inFlight = true;
     try {
       const refreshed = await storage.refreshLock!(lockKey, token, ttlMs);
+      if (released || lost) return;
       if (!refreshed) {
-        lost = true;
-        clearInterval(timer);
-        const err = new Error(
-          `Distributed lock lease lost on "${lockKey}": lease renewal was rejected (lease held by another owner or expired)`,
+        triggerLost(
+          new Error(
+            `Distributed lock lease lost on "${lockKey}": lease renewal was rejected (lease held by another owner or expired)`,
+          ),
         );
-        logger?.error({ lockKey }, err.message);
-        onLost?.(err);
         return;
       }
       lastSuccessfulHeartbeat = Date.now();
     } catch (err: unknown) {
+      if (released || lost) return;
       const error = err instanceof Error ? err : new Error(String(err));
       logger?.warn(
         { err: error.message, lockKey },
         "Failed to refresh distributed S3 lock heartbeat",
       );
       if (Date.now() - lastSuccessfulHeartbeat > ttlMs) {
-        lost = true;
-        clearInterval(timer);
-        const expiredErr = new Error(
-          `Distributed lock lease expired on "${lockKey}" after ${ttlMs}ms without successful renewal`,
+        triggerLost(
+          new Error(
+            `Distributed lock lease expired on "${lockKey}" after ${ttlMs}ms without successful renewal`,
+          ),
         );
-        logger?.error({ lockKey }, expiredErr.message);
-        onLost?.(expiredErr);
       }
     } finally {
       inFlight = false;
     }
-  }, heartbeatIntervalMs);
+  }, effectiveHeartbeatMs);
   timer.unref();
 
-  return async function release() {
+  const releaseFn: ReleaseLockFn = async function release() {
+    if (released) return;
+    released = true;
     clearInterval(timer);
     try {
       await storage.releaseLock!(lockKey, token);
@@ -219,6 +338,19 @@ export async function acquireDistributedLock(
       );
     }
   };
+  releaseFn.signal = lockController.signal;
+  releaseFn.assertValid = () => {
+    if (lostError) throw lostError;
+    if (!released && Date.now() - lastSuccessfulHeartbeat > ttlMs) {
+      const expiredErr = new Error(
+        `Distributed lock lease expired on "${lockKey}" after ${ttlMs}ms without successful renewal`,
+      );
+      triggerLost(expiredErr);
+      throw expiredErr;
+    }
+  };
+
+  return releaseFn;
 }
 
 export async function acquireHybridLock({
@@ -232,12 +364,18 @@ export async function acquireHybridLock({
   logger,
   onLost,
 }: AcquireHybridLockOptions): Promise<ReleaseLockFn | null> {
+  const localHeartbeatMs = Math.min(
+    heartbeatIntervalMs,
+    Math.max(10, Math.floor(staleAfterMs / 3)),
+  );
+  const distHeartbeatMs = Math.min(
+    heartbeatIntervalMs,
+    Math.max(10, Math.floor(distributedTtlMs / 3)),
+  );
+
   const localRelease = await acquireLock(file, {
     staleAfterMs,
-    heartbeatIntervalMs: Math.min(
-      heartbeatIntervalMs,
-      Math.max(1_000, Math.floor(staleAfterMs / 3)),
-    ),
+    heartbeatIntervalMs: localHeartbeatMs,
     logger,
     onLost,
   });
@@ -250,7 +388,7 @@ export async function acquireHybridLock({
       const distRelease = await acquireDistributedLock(storage, lockKey, {
         holder,
         ttlMs: distributedTtlMs,
-        heartbeatIntervalMs,
+        heartbeatIntervalMs: distHeartbeatMs,
         logger,
         onLost,
       });
@@ -260,10 +398,26 @@ export async function acquireHybridLock({
         return null;
       }
 
-      return async function releaseAll() {
+      const hybridController = new AbortController();
+      const onLocalAbort = () => hybridController.abort(localRelease.signal?.reason);
+      const onDistAbort = () => hybridController.abort(distRelease.signal?.reason);
+      if (localRelease.signal?.aborted) onLocalAbort();
+      else localRelease.signal?.addEventListener("abort", onLocalAbort, { once: true });
+      if (distRelease.signal?.aborted) onDistAbort();
+      else distRelease.signal?.addEventListener("abort", onDistAbort, { once: true });
+
+      const releaseAll: ReleaseLockFn = async function releaseAll() {
+        localRelease.signal?.removeEventListener("abort", onLocalAbort);
+        distRelease.signal?.removeEventListener("abort", onDistAbort);
         await distRelease().catch(() => {});
         await localRelease().catch(() => {});
       };
+      releaseAll.signal = hybridController.signal;
+      releaseAll.assertValid = () => {
+        localRelease.assertValid?.();
+        distRelease.assertValid?.();
+      };
+      return releaseAll;
     } catch (err) {
       await localRelease().catch(() => {});
       throw err;

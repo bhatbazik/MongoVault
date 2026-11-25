@@ -14,3 +14,8 @@ export interface Encryptor {
   stream: Transform;
   envelope: () => EncryptionEnvelope;
 }
+
+export interface VerifyManifestOptions {
+  allowUnsigned?: boolean;
+  requireSigned?: boolean;
+}

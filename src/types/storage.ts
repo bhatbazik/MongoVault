@@ -69,6 +69,7 @@ export interface StorageClient {
   list: (prefix: string) => AsyncGenerator<StorageObject, void, unknown>;
   remove: (key: string) => Promise<void>;
   removeMany?: (keys: string[]) => Promise<void>;
+  cleanupStaleUploads?: (prefix: string, maxAgeMs: number) => Promise<number>;
   acquireLock?: (
     key: string,
     options: { holder?: string; ttlMs: number },
