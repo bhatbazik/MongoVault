@@ -55,7 +55,7 @@ export async function waitForPing(uri, proc, logPath, timeoutMs = 45_000) {
     } catch (err) {
       lastErr = err;
       await client.close().catch(() => {});
-      await new Promise((r) => setTimeout(r, 250));
+      await new Promise((r) => setTimeout(r, 50));
     }
   }
   throw new Error(
@@ -81,7 +81,7 @@ export async function waitForPrimary(uriOrUris, timeoutMs = 45_000) {
         await client.close().catch(() => {});
       }
     }
-    await new Promise((r) => setTimeout(r, 250));
+    await new Promise((r) => setTimeout(r, 50));
   }
   throw new Error(`Replica set at ${uris.join(", ")} did not elect primary within ${timeoutMs}ms`);
 }
@@ -147,11 +147,26 @@ async function waitForSecondariesReady(primaryUri, expectedSecondaries, timeoutM
     } catch {
       await client.close().catch(() => {});
     }
-    await new Promise((r) => setTimeout(r, 250));
+    await new Promise((r) => setTimeout(r, 50));
   }
   throw new Error(
     `Replica set at ${primaryUri} did not reach ${expectedSecondaries} SECONDARY members within ${timeoutMs}ms`,
   );
+}
+
+/**
+ * Appends WiredTiger cache cap and FTDC disable flags for fast E2E startup/teardown
+ * unless the caller explicitly overrides them in `extraArgs`.
+ */
+function appendFastMongodArgs(args, extraArgs) {
+  const extra = Array.isArray(extraArgs) ? extraArgs : [];
+  if (!extra.some((a) => a.startsWith("--wiredTigerCacheSizeGB"))) {
+    args.push("--wiredTigerCacheSizeGB=0.25");
+  }
+  if (!extra.some((a) => a.includes("diagnosticDataCollectionEnabled"))) {
+    args.push("--setParameter=diagnosticDataCollectionEnabled=false");
+  }
+  if (extra.length > 0) args.push(...extra);
 }
 
 function normalizeFailPointOptions(optsOrData) {
@@ -205,7 +220,7 @@ export async function startReplicaSet({
       if (role === "configsvr") args.push("--configsvr");
       if (role === "shardsvr") args.push("--shardsvr");
       if (enableTestCommands) args.push("--setParameter=enableTestCommands=1");
-      if (Array.isArray(extraArgs) && extraArgs.length > 0) args.push(...extraArgs);
+      appendFastMongodArgs(args, extraArgs);
 
       const trackProcExit = (p) => {
         p.once("close", () => pausedProcs.delete(p));
@@ -546,7 +561,7 @@ export async function startReplicaSetFromDbPath({
         `--logpath=${nodeLogPath}`,
       ];
       if (enableTestCommands) args.push("--setParameter=enableTestCommands=1");
-      if (Array.isArray(extraArgs) && extraArgs.length > 0) args.push(...extraArgs);
+      appendFastMongodArgs(args, extraArgs);
 
       const trackProcExit = (p) => {
         p.once("close", () => pausedProcs.delete(p));
@@ -738,7 +753,7 @@ export async function startStandalone({
     `--logpath=${logPath}`,
   ];
   if (enableTestCommands) args.push("--setParameter=enableTestCommands=1");
-  if (Array.isArray(extraArgs) && extraArgs.length > 0) args.push(...extraArgs);
+  appendFastMongodArgs(args, extraArgs);
 
   const proc = spawn("mongod", args, { stdio: "ignore" });
   const uri = `mongodb://127.0.0.1:${port}/?directConnection=true`;
@@ -805,6 +820,7 @@ export async function startShardedCluster(rootDirOrOptions) {
     `--port=${mongosPort}`,
     "--bind_ip=127.0.0.1",
     `--logpath=${mongosLog}`,
+    "--setParameter=diagnosticDataCollectionEnabled=false",
   ];
   if (enableTestCommands) {
     mongosArgs.push("--setParameter=enableTestCommands=1");
@@ -1030,7 +1046,7 @@ export async function waitForMajorityCatchup(uri, targetTs, timeoutMs = 10_000) 
     } catch {
       await client.close().catch(() => {});
     }
-    await new Promise((r) => setTimeout(r, 100));
+    await new Promise((r) => setTimeout(r, 50));
   }
 }
 

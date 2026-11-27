@@ -1566,9 +1566,15 @@ describe("F7, F8, F11, F12: Physical & Sharded Cluster Live E2E + Chaos", () => 
         key: { idx: 1 },
       });
       await mongosClient
+        .db("config")
+        .collection("settings")
+        .updateOne({ _id: "chunksize" }, { $set: { value: 1 } }, { upsert: true });
+      await mongosClient
         .db("draindb")
         .collection("items")
-        .insertMany(Array.from({ length: 400 }, (_, i) => ({ _id: i, idx: i })));
+        .insertMany(
+          Array.from({ length: 400 }, (_, i) => ({ _id: i, idx: i, pad: "x".repeat(8192) })),
+        );
 
       for (const mid of [100, 200, 300]) {
         await mongosClient.db("admin").command({ split: "draindb.items", middle: { idx: mid } });
@@ -1578,7 +1584,7 @@ describe("F7, F8, F11, F12: Physical & Sharded Cluster Live E2E + Chaos", () => 
         mode: "alwaysOn",
       });
       await mongosClient.db("admin").command({ balancerStart: 1 });
-      await waitForBalancerRound(mongosClient);
+      await waitForBalancerRound(mongosClient, 30_000);
 
       const encKey = parseKey(generateKey());
       const storage = new FilesystemStorageClient(storageDir);

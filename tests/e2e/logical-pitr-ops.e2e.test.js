@@ -212,6 +212,41 @@ async function dropAllUserDatabases(client) {
   }
 }
 
+/**
+ * Inserts padded documents and fsyncs until the 1 MiB oplog.rs rolls over past `targetTs`.
+ * Yields briefly between rounds so MongoDB's background oplog cap maintainer can truncate.
+ */
+async function rolloverOplogPast(
+  client,
+  dbName,
+  targetTs,
+  { collName = "filler", docsPerRound = 100, padBytes = 8 * 1024, maxRounds = 30 } = {},
+) {
+  const pad = randomBytes(padBytes).toString("hex");
+  const runId = randomBytes(4).toString("hex");
+  for (let round = 0; round < maxRounds; round++) {
+    const docs = Array.from({ length: docsPerRound }, (_, i) => ({
+      _id: `roll-${runId}-${round}-${i}`,
+      pad,
+    }));
+    await client.db(dbName).collection(collName).insertMany(docs);
+    await client.db("admin").command({ fsync: 1 });
+    const oldest = await client
+      .db("local")
+      .collection("oplog.rs")
+      .find({}, { projection: { ts: 1 } })
+      .sort({ $natural: 1 })
+      .limit(1)
+      .next();
+    const oldestTs = fromBsonTimestamp(oldest?.ts);
+    if (oldestTs && compareTimestamps(oldestTs, targetTs) > 0) {
+      return true;
+    }
+    await new Promise((r) => setTimeout(r, 150));
+  }
+  return false;
+}
+
 describe("E2E-M2: Logical Backup/Restore, PITR Slicer/Replay & Ops/Daemon (F5–F6, F9–F10, F13–F15)", () => {
   let rootDir;
   let s3Server;
@@ -1151,28 +1186,7 @@ describe("E2E-M2: Logical Backup/Restore, PITR Slicer/Replay & Ops/Daemon (F5–
         const s1EndTs = parseOplogTimestamp(s1.oplogWindow.endTs);
 
         // Roll over 1 MiB oplog deterministically past s1.endTs (checkpoint via syncdelay=1 + fsync:1)
-        const chunk = randomBytes(8 * 1024).toString("hex"); // 16 KiB
-        let rolledOver = false;
-        for (let round = 0; round < 10; round++) {
-          const fillerDocs = Array.from({ length: 100 }, (_, i) => ({
-            _id: `roll-${round}-${i}`,
-            pad: chunk,
-          }));
-          await client.db("f9roll").collection("filler").insertMany(fillerDocs);
-          await client.db("admin").command({ fsync: 1 });
-          const oldest = await client
-            .db("local")
-            .collection("oplog.rs")
-            .find({}, { projection: { ts: 1 } })
-            .sort({ $natural: 1 })
-            .limit(1)
-            .next();
-          const oldestTs = fromBsonTimestamp(oldest?.ts);
-          if (oldestTs && compareTimestamps(oldestTs, s1EndTs) > 0) {
-            rolledOver = true;
-            break;
-          }
-        }
+        const rolledOver = await rolloverOplogPast(client, "f9roll", s1EndTs);
         expect(rolledOver).toBe(true);
         await waitForMajorityCatchup(rs.uri, await getLatestOplogTs(rs.uri));
 
@@ -1260,7 +1274,7 @@ describe("E2E-M2: Logical Backup/Restore, PITR Slicer/Replay & Ops/Daemon (F5–
           data: {
             failCommands: ["getMore"],
             blockConnection: true,
-            blockTimeMS: 5_000,
+            blockTimeMS: 10_000,
           },
         });
 
@@ -1278,28 +1292,13 @@ describe("E2E-M2: Logical Backup/Restore, PITR Slicer/Replay & Ops/Daemon (F5–
 
         // Wait briefly for archiver tick to open cursor and enter blocked getMore, then roll over oplog
         await new Promise((r) => setTimeout(r, 300));
-        const chunk = randomBytes(8 * 1024).toString("hex");
-        for (let b = 0; b < 12; b++) {
-          const docs = Array.from({ length: 60 }, (_, i) => ({
-            _id: `over-${b}-${i}`,
-            pad: chunk,
-          }));
-          await client.db("f9cpl").collection("overflow").insertMany(docs);
-          await client.db("admin").command({ fsync: 1 });
-          const oldest = await client
-            .db("local")
-            .collection("oplog.rs")
-            .find({}, { projection: { ts: 1 } })
-            .sort({ $natural: 1 })
-            .limit(1)
-            .next();
-          const oldestTs = fromBsonTimestamp(oldest?.ts);
-          if (oldestTs && compareTimestamps(oldestTs, lastSmallTs) > 0) {
-            break;
-          }
-        }
+        await rolloverOplogPast(client, "f9cpl", lastSmallTs, {
+          collName: "overflow",
+          docsPerRound: 60,
+          maxRounds: 25,
+        });
 
-        const alerted = await waitForCondition(() => failureAlerts.length > 0, 15_000, 50);
+        const alerted = await waitForCondition(() => failureAlerts.length > 0, 25_000, 50);
         await archiver.stop();
         expect(alerted).toBe(true);
 
@@ -2497,28 +2496,7 @@ describe("E2E-M2: Logical Backup/Restore, PITR Slicer/Replay & Ops/Daemon (F5–
         const slice1EndTs = parseOplogTimestamp(slice1.oplogWindow.endTs);
 
         // Fill >= 80% and roll over 1 MiB oplog deterministically (within < 3600s)
-        const pad = randomBytes(8 * 1024).toString("hex");
-        let rolled = false;
-        for (let round = 0; round < 10; round++) {
-          const filler = Array.from({ length: 100 }, (_, i) => ({
-            _id: `f-${round}-${i}`,
-            pad,
-          }));
-          await client.db("f14app").collection("filler").insertMany(filler);
-          await client.db("admin").command({ fsync: 1 });
-          const oldest = await client
-            .db("local")
-            .collection("oplog.rs")
-            .find({}, { projection: { ts: 1 } })
-            .sort({ $natural: 1 })
-            .limit(1)
-            .next();
-          const oldestTs = fromBsonTimestamp(oldest?.ts);
-          if (oldestTs && compareTimestamps(oldestTs, slice1EndTs) > 0) {
-            rolled = true;
-            break;
-          }
-        }
+        const rolled = await rolloverOplogPast(client, "f14app", slice1EndTs);
         expect(rolled).toBe(true);
         await waitForMajorityCatchup(rs.uri, await getLatestOplogTs(rs.uri));
 

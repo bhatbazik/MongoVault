@@ -39,6 +39,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        shard: [1, 2]
         include:
           - mongodb-version: "7.0"
             os: ubuntu-22.04
@@ -75,8 +76,8 @@ jobs:
       - name: Build TypeScript artifacts
         run: npm run build
 
-      - name: Run full test & coverage suite (Unit + Integration + Real MongoDB ${{ matrix.mongodb-version }} E2E)
-        run: npm run test:coverage
+      - name: Run full test & coverage suite (Unit + Integration + Real MongoDB ${{ matrix.mongodb-version }} E2E, shard ${{ matrix.shard }}/2)
+        run: npm run test:coverage -- --shard=${{ matrix.shard }}/2
 
   docker:
     runs-on: ubuntu-latest
