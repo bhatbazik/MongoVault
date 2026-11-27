@@ -1748,6 +1748,14 @@ function isCommandNotFoundError(err: unknown): boolean {
   return code === 59 || codeName === "CommandNotFound";
 }
 
+function isIgnorableCacheFlushError(err: unknown): boolean {
+  if (isCommandNotFoundError(err)) return true;
+  if (!err || typeof err !== "object") return false;
+  const code = (err as { code?: unknown }).code;
+  const codeName = (err as { codeName?: unknown }).codeName;
+  return code === 445 || codeName === "MetadataRefreshCanceledDueToFCVTransition";
+}
+
 export async function restoreShardedCluster({
   config,
   storage,
@@ -2297,12 +2305,13 @@ export async function restoreShardedCluster({
           }
         }
 
-        // MongoDB 7.0 / 8.0 legacy cache refresh (ignore CommandNotFound on MongoDB 9.0+)
+        // MongoDB 7.0 / 8.0 legacy cache refresh (ignore CommandNotFound on MongoDB 9.0+
+        // and MetadataRefreshCanceledDueToFCVTransition / code 445 on MongoDB 8.0+ where shards are authoritative)
         for (const dbDoc of restoredConfigDbs) {
           try {
             await sAdmin.command({ _flushDatabaseCacheUpdates: dbDoc._id, syncFromConfig: true });
           } catch (err) {
-            if (!isCommandNotFoundError(err)) throw err;
+            if (!isIgnorableCacheFlushError(err)) throw err;
           }
         }
         for (const collDoc of restoredConfigColls) {
@@ -2312,7 +2321,7 @@ export async function restoreShardedCluster({
               syncFromConfig: true,
             });
           } catch (err) {
-            if (!isCommandNotFoundError(err)) throw err;
+            if (!isIgnorableCacheFlushError(err)) throw err;
           }
         }
 
