@@ -577,6 +577,50 @@ export interface ArchiveNamespaceFilterOptions {
    * Defaults to `false`.
    */
   passthroughNonArchive?: boolean;
+  /**
+   * When true (default), strips conflicting `_id_` index / `idIndex` metadata from timeseries
+   * collections in the archive prelude so `mongorestore --preserveUUID` on MongoDB 9.0+ does not
+   * fail with `(InvalidOptions) The 'clusteredIndex' option is not supported with the 'idIndex' option`.
+   */
+  sanitizeTimeseriesMetadata?: boolean;
+}
+
+function sanitizeTimeseriesPreludeMeta(
+  meta: Record<string, unknown>,
+): Record<string, unknown> | null {
+  if (typeof meta.metadata !== "string" || !meta.metadata) return null;
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(meta.metadata) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+
+  const opts =
+    parsed.options && typeof parsed.options === "object"
+      ? (parsed.options as Record<string, unknown>)
+      : null;
+  const isTimeseries = meta.type === "timeseries" || Boolean(opts?.timeseries);
+  if (!isTimeseries) return null;
+
+  let changed = false;
+  if (opts && "idIndex" in opts) {
+    delete opts.idIndex;
+    changed = true;
+  }
+  if (Array.isArray(parsed.indexes)) {
+    const filtered = parsed.indexes.filter(
+      (idx) =>
+        !(idx && typeof idx === "object" && (idx as Record<string, unknown>).name === "_id_"),
+    );
+    if (filtered.length !== parsed.indexes.length) {
+      parsed.indexes = filtered;
+      changed = true;
+    }
+  }
+  if (!changed) return null;
+  return { ...meta, metadata: JSON.stringify(parsed) };
 }
 
 function compileNamespaceExcludePredicate(
@@ -630,6 +674,7 @@ type FilterState =
 export class ArchiveNamespaceFilter extends Transform {
   readonly #isExcluded: (db: string, collection: string) => boolean;
   readonly #passthroughNonArchive: boolean;
+  readonly #sanitizeTimeseriesMetadata: boolean;
   #state: FilterState = "MAGIC";
   #queue = new ByteQueue();
   #pendingBytes = 0;
@@ -646,6 +691,7 @@ export class ArchiveNamespaceFilter extends Transform {
     super();
     this.#isExcluded = compileNamespaceExcludePredicate(excludePatterns);
     this.#passthroughNonArchive = Boolean(options.passthroughNonArchive);
+    this.#sanitizeTimeseriesMetadata = options.sanitizeTimeseriesMetadata !== false;
   }
 
   override _transform(chunk: Buffer, _encoding: BufferEncoding, callback: TransformCallback): void {
@@ -749,11 +795,7 @@ export class ArchiveNamespaceFilter extends Transform {
         if (rawMeta[nextInt - 1] !== 0x00) {
           throw new Error("Corrupted archive prelude metadata: missing null terminator");
         }
-        const meta = BSON.deserialize(rawMeta, { promoteValues: true }) as {
-          db?: string;
-          collection?: string;
-          type?: string;
-        };
+        const meta = BSON.deserialize(rawMeta, { promoteValues: true }) as Record<string, unknown>;
         const db = typeof meta.db === "string" ? meta.db : "";
         const coll = typeof meta.collection === "string" ? meta.collection : "";
         this.#namespaces.recordPrelude(
@@ -762,7 +804,10 @@ export class ArchiveNamespaceFilter extends Transform {
           typeof meta.type === "string" ? meta.type : undefined,
         );
         if (!this.#isExcluded(db, coll)) {
-          this.push(rawMeta);
+          const sanitized = this.#sanitizeTimeseriesMetadata
+            ? sanitizeTimeseriesPreludeMeta(meta)
+            : null;
+          this.push(sanitized ? Buffer.from(BSON.serialize(sanitized)) : rawMeta);
         }
         continue;
       }

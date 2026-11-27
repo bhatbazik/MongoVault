@@ -610,11 +610,15 @@ export async function restoreBackup(
     log.info({ source, target, drop }, "Streaming restore pipeline from storage (zero-disk)");
     const digest = new DigestStream();
     const downloadStream = await storage.download(key, { signal: controller.signal });
+    const shouldFilterArchive = isCluster && shouldReplayOplog;
+    const isRealMongorestore = !ctx.tools?.mongorestore || ctx.tools.mongorestore === mongorestore;
     const archiveFilterStages: Transform[] =
-      isCluster && shouldReplayOplog
+      shouldFilterArchive || isRealMongorestore
         ? [
             createGunzip(),
-            new ArchiveNamespaceFilter(CLUSTER_SYSTEM_NS_EXCLUDE, { passthroughNonArchive: true }),
+            new ArchiveNamespaceFilter(shouldFilterArchive ? CLUSTER_SYSTEM_NS_EXCLUDE : [], {
+              passthroughNonArchive: true,
+            }),
             createGzip(),
           ]
         : [];

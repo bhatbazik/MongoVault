@@ -611,4 +611,77 @@ describe("archive-stream (mongodump 100.13.0 real --archive framing regression)"
       ),
     ).rejects.toThrow(/trailing bytes/i);
   });
+
+  it("Test G: ArchiveNamespaceFilter strips conflicting idIndex/_id_ from timeseries prelude metadata while preserving regular collections", async () => {
+    const tsMeta = {
+      options: {
+        timeseries: { timeField: "ts", metaField: "meta" },
+        idIndex: { v: 2, key: { _id: 1 }, name: "_id_" },
+      },
+      indexes: [
+        { v: 2, key: { _id: 1 }, name: "_id_" },
+        { v: 2, key: { meta: 1, ts: 1 }, name: "meta_1_ts_1" },
+      ],
+      uuid: "11111111222233334444555566667777",
+    };
+    const regularMeta = {
+      options: {},
+      indexes: [{ v: 2, key: { _id: 1 }, name: "_id_" }],
+      uuid: "aaaaaaaabbbbccccddddeeeeeeeeeeee",
+    };
+
+    const parts = [
+      uint32LE(ARCHIVE_MAGIC_NUMBER),
+      Buffer.from(BSON.serialize({ server_version: "9.0.0", tool_version: "100.13.0" })),
+      Buffer.from(
+        BSON.serialize({
+          db: "tsdb",
+          collection: "metrics",
+          type: "timeseries",
+          metadata: JSON.stringify(tsMeta),
+        }),
+      ),
+      Buffer.from(
+        BSON.serialize({
+          db: "tsdb",
+          collection: "marker",
+          type: "collection",
+          metadata: JSON.stringify(regularMeta),
+        }),
+      ),
+      int32LE(-1),
+      Buffer.from(BSON.serialize({ db: "tsdb", collection: "metrics" })),
+      Buffer.from(BSON.serialize({ _id: 1, ts: new Date("2026-01-01T00:00:00Z") })),
+      int32LE(-1),
+      Buffer.from(BSON.serialize({ db: "tsdb", collection: "marker" })),
+      Buffer.from(BSON.serialize({ _id: "m1" })),
+      int32LE(-1),
+      int32LE(-1),
+    ];
+    const rawArchive = Buffer.concat(parts);
+    const filtered = await runArchiveNamespaceFilter(rawArchive, [], 13);
+
+    // Parse prelude docs from filtered output
+    let offset = 4;
+    const headerLen = filtered.readInt32LE(offset);
+    offset += headerLen;
+    const metas = [];
+    while (filtered.readInt32LE(offset) !== -1) {
+      const len = filtered.readInt32LE(offset);
+      metas.push(
+        BSON.deserialize(filtered.subarray(offset, offset + len), { promoteValues: true }),
+      );
+      offset += len;
+    }
+
+    expect(metas).toHaveLength(2);
+    const parsedTs = JSON.parse(metas[0].metadata);
+    expect(parsedTs.options.timeseries).toEqual({ timeField: "ts", metaField: "meta" });
+    expect(parsedTs.options.idIndex).toBeUndefined();
+    expect(parsedTs.indexes).toEqual([{ v: 2, key: { meta: 1, ts: 1 }, name: "meta_1_ts_1" }]);
+    expect(parsedTs.uuid).toBe("11111111222233334444555566667777");
+
+    const parsedRegular = JSON.parse(metas[1].metadata);
+    expect(parsedRegular.indexes).toEqual([{ v: 2, key: { _id: 1 }, name: "_id_" }]);
+  });
 });
