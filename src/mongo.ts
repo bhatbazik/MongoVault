@@ -2,15 +2,69 @@ import { MongoClient } from "mongodb";
 import { formatOplogTimestamp, getOplogBounds } from "./oplog.js";
 import type { ClusterStatus } from "./types/status.js";
 
+const SENSITIVE_QUERY_KEYS = new Set([
+  "tlscertificatekeyfilepassword",
+  "awssessiontoken",
+  "password",
+  "authmechanismproperties",
+]);
+
 /**
  * Masks credentials in MongoDB connection URI for safe logging and diagnostic display.
  */
 export function maskMongoUri(uri: string): string {
+  if (typeof uri !== "string") return "masked";
   try {
-    return uri.replace(/\/\/[^:]+:[^@]+@/, "//***:***@");
+    const schemeIdx = uri.indexOf("://");
+    if (schemeIdx === -1) return uri;
+    const scheme = uri.slice(0, schemeIdx + 3);
+    const rest = uri.slice(schemeIdx + 3);
+    const pathIdx = rest.search(/[/?#]/);
+    const authority = pathIdx === -1 ? rest : rest.slice(0, pathIdx);
+    let suffix = pathIdx === -1 ? "" : rest.slice(pathIdx);
+
+    const atIdx = authority.lastIndexOf("@");
+    let maskedAuth = authority;
+    if (atIdx !== -1) {
+      const userInfo = authority.slice(0, atIdx);
+      const host = authority.slice(atIdx + 1);
+      const colonIdx = userInfo.indexOf(":");
+      if (colonIdx !== -1) {
+        maskedAuth = `***:***@${host}`;
+      } else {
+        maskedAuth = `***@${host}`;
+      }
+    }
+
+    if (suffix.includes("?")) {
+      const qIdx = suffix.indexOf("?");
+      const pathPart = suffix.slice(0, qIdx);
+      const hashIdx = suffix.indexOf("#", qIdx);
+      const queryPart = hashIdx === -1 ? suffix.slice(qIdx + 1) : suffix.slice(qIdx + 1, hashIdx);
+      const hashPart = hashIdx === -1 ? "" : suffix.slice(hashIdx);
+      const redactedQuery = queryPart
+        .split("&")
+        .map((pair) => {
+          const eq = pair.indexOf("=");
+          if (eq === -1) return pair;
+          const key = pair.slice(0, eq);
+          if (SENSITIVE_QUERY_KEYS.has(key.toLowerCase())) {
+            return `${key}=***`;
+          }
+          return pair;
+        })
+        .join("&");
+      suffix = `${pathPart}?${redactedQuery}${hashPart}`;
+    }
+
+    return `${scheme}${maskedAuth}${suffix}`;
   } catch {
     return "masked";
   }
+}
+
+export function sanitizeSecrets(text: string): string {
+  return text.replace(/mongodb(?:\+srv)?:\/\/[^\s"'`]+/gi, (match) => maskMongoUri(match));
 }
 
 export interface InspectMongoClusterOptions {
@@ -60,6 +114,8 @@ export async function inspectMongoCluster(
             newestTs: formatOplogTimestamp(bounds.newestTs),
             retentionHours: Math.max(0, hours),
           };
+        } else {
+          oplogInfo = { available: false };
         }
       } catch {
         oplogInfo = { available: false };
@@ -80,7 +136,7 @@ export async function inspectMongoCluster(
   } catch (error) {
     return {
       connected: false,
-      error: error instanceof Error ? error.message : String(error),
+      error: sanitizeSecrets(error instanceof Error ? error.message : String(error)),
     };
   }
 }

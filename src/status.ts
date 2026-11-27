@@ -2,8 +2,8 @@ import path from "node:path";
 import { MongoClient } from "mongodb";
 import { databasePrefix, listBackups, readManifest, scopeOf } from "./catalog.js";
 import { formatBytes, formatDate } from "./format.js";
-import { readLock } from "./lock.js";
-import { inspectMongoCluster } from "./mongo.js";
+import { isStale, readLock } from "./lock.js";
+import { inspectMongoCluster, sanitizeSecrets } from "./mongo.js";
 import {
   compareTimestamps,
   formatOplogTimestamp,
@@ -47,6 +47,7 @@ export async function getStatus({
 
   // 1. MongoDB Cluster Status & Topology
   let cluster: ClusterStatus;
+  let discoveredShards: string[] | undefined;
   const client = createMongoClient(config.mongo.uri);
   try {
     await client.connect();
@@ -54,10 +55,18 @@ export async function getStatus({
       readPreference: config.mongo.readPreference || "secondaryPreferred",
       createMongoClient,
     });
+    if (cluster.role === "mongos") {
+      try {
+        const shards = await client.db("config").collection("shards").find({}).toArray();
+        discoveredShards = shards.map((s) => String(s._id));
+      } catch {
+        // Best-effort shard discovery
+      }
+    }
   } catch (error) {
     cluster = {
       connected: false,
-      error: error instanceof Error ? error.message : String(error),
+      error: sanitizeSecrets(error instanceof Error ? error.message : String(error)),
     };
   } finally {
     await client.close().catch(() => {});
@@ -65,16 +74,18 @@ export async function getStatus({
 
   // 2. Storage Health & Inventory
   let storageStat: StorageStatus;
+  let recentBackups: SystemStatus["recentBackups"] = [];
   const scope = scopeOf(config);
   try {
     const allBackups = await listBackups(storage, scope);
     const completeBackups = allBackups.filter((b) => b.complete);
+    recentBackups = completeBackups.slice(0, 5);
     const totalSizeBytes = completeBackups.reduce((acc, b) => acc + (b.size || 0), 0);
     const latest = completeBackups[0] || null;
 
     let latestDetails: StorageStatus["latestBackup"] = undefined;
     if (latest) {
-      const manifest = await readManifest(storage, latest.key);
+      const manifest = await readManifest(storage, latest.key).catch(() => null);
       latestDetails = {
         key: latest.key,
         createdAt: manifest?.createdAt || new Date(latest.createdAt).toISOString(),
@@ -106,7 +117,7 @@ export async function getStatus({
       accessible: false,
       totalBackups: 0,
       totalSizeBytes: 0,
-      error: error instanceof Error ? error.message : String(error),
+      error: sanitizeSecrets(error instanceof Error ? error.message : String(error)),
     };
   }
 
@@ -141,17 +152,28 @@ export async function getStatus({
           break;
         }
 
-        if (i > 0 && sliceManifest?.oplogWindow?.previousEndTs) {
-          const prevEndTs = parseOplogTimestamp(sliceManifest.oplogWindow.previousEndTs);
+        if (i > 0) {
           const prevSlice = slices[i - 1]!;
-          if (
-            prevEndTs &&
-            compareTimestamps(prevEndTs, prevSlice.endTs) !== 0 &&
-            compareTimestamps(slice.startTs, prevSlice.endTs) > 0
-          ) {
+          if (compareTimestamps(slice.startTs, prevSlice.endTs) > 0) {
             timelineContinuous = false;
-            gapWarning = `Discontinuity detected between ${prevSlice.key} (end ${formatOplogTimestamp(prevSlice.endTs)}) and ${slice.key} (expected previousEndTs ${sliceManifest.oplogWindow.previousEndTs})`;
+            gapWarning = `Discontinuity detected between ${prevSlice.key} (end ${formatOplogTimestamp(prevSlice.endTs)}) and ${slice.key} (start ${formatOplogTimestamp(slice.startTs)})`;
             break;
+          }
+          if (sliceManifest?.oplogWindow?.previousEndTs) {
+            try {
+              const prevEndTs = parseOplogTimestamp(sliceManifest.oplogWindow.previousEndTs);
+              if (
+                prevEndTs &&
+                compareTimestamps(prevEndTs, prevSlice.endTs) !== 0 &&
+                compareTimestamps(slice.startTs, prevSlice.endTs) > 0
+              ) {
+                timelineContinuous = false;
+                gapWarning = `Discontinuity detected between ${prevSlice.key} (end ${formatOplogTimestamp(prevSlice.endTs)}) and ${slice.key} (expected previousEndTs ${sliceManifest.oplogWindow.previousEndTs})`;
+                break;
+              }
+            } catch {
+              // Ignore malformed previousEndTs in individual slice manifest
+            }
           }
         }
       }
@@ -192,7 +214,9 @@ export async function getStatus({
   let operation: OperationLockStatus = { running: false };
   try {
     const lockFile = path.join(config.workDir, ".backup.lock");
-    const local = await readLock(lockFile);
+    const rawLocal = await readLock(lockFile);
+    const local =
+      rawLocal && !(await isStale(lockFile, config.timeoutMs + 60_000)) ? rawLocal : null;
 
     let distributed: {
       data?: { holder?: string; acquiredAt?: string; expiresAt?: number };
@@ -226,13 +250,6 @@ export async function getStatus({
     operation = { running: false };
   }
 
-  // 5. Recent Backups List (last 5)
-  let recentBackups: SystemStatus["recentBackups"] = [];
-  try {
-    const backups = await listBackups(storage, scope);
-    recentBackups = backups.filter((b) => b.complete).slice(0, 5);
-  } catch {}
-
   return {
     timestamp,
     cluster,
@@ -251,7 +268,8 @@ export async function getStatus({
     sharding: config.sharding
       ? {
           isSharded: cluster.role === "mongos",
-          shardsCount: cluster.hosts?.length,
+          shardsCount: discoveredShards?.length ?? cluster.hosts?.length,
+          ...(discoveredShards ? { shards: discoveredShards } : {}),
         }
       : undefined,
   };
@@ -358,6 +376,11 @@ export function formatStatus(status: SystemStatus): string {
           : badge(`WARNING: ${status.pitr.gapWarning}`, "warn"),
       },
     );
+  } else if (status.pitr.gapWarning) {
+    pitrRows.push({
+      label: "Contiguity",
+      value: badge(`WARNING: ${status.pitr.gapWarning}`, "warn"),
+    });
   }
   sections.push(
     renderPanel(renderKeyValue(pitrRows, { indent: 1 }), {

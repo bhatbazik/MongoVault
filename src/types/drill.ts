@@ -52,6 +52,7 @@ export interface DrillContext {
   config: AppConfig;
   storage: StorageClient;
   logger: Logger;
+  signal?: AbortSignal;
   tools?: RestoreTools;
   createMongoClient?: (uri: string) => MongoClient;
 }

@@ -1,8 +1,11 @@
 import { randomUUID } from "node:crypto";
+import path from "node:path";
 import { type Db, MongoClient } from "mongodb";
-import { isClusterScope, listBackups, readManifest, scopeOf } from "./catalog.js";
-import { formatOplogTimestamp, listOplogSlices } from "./oplog.js";
+import { databasePrefix, isClusterScope, listBackups, readManifest, scopeOf } from "./catalog.js";
+import { acquireHybridLock } from "./lock.js";
+import { formatOplogTimestamp, listOplogSlices, resolvePitrPlan } from "./oplog.js";
 import { restoreBackup } from "./restore.js";
+import { restoreShardedCluster } from "./sharding.js";
 import type { BackupManifest, SchemaIndexSpec } from "./types/catalog.js";
 import type {
   DrillContext,
@@ -67,11 +70,14 @@ function isReasonableOplogShift(
   actual: number,
   oplogEntries?: number,
   isPitrDrill = false,
+  appliedEntries?: number,
 ): boolean {
   if (actual === 0 && expected > 0) return false;
   if (isPitrDrill) {
-    // PITR replays post-backup slices which may legitimately insert/delete many documents,
-    // so any non-zero restored count is tracked as variance while schema/RW checks verify integrity.
+    if (typeof oplogEntries === "number" || typeof appliedEntries === "number") {
+      const maxShift = (oplogEntries ?? 0) + (appliedEntries ?? 0);
+      return Math.abs(actual - expected) <= maxShift;
+    }
     return actual > 0;
   }
   if (typeof oplogEntries === "number") {
@@ -79,8 +85,8 @@ function isReasonableOplogShift(
     // document count by more than `oplogEntries`.
     return Math.abs(actual - expected) <= oplogEntries;
   }
-  // Legacy/unbounded manifest fallback: reject catastrophic drops (>50% missing on >=10 docs).
-  if (expected >= 10 && actual < Math.ceil(expected * 0.5)) {
+  // Legacy/unbounded manifest fallback: reject catastrophic drops (>50% missing on >=2 docs).
+  if (expected >= 2 && actual < Math.ceil(expected * 0.5)) {
     return false;
   }
   return true;
@@ -91,6 +97,7 @@ async function verifyCollections(
   reader: CollectionCountReader,
   hasOplog: boolean,
   isPitrDrill = false,
+  appliedEntries?: number,
 ): Promise<{ mismatches: DrillMismatch[]; variances: DrillVariance[] }> {
   const mismatches: DrillMismatch[] = [];
   const variances: DrillVariance[] = [];
@@ -101,9 +108,7 @@ async function verifyCollections(
   for (const [colKey, expected] of Object.entries(manifest.collections || {})) {
     const exists = reader.hasCollection(colKey);
     if (exists === false) {
-      if (expected > 0) {
-        mismatches.push({ collection: colKey, expected, actual: "missing" });
-      }
+      mismatches.push({ collection: colKey, expected, actual: "missing" });
       continue;
     }
 
@@ -116,11 +121,12 @@ async function verifyCollections(
     const actual = await reader.countDocuments(colKey);
 
     if (actual === null) {
-      if (expected > 0) {
-        mismatches.push({ collection: colKey, expected, actual: "missing" });
-      }
+      mismatches.push({ collection: colKey, expected, actual: "missing" });
     } else if (actual !== expected) {
-      if (hasOplog && isReasonableOplogShift(expected, actual, oplogEntries, isPitrDrill)) {
+      if (
+        hasOplog &&
+        isReasonableOplogShift(expected, actual, oplogEntries, isPitrDrill, appliedEntries)
+      ) {
         variances.push({ collection: colKey, expected, actual, diff: actual - expected });
       } else {
         mismatches.push({ collection: colKey, expected, actual });
@@ -184,6 +190,7 @@ async function verifySchemaAndReadWrite({
   manifest,
   isCluster,
   isPitr = false,
+  appliedEntries,
   resolveDbAndColl,
   collectionInfosByDb,
   probeDb,
@@ -193,6 +200,7 @@ async function verifySchemaAndReadWrite({
   manifest: BackupManifest;
   isCluster: boolean;
   isPitr?: boolean;
+  appliedEntries?: number;
   resolveDbAndColl: (colKey: string) => { db: Db; dbName: string; collName: string } | null;
   collectionInfosByDb: Map<string, Map<string, RestoredCollectionInfo> | null>;
   probeDb: Db | null;
@@ -331,7 +339,6 @@ async function verifySchemaAndReadWrite({
           const diff = compareIndexSpec(expectedIdx, found);
           if (diff) {
             recordSchemaDiff({ namespace: colKey, kind: "index", detail: diff });
-            if (isPitr) indexesVerified++;
           } else {
             indexesVerified++;
           }
@@ -384,10 +391,14 @@ async function verifySchemaAndReadWrite({
     }
 
     if (pitrSchemaDrifts.length > 0) {
-      logger?.info(
-        { driftsCount: pitrSchemaDrifts.length, drifts: pitrSchemaDrifts },
-        "Schema differed from base snapshot during PITR drill (expected when post-backup DDL replayed)",
-      );
+      if (appliedEntries === 0) {
+        schemaMismatches.push(...pitrSchemaDrifts);
+      } else {
+        logger?.info(
+          { driftsCount: pitrSchemaDrifts.length, drifts: pitrSchemaDrifts },
+          "Schema differed from base snapshot during PITR drill (expected when post-backup DDL replayed)",
+        );
+      }
     }
   } else {
     // Backwards-compatible index count inspection for manifests without recorded schema metadata
@@ -405,11 +416,9 @@ async function verifySchemaAndReadWrite({
   }
 
   // 2. Live Read/Write functional usability checks on restored database(s)
-  let ranReadCheck = false;
   for (const sample of readSampleTargets) {
     const coll = sample.db.collection(sample.collName);
     if (typeof coll.findOne === "function") {
-      ranReadCheck = true;
       try {
         await coll.findOne({});
       } catch (err) {
@@ -455,8 +464,6 @@ async function verifySchemaAndReadWrite({
           await probeColl.drop().catch(() => {});
         }
       }
-    } else if (ranReadCheck && schemaMismatches.length === 0) {
-      readWriteVerified = true;
     }
   }
 
@@ -477,6 +484,7 @@ export async function runDrill(
     config,
     storage,
     logger,
+    signal,
     createMongoClient = (uri: string) => new MongoClient(uri),
   } = ctx;
   if (!config.drill) {
@@ -484,86 +492,177 @@ export async function runDrill(
   }
 
   // Safety check: prevent running drills against the primary/production database
-  if (config.drill.uri === config.mongo.uri) {
+  if (config.drill.uri.trim() === config.mongo.uri.trim()) {
     throw new Error(
       "Safety violation: DRILL_MONGODB_URI cannot match MONGODB_URI. Drills must run against an isolated staging/test instance.",
     );
   }
 
-  const startedAt = Date.now();
+  signal?.throwIfAborted?.();
+
   const scope = scopeOf(config);
-  let resolvedPitr: string | undefined = options.pitr;
-
-  if (resolvedPitr === "latest") {
-    const slices = (await listOplogSlices(storage, scope)).filter((s) => s.complete);
-    if (slices.length === 0) {
-      throw new Error("Cannot run PITR restore drill: no complete oplog slices found in storage");
-    }
-    const latestSlice = slices[slices.length - 1]!;
-    resolvedPitr = formatOplogTimestamp(latestSlice.endTs);
+  const lockController = new AbortController();
+  const onCallerAbort = () => lockController.abort(signal?.reason);
+  if (signal) {
+    if (signal.aborted) lockController.abort(signal.reason);
+    else signal.addEventListener("abort", onCallerAbort, { once: true });
   }
 
-  const backups = await listBackups(storage, scope);
-  const logicalBackups = backups.filter(
-    (b) => !/\.physical\.tar\.gz(\.enc)?$/.test(b.key) && !/\.cluster(\.enc)?$/.test(b.key),
-  );
-  if (logicalBackups.length === 0) {
-    throw new Error("No logical backups found to run restore drill");
+  const releaseDrillLock = await acquireHybridLock({
+    file: path.join(config.workDir, ".drill.lock"),
+    storage,
+    lockKey: `${databasePrefix(scope)}.locks/drill.lock.json`,
+    staleAfterMs: Math.max(config.timeoutMs + 60_000, 120_000),
+    logger,
+    onLost: (err) => {
+      lockController.abort(err ?? new Error("Lost drill lock"));
+    },
+  });
+  if (!releaseDrillLock) {
+    if (signal) signal.removeEventListener("abort", onCallerAbort);
+    throw new Error("Another restore drill is already in progress (failed to acquire drill lock)");
   }
-  const key = logicalBackups[0]!.key;
-  const manifest = await readManifest(storage, key);
-  if (!manifest) {
-    throw new Error(`Manifest not found for ${key}`);
-  }
-  const isCluster = isClusterScope(manifest.database);
-  const drillTag = `drill_${Date.now()}`;
+
+  const drillSignal = lockController.signal;
+  const startedAt = Date.now();
   const client = createMongoClient(config.drill.uri);
-
-  logger.info(
-    { key, isCluster, oplog: Boolean(manifest.oplog), pitr: resolvedPitr },
-    "Restore drill started",
-  );
-
   const restoredDbs = new Set<string>();
   const PROTECTED_SYSTEM_DBS = new Set(["admin", "local", "config"]);
+  let preDrillDbs: Set<string> | null = null;
+
   try {
+    drillSignal.throwIfAborted?.();
+    let resolvedPitr: string | undefined = options.pitr;
+
+    if (resolvedPitr === "latest") {
+      const slices = (await listOplogSlices(storage, scope)).filter((s) => s.complete);
+      if (slices.length === 0) {
+        throw new Error("Cannot run PITR restore drill: no complete oplog slices found in storage");
+      }
+      const latestSlice = slices[slices.length - 1]!;
+      resolvedPitr = formatOplogTimestamp(latestSlice.endTs);
+    }
+
+    const backups = (await listBackups(storage, scope)).filter((b) => b.complete);
+    const logicalBackups = backups.filter((b) => {
+      if (/\.physical\.tar\.gz(\.enc)?$/.test(b.key)) return false;
+      if (/\.cluster(\.enc)?$/.test(b.key)) return Boolean(config.sharding?.enabled);
+      return true;
+    });
+    if (logicalBackups.length === 0) {
+      if (backups.some((b) => /\.physical\.tar\.gz(\.enc)?$/.test(b.key))) {
+        throw new Error(
+          "Restore drill is not supported for physical backups (requires offline dbPath recovery)",
+        );
+      }
+      throw new Error("No logical backups found to run restore drill");
+    }
+
+    let key = logicalBackups[0]!.key;
+    if (resolvedPitr) {
+      try {
+        const plan = await resolvePitrPlan(storage, scope, resolvedPitr);
+        if (plan?.baseBackup?.key && !/\.physical\.tar\.gz(\.enc)?$/.test(plan.baseBackup.key)) {
+          key = plan.baseBackup.key;
+        }
+      } catch {
+        // Let restoreBackup surface PITR plan errors if any
+      }
+    }
+
+    const manifest = await readManifest(storage, key);
+    if (!manifest) {
+      throw new Error(`Manifest not found for ${key}`);
+    }
+    const isCluster = isClusterScope(manifest.database);
+    const drillTag = `drill_${Date.now()}`;
+
+    logger.info(
+      { key, isCluster, oplog: Boolean(manifest.oplog), pitr: resolvedPitr },
+      "Restore drill started",
+    );
+
+    drillSignal.throwIfAborted?.();
     await client.connect();
 
     // Server-level topology isolation check: ensure DRILL_MONGODB_URI does not resolve
-    // to the same physical cluster as MONGODB_URI via a different hostname/alias.
+    // to the same physical cluster as MONGODB_URI via a different hostname/alias or mongos router.
+    const prodClient = createMongoClient(config.mongo.uri);
     try {
-      const prodClient = createMongoClient(config.mongo.uri);
-      try {
-        await prodClient.connect();
-        const prodAdmin = prodClient.db("admin");
-        const drillAdmin = client.db("admin");
-        if (typeof prodAdmin.command === "function" && typeof drillAdmin.command === "function") {
-          const [prodHello, drillHello] = await Promise.all([
-            prodAdmin.command({ hello: 1 }).catch(() => null),
-            drillAdmin.command({ hello: 1 }).catch(() => null),
-          ]);
-          if (prodHello && drillHello) {
-            const sameNode =
-              Boolean(prodHello.me && drillHello.me) && prodHello.me === drillHello.me;
-            const sameReplicaSet =
-              Boolean(prodHello.setName && drillHello.setName) &&
-              prodHello.setName === drillHello.setName &&
-              Array.isArray(prodHello.hosts) &&
-              Array.isArray(drillHello.hosts) &&
-              prodHello.hosts.some((h: string) => drillHello.hosts.includes(h));
-            if (sameNode || sameReplicaSet) {
+      await prodClient.connect();
+      const prodAdmin = prodClient.db("admin");
+      const drillAdmin = client.db("admin");
+      if (typeof prodAdmin.command === "function" && typeof drillAdmin.command === "function") {
+        const [prodHello, drillHello] = await Promise.all([
+          prodAdmin.command({ hello: 1 }),
+          drillAdmin.command({ hello: 1 }),
+        ]);
+        if (prodHello && drillHello) {
+          const sameNode = Boolean(prodHello.me && drillHello.me) && prodHello.me === drillHello.me;
+          const sameReplicaSet =
+            Boolean(prodHello.setName && drillHello.setName) &&
+            prodHello.setName === drillHello.setName &&
+            Array.isArray(prodHello.hosts) &&
+            Array.isArray(drillHello.hosts) &&
+            prodHello.hosts.some((h: string) => drillHello.hosts.includes(h));
+          if (sameNode || sameReplicaSet) {
+            throw new Error(
+              "Safety violation: DRILL_MONGODB_URI resolves to the same MongoDB cluster as MONGODB_URI. Drills must run against an isolated staging/test instance.",
+            );
+          }
+          if (prodHello.msg === "isdbgrid" && drillHello.msg === "isdbgrid") {
+            const [prodShards, drillShards] = await Promise.all([
+              prodClient.db("config").collection("shards").find({}).toArray(),
+              client.db("config").collection("shards").find({}).toArray(),
+            ]);
+            const prodHosts = new Set(
+              prodShards.map((s) => `${String(s._id)}::${String(s.host ?? "")}`),
+            );
+            const sharesShard = drillShards.some((s) =>
+              prodHosts.has(`${String(s._id)}::${String(s.host ?? "")}`),
+            );
+            if (sharesShard) {
               throw new Error(
-                "Safety violation: DRILL_MONGODB_URI resolves to the same MongoDB cluster as MONGODB_URI. Drills must run against an isolated staging/test instance.",
+                "Safety violation: DRILL_MONGODB_URI resolves to the same MongoDB sharded cluster as MONGODB_URI. Drills must run against an isolated staging/test instance.",
               );
             }
           }
         }
-      } finally {
-        await prodClient.close().catch(() => {});
       }
     } catch (err) {
       if (err instanceof Error && err.message.startsWith("Safety violation:")) {
         throw err;
+      }
+      throw new Error(
+        `Safety violation: unable to verify DRILL_MONGODB_URI isolation against MONGODB_URI: ${err instanceof Error ? err.message : String(err)}`,
+        { cause: err },
+      );
+    } finally {
+      await prodClient.close().catch(() => {});
+    }
+
+    // Sweep stale *_drill_<digits> staging databases left by crashed drills (safe under exclusive drill lock)
+    const drillAdmin = client.db("admin");
+    if (typeof drillAdmin.command === "function") {
+      try {
+        const listed = (await drillAdmin.command({ listDatabases: 1, nameOnly: true })) as {
+          databases?: Array<{ name: string }>;
+        };
+        if (Array.isArray(listed?.databases)) {
+          preDrillDbs = new Set<string>();
+          for (const entry of listed.databases) {
+            if (/_drill_\d+$/.test(entry.name)) {
+              await client
+                .db(entry.name)
+                .dropDatabase()
+                .catch(() => {});
+            } else {
+              preDrillDbs.add(entry.name);
+            }
+          }
+        }
+      } catch {
+        // Non-fatal if target user lacks listDatabases privilege
       }
     }
 
@@ -572,19 +671,24 @@ export async function runDrill(
       restoredDbs.add(database);
       await client.db(database).dropDatabase();
 
-      const restoreRes = await restoreBackup(ctx, {
-        ref: key,
-        uri: config.drill.uri,
-        database,
-        drop: true,
-        preVerify: true,
-        pitr: resolvedPitr,
-      });
+      const restoreRes = await restoreBackup(
+        { ...ctx, signal: drillSignal },
+        {
+          ref: key,
+          uri: config.drill.uri,
+          database,
+          drop: true,
+          preVerify: true,
+          pitr: resolvedPitr,
+          skipPitrRestoreMarker: true,
+        },
+      );
 
       const activeManifest = restoreRes.manifest ?? manifest;
       const db = client.db(database);
       const collectionInfos = await getRestoredCollectionInfos(db);
       const hasOplog = Boolean(activeManifest.oplog) || Boolean(resolvedPitr);
+      const appliedEntries = restoreRes.oplogStats?.appliedEntries;
 
       const reader: CollectionCountReader = {
         hasCollection(colKey: string) {
@@ -607,6 +711,7 @@ export async function runDrill(
         reader,
         hasOplog,
         Boolean(resolvedPitr),
+        appliedEntries,
       );
 
       const readSampleTargets = Object.entries(activeManifest.collections || {})
@@ -617,6 +722,7 @@ export async function runDrill(
         manifest: activeManifest,
         isCluster: false,
         isPitr: Boolean(resolvedPitr),
+        appliedEntries,
         resolveDbAndColl: (colKey) => ({ db, dbName: database, collName: colKey }),
         collectionInfosByDb: new Map([[database, collectionInfos]]),
         probeDb: db,
@@ -655,34 +761,91 @@ export async function runDrill(
       logger.info(result, "Restore drill passed");
       return result;
     } else {
-      // Cluster-wide restore drill
-      const restoreRes = await restoreBackup(ctx, {
-        ref: key,
-        uri: config.drill.uri,
-        drop: true,
-        preVerify: true,
-        pitr: resolvedPitr,
-      });
+      // Cluster-wide restore drill: pre-populate restoredDbs from manifest so finally cleans up partial failures
+      const addDbsFromManifest = (m: BackupManifest) => {
+        for (const colKey of Object.keys(m.collections || {})) {
+          const firstDot = colKey.indexOf(".");
+          if (firstDot > 0) restoredDbs.add(colKey.substring(0, firstDot));
+        }
+        for (const colKey of Object.keys(m.schema?.collections || {})) {
+          const firstDot = colKey.indexOf(".");
+          if (firstDot > 0) restoredDbs.add(colKey.substring(0, firstDot));
+        }
+        for (const view of m.schema?.views || []) {
+          const firstDot = view.name.indexOf(".");
+          if (firstDot > 0) restoredDbs.add(view.name.substring(0, firstDot));
+        }
+      };
+      const isShardedBackup =
+        manifest.type === "sharded-cluster-backup" || /\.cluster(\.enc)?$/.test(key);
+      let effectiveManifest: BackupManifest = manifest;
+      if (isShardedBackup && manifest.sharding?.shards) {
+        const mergedCollections: Record<string, number> = { ...(manifest.collections || {}) };
+        for (const shardInfo of Object.values(manifest.sharding.shards)) {
+          const shardManifest = await readManifest(storage, shardInfo.backupKey);
+          if (!shardManifest?.collections) continue;
+          for (const [colKey, count] of Object.entries(shardManifest.collections)) {
+            const firstDot = colKey.indexOf(".");
+            const dbName = firstDot > 0 ? colKey.substring(0, firstDot) : "";
+            if (PROTECTED_SYSTEM_DBS.has(dbName)) continue;
+            mergedCollections[colKey] = (mergedCollections[colKey] ?? 0) + count;
+          }
+        }
+        effectiveManifest = { ...manifest, collections: mergedCollections };
+      }
+      addDbsFromManifest(effectiveManifest);
 
-      const activeManifest = restoreRes.manifest ?? manifest;
-      for (const colKey of Object.keys(activeManifest.collections || {})) {
-        const firstDot = colKey.indexOf(".");
-        if (firstDot > 0) {
-          restoredDbs.add(colKey.substring(0, firstDot));
+      if (preDrillDbs) {
+        const collisions = [...restoredDbs].filter(
+          (dbName) => !PROTECTED_SYSTEM_DBS.has(dbName) && preDrillDbs!.has(dbName),
+        );
+        if (collisions.length > 0) {
+          // Do not drop pre-existing user databases in finally!
+          for (const c of collisions) restoredDbs.delete(c);
+          throw new Error(
+            `Safety violation: cluster drill target already contains colliding user database(s): ${collisions.join(", ")}`,
+          );
         }
       }
-      for (const colKey of Object.keys(activeManifest.schema?.collections || {})) {
-        const firstDot = colKey.indexOf(".");
-        if (firstDot > 0) {
-          restoredDbs.add(colKey.substring(0, firstDot));
-        }
-      }
-      for (const view of activeManifest.schema?.views || []) {
-        const firstDot = view.name.indexOf(".");
-        if (firstDot > 0) {
-          restoredDbs.add(view.name.substring(0, firstDot));
-        }
-      }
+
+      const restoreRes = isShardedBackup
+        ? await (async () => {
+            const shardedRes = await restoreShardedCluster({
+              config: {
+                ...config,
+                mongo: { ...config.mongo, uri: config.drill!.uri },
+              },
+              storage,
+              logger,
+              signal: drillSignal,
+              drop: true,
+              preVerify: true,
+              pitr: resolvedPitr,
+              skipPitrRestoreMarker: true,
+              createMongoClient,
+            });
+            return {
+              key: shardedRes.key,
+              manifest: effectiveManifest,
+              pitrTarget: shardedRes.pitrTarget,
+              replayedSlices: shardedRes.replayedSlices,
+              oplogStats: shardedRes.oplogStats,
+            };
+          })()
+        : await restoreBackup(
+            { ...ctx, signal: drillSignal },
+            {
+              ref: key,
+              uri: config.drill.uri,
+              drop: true,
+              preVerify: true,
+              pitr: resolvedPitr,
+              skipPitrRestoreMarker: true,
+            },
+          );
+
+      const activeManifest = restoreRes.manifest ?? effectiveManifest;
+      addDbsFromManifest(activeManifest);
 
       const collectionInfosByDb = new Map<string, Map<string, RestoredCollectionInfo> | null>();
       for (const dbName of restoredDbs) {
@@ -690,6 +853,7 @@ export async function runDrill(
       }
 
       const hasOplog = Boolean(activeManifest.oplog) || Boolean(resolvedPitr);
+      const appliedEntries = restoreRes.oplogStats?.appliedEntries;
 
       const reader: CollectionCountReader = {
         hasCollection(colKey: string) {
@@ -725,6 +889,7 @@ export async function runDrill(
         reader,
         hasOplog,
         Boolean(resolvedPitr),
+        appliedEntries,
       );
 
       const readSampleTargets: Array<{ namespace: string; db: Db; collName: string }> = [];
@@ -743,6 +908,7 @@ export async function runDrill(
         manifest: activeManifest,
         isCluster: true,
         isPitr: Boolean(resolvedPitr),
+        appliedEntries,
         resolveDbAndColl: (colKey) => {
           const firstDot = colKey.indexOf(".");
           if (firstDot <= 0) return null;
@@ -788,6 +954,24 @@ export async function runDrill(
       return result;
     }
   } finally {
+    if (
+      isClusterScope(config.mongo.database) &&
+      preDrillDbs &&
+      typeof drillAdminOrNull(client) === "function"
+    ) {
+      try {
+        const listed = (await client.db("admin").command({ listDatabases: 1, nameOnly: true })) as {
+          databases?: Array<{ name: string }>;
+        };
+        for (const entry of listed?.databases ?? []) {
+          if (!PROTECTED_SYSTEM_DBS.has(entry.name) && !preDrillDbs.has(entry.name)) {
+            restoredDbs.add(entry.name);
+          }
+        }
+      } catch {
+        // Ignore cleanup listDatabases errors
+      }
+    }
     for (const dbName of restoredDbs) {
       if (PROTECTED_SYSTEM_DBS.has(dbName)) continue;
       await client
@@ -796,5 +980,15 @@ export async function runDrill(
         .catch(() => {});
     }
     await client.close().catch(() => {});
+    if (signal) signal.removeEventListener("abort", onCallerAbort);
+    await releaseDrillLock().catch(() => {});
+  }
+}
+
+function drillAdminOrNull(client: MongoClient): unknown {
+  try {
+    return client.db("admin").command;
+  } catch {
+    return null;
   }
 }

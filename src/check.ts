@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { MongoClient } from "mongodb";
 import { createDecryptor, createEncryptor, keyId } from "./crypto.js";
+import { sanitizeSecrets } from "./mongo.js";
 import { fromBsonTimestamp } from "./oplog.js";
 import { checkDatabaseTools, checkTool } from "./tools.js";
 import { badge, padVisibleEnd, renderBanner, renderPanel, style } from "./tui.js";
@@ -81,7 +82,7 @@ async function checkMongo(
       message: `Connected successfully to ${hello.me || "instance"} (setName: ${hello.setName || "none"})`,
     });
 
-    if (config.mongo.oplog || config.pitr?.enabled) {
+    if ((config.mongo.oplog || config.pitr?.enabled) && hello?.msg !== "isdbgrid") {
       try {
         const localDb = client.db("local");
         const oplogColl = localDb.collection("oplog.rs");
@@ -207,7 +208,7 @@ async function checkMongo(
     checks.push({
       name: "MongoDB Connectivity",
       passed: false,
-      message: `Failed to connect: ${error instanceof Error ? error.message : String(error)}`,
+      message: `Failed to connect: ${sanitizeSecrets(error instanceof Error ? error.message : String(error))}`,
     });
   } finally {
     await client.close().catch(() => {});
@@ -220,7 +221,8 @@ async function checkMongo(
  * Checks storage read, write, head, and delete permissions via a temporary probe file.
  */
 async function checkStorage(config: AppConfig, storage: StorageClient): Promise<CheckItem> {
-  const probeKey = `${config.storage.prefix}/.probe-${randomUUID()}.json`;
+  const basePrefix = config.storage.prefix ? `${config.storage.prefix}/` : "";
+  const probeKey = `${basePrefix}.probe-${randomUUID()}.json`;
   const backendLabel = `Storage Backend (${config.storage.type.toUpperCase()})`;
 
   try {
@@ -228,20 +230,30 @@ async function checkStorage(config: AppConfig, storage: StorageClient): Promise<
     await storage.putJson(probeKey, probeData);
     const retrieved = await storage.getJson<{ probe: boolean }>(probeKey);
     const head = await storage.head(probeKey);
-    await storage.remove(probeKey);
+    if (typeof storage.list === "function") {
+      for await (const _ of storage.list(basePrefix)) {
+        break;
+      }
+    }
 
     const probeOk = retrieved?.data?.probe === true && head?.size !== undefined && head.size > 0;
     return {
       name: backendLabel,
       passed: probeOk,
-      message: `Read, write, head, and delete verified on ${storage.bucket}`,
+      message: probeOk
+        ? `Read, write, head, list, and delete verified on ${storage.bucket}`
+        : `Storage probe verification returned unexpected result on ${storage.bucket}`,
     };
   } catch (error) {
     return {
       name: backendLabel,
       passed: false,
-      message: `Storage permission test failed: ${error instanceof Error ? error.message : String(error)}`,
+      message: `Storage permission test failed: ${sanitizeSecrets(error instanceof Error ? error.message : String(error))}`,
     };
+  } finally {
+    if (typeof storage.remove === "function") {
+      await storage.remove(probeKey).catch(() => {});
+    }
   }
 }
 
@@ -255,6 +267,10 @@ function checkEncryption(config: AppConfig): CheckItem {
       const encryptor = createEncryptor(config.encryptionKey);
       const envelope = encryptor.envelope();
       const decryptor = createDecryptor([config.encryptionKey], envelope);
+      for (const ringKey of config.encryptionKeyRing || []) {
+        keyId(ringKey);
+        createEncryptor(ringKey);
+      }
       return {
         name: "Client-Side Encryption",
         passed: Boolean(decryptor && id),
@@ -291,6 +307,17 @@ function checkEncryption(config: AppConfig): CheckItem {
 async function checkScratchDir(config: AppConfig): Promise<CheckItem> {
   try {
     await fs.mkdir(config.workDir, { recursive: true });
+    if (typeof fs.statfs === "function") {
+      const stats = await fs.statfs(config.workDir);
+      const freeBytes = Number(stats.bavail) * Number(stats.bsize);
+      if (Number.isFinite(freeBytes) && freeBytes < 10 * 1024 * 1024) {
+        return {
+          name: "Scratch Directory",
+          passed: false,
+          message: `Insufficient free space in ${config.workDir} (${Math.round(freeBytes / (1024 * 1024))} MiB available)`,
+        };
+      }
+    }
     const probeFile = path.join(config.workDir, `.probe-${randomUUID()}`);
     await fs.writeFile(probeFile, "ok", { mode: 0o600 });
     await fs.readFile(probeFile);

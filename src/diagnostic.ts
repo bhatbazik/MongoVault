@@ -63,11 +63,20 @@ export interface DiagnosticBundle {
     bucket: string;
     prefix: string;
     totalBackups: number;
+    error?: string;
+  };
+  pitr?: {
+    enabled: boolean;
+    flushIntervalSeconds: number;
+  };
+  sharding?: {
+    enabled: boolean;
   };
   recentManifests: Array<Record<string, unknown>>;
   activeLocks: {
     local?: Record<string, unknown> | null;
     distributed?: Record<string, unknown> | null;
+    error?: string;
   };
 }
 
@@ -91,7 +100,16 @@ export async function generateDiagnosticBundle({
   };
 
   // 2. Tools
-  const tools = await checkDatabaseTools();
+  let tools: DiagnosticBundle["tools"];
+  try {
+    tools = sanitizeValue(await checkDatabaseTools());
+  } catch (error) {
+    const msg = sanitizeValue(error instanceof Error ? error.message : String(error));
+    tools = {
+      mongodump: { available: false, error: msg },
+      mongorestore: { available: false, error: msg },
+    };
+  }
 
   // 3. Database
   let database: DiagnosticBundle["database"];
@@ -117,7 +135,7 @@ export async function generateDiagnosticBundle({
       connected: false,
       maskedUri: maskMongoUri(config.mongo.uri),
       targetDatabase: config.mongo.database,
-      error: error instanceof Error ? error.message : String(error),
+      error: sanitizeValue(error instanceof Error ? error.message : String(error)),
     };
   } finally {
     await client.close().catch(() => {});
@@ -126,6 +144,7 @@ export async function generateDiagnosticBundle({
   // 4. Storage & Backups
   const scope = scopeOf(config);
   let totalBackups = 0;
+  let storageError: string | undefined;
   const recentManifests: Array<Record<string, unknown>> = [];
   try {
     const backups = await listBackups(storage, scope);
@@ -133,35 +152,41 @@ export async function generateDiagnosticBundle({
     totalBackups = complete.length;
 
     for (const b of complete.slice(0, 3)) {
-      const manifest = await readManifest(storage, b.key);
+      const manifest = await readManifest(storage, b.key).catch(() => null);
       if (manifest) {
-        recentManifests.push(manifest as unknown as Record<string, unknown>);
+        recentManifests.push(sanitizeValue(manifest as unknown as Record<string, unknown>));
       }
     }
-  } catch {}
+  } catch (error) {
+    storageError = sanitizeValue(error instanceof Error ? error.message : String(error));
+  }
 
-  const storageInfo = {
+  const storageInfo: DiagnosticBundle["storage"] = {
     type: config.storage.type,
     bucket: config.storage.bucket,
     prefix: config.storage.prefix,
     totalBackups,
+    ...(storageError ? { error: storageError } : {}),
   };
 
   // 5. Active Locks
   let localLock: Record<string, unknown> | null = null;
   let distributedLock: Record<string, unknown> | null = null;
+  let lockError: string | undefined;
   try {
     const lockFile = path.join(config.workDir, ".backup.lock");
-    localLock = (await readLock(lockFile)) as Record<string, unknown> | null;
+    localLock = sanitizeValue((await readLock(lockFile)) as Record<string, unknown> | null);
     if (typeof storage.getJson === "function") {
       const primaryLockKey = `${databasePrefix(scope)}.locks/backup.lock.json`;
       const legacyLockKey = `${config.storage.prefix}/locks/backup.lock`;
       const dist =
         (await storage.getJson(primaryLockKey).catch(() => null)) ??
         (await storage.getJson(legacyLockKey).catch(() => null));
-      distributedLock = (dist?.data as Record<string, unknown> | null) ?? null;
+      distributedLock = sanitizeValue((dist?.data as Record<string, unknown> | null) ?? null);
     }
-  } catch {}
+  } catch (error) {
+    lockError = sanitizeValue(error instanceof Error ? error.message : String(error));
+  }
 
   return {
     generatedAt,
@@ -169,10 +194,18 @@ export async function generateDiagnosticBundle({
     tools,
     database,
     storage: storageInfo,
+    pitr: {
+      enabled: config.pitr?.enabled ?? false,
+      flushIntervalSeconds: config.pitr?.flushIntervalSeconds ?? 60,
+    },
+    sharding: {
+      enabled: Boolean(config.sharding?.enabled),
+    },
     recentManifests,
     activeLocks: {
       local: localLock,
       distributed: distributedLock,
+      ...(lockError ? { error: lockError } : {}),
     },
   };
 }
