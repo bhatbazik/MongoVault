@@ -4,6 +4,7 @@ import { Transform, type TransformCallback } from "node:stream";
 export class DigestStream extends Transform {
   #hash: Hash = createHash("sha256");
   #bytes: number = 0;
+  #finalDigest: string | null = null;
 
   override _transform(chunk: Buffer, _encoding: BufferEncoding, callback: TransformCallback): void {
     this.#hash.update(chunk);
@@ -16,6 +17,9 @@ export class DigestStream extends Transform {
   }
 
   digest(): string {
-    return this.#hash.digest("hex");
+    if (this.#finalDigest === null) {
+      this.#finalDigest = this.#hash.digest("hex");
+    }
+    return this.#finalDigest;
   }
 }

@@ -27,6 +27,7 @@ export interface RestoreOptions {
   oplogLimit?: string;
   pitr?: string;
   parallelCollections?: number;
+  skipPitrRestoreMarker?: boolean;
 }
 
 export interface RestoreResult {

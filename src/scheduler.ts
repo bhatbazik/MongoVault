@@ -6,7 +6,6 @@ import { EngineRegistry } from "./engines.js";
 import { acquireHybridLock } from "./lock.js";
 import { startOplogArchiver } from "./oplog.js";
 import { prune } from "./retention.js";
-import type { BackupManifest } from "./types/catalog.js";
 import type { OplogArchiver } from "./types/oplog.js";
 import type { Scheduler, SchedulerContext, SchedulerState } from "./types/scheduler.js";
 
@@ -19,9 +18,12 @@ export function createScheduler({
 }: SchedulerContext): Scheduler {
   const lockFile = path.join(config.workDir, ".backup.lock");
   const distLockKey = `${databasePrefix(scopeOf(config))}.locks/backup.lock.json`;
-  let activeBackupPromise: Promise<BackupManifest> | null = null;
+  let activeBackupTask: Promise<void> | null = null;
   let activeAbortController: AbortController | null = null;
+  let activeDrillTask: Promise<void> | null = null;
+  let activeDrillAbortController: AbortController | null = null;
   let oplogArchiver: OplogArchiver | null = null;
+  let started = false;
   let isShuttingDown = false;
 
   const state: SchedulerState = {
@@ -34,103 +36,131 @@ export function createScheduler({
   };
 
   async function executeBackup(): Promise<void> {
-    if (isShuttingDown) return;
+    if (isShuttingDown || activeBackupTask) return;
 
-    let release: (() => Promise<void>) | null;
-    try {
-      release = await acquireHybridLock({
-        file: lockFile,
-        storage,
-        lockKey: distLockKey,
-        staleAfterMs: config.timeoutMs + 60_000,
-        logger,
-        onLost: (err) => {
-          logger.error(
-            { err },
-            "Lock lease lost during backup execution; aborting active backup pipeline",
-          );
-          activeAbortController?.abort(err);
-        },
-      });
-    } catch (lockError) {
-      const err = lockError instanceof Error ? lockError : new Error(String(lockError));
-      logger.error({ err }, "Failed to acquire lock for backup");
-      state.status = "error";
-      state.lastError = err.message;
-      return;
-    }
+    activeBackupTask = (async () => {
+      const controller = new AbortController();
+      activeAbortController = controller;
 
-    if (!release) {
-      logger.warn("Skipping backup: another process holds the local or distributed lock");
-      return;
-    }
-
-    state.status = "running";
-    state.lastRunAt = new Date().toISOString();
-    activeAbortController = new AbortController();
-
-    try {
-      const engine = EngineRegistry.resolveForBackup({ config });
-      activeBackupPromise = engine.backup({
-        config,
-        storage,
-        logger,
-        signal: activeAbortController.signal,
-      });
-
-      const manifest = await activeBackupPromise;
-      state.status = "idle";
-      state.lastSuccessAt = manifest.completedAt;
-      state.lastError = null;
-      state.lastManifest = manifest;
-
-      metrics.recordBackupSuccess(manifest.database, manifest.size, manifest.durationMs);
-      await notifier.notifySuccess("backup", manifest);
-
-      if (config.retention) {
-        try {
-          await prune({ config, storage, logger });
-        } catch (pruneError) {
-          logger.error({ err: pruneError }, "Retention prune failed after backup");
-        }
+      let release: (() => Promise<void>) | null;
+      try {
+        release = await acquireHybridLock({
+          file: lockFile,
+          storage,
+          lockKey: distLockKey,
+          staleAfterMs: config.timeoutMs + 60_000,
+          logger,
+          onLost: (err) => {
+            logger.error(
+              { err },
+              "Lock lease lost during backup execution; aborting active backup pipeline",
+            );
+            controller.abort(err);
+          },
+        });
+      } catch (lockError) {
+        const err = lockError instanceof Error ? lockError : new Error(String(lockError));
+        logger.error({ err }, "Failed to acquire lock for backup");
+        state.status = "error";
+        state.lastError = err.message;
+        activeAbortController = null;
+        return;
       }
-    } catch (error) {
-      const err = error instanceof Error ? error : new Error(String(error));
-      state.status = "error";
-      state.lastError = err.message;
-      metrics.recordBackupFailure(config.mongo.database);
-      await notifier.notifyFailure("backup", err, { database: config.mongo.database });
-      logger.error({ err }, "Scheduled backup run failed");
-    } finally {
-      activeBackupPromise = null;
-      activeAbortController = null;
-      await release();
-    }
+
+      if (!release) {
+        logger.warn("Skipping backup: another process holds the local or distributed lock");
+        activeAbortController = null;
+        return;
+      }
+
+      if (isShuttingDown || controller.signal.aborted) {
+        activeAbortController = null;
+        await release();
+        return;
+      }
+
+      state.status = "running";
+      state.lastRunAt = new Date().toISOString();
+
+      try {
+        const engine = EngineRegistry.resolveForBackup({ config });
+        const manifest = await engine.backup({
+          config,
+          storage,
+          logger,
+          signal: controller.signal,
+        });
+        state.status = "idle";
+        state.lastSuccessAt = manifest.completedAt;
+        state.lastError = null;
+        state.lastManifest = manifest;
+
+        metrics.recordBackupSuccess(manifest.database, manifest.size, manifest.durationMs);
+        await notifier.notifySuccess("backup", manifest);
+
+        if (config.retention && !isShuttingDown && !controller.signal.aborted) {
+          try {
+            await prune({ config, storage, logger });
+          } catch (pruneError) {
+            logger.error({ err: pruneError }, "Retention prune failed after backup");
+          }
+        }
+      } catch (error) {
+        const err = error instanceof Error ? error : new Error(String(error));
+        state.status = "error";
+        state.lastError = err.message;
+        metrics.recordBackupFailure(config.mongo.database);
+        await notifier.notifyFailure("backup", err, { database: config.mongo.database });
+        logger.error({ err }, "Scheduled backup run failed");
+      } finally {
+        activeAbortController = null;
+        await release();
+      }
+    })().finally(() => {
+      activeBackupTask = null;
+    });
+
+    return activeBackupTask;
   }
 
   async function executeDrill(): Promise<void> {
-    if (isShuttingDown || !config.drill) return;
+    if (isShuttingDown || !config.drill || activeDrillTask) return;
 
-    logger.info("Executing scheduled restore drill");
-    try {
-      const result = await runDrill({ config, storage, logger });
-      state.lastDrillAt = new Date().toISOString();
-      metrics.recordDrillSuccess();
-      await notifier.notifySuccess("drill", {
-        database: result.database,
-        key: result.key,
-        size: 0,
-        durationMs: result.durationMs,
-        collections: { restoredCount: result.documents },
-        sha256: "verified",
-        encryption: false,
-      });
-    } catch (error) {
-      const err = error instanceof Error ? error : new Error(String(error));
-      metrics.recordDrillFailure();
-      await notifier.notifyFailure("drill", err);
-      logger.error({ err }, "Scheduled restore drill failed");
-    }
+    activeDrillTask = (async () => {
+      const controller = new AbortController();
+      activeDrillAbortController = controller;
+      logger.info("Executing scheduled restore drill");
+      try {
+        const result = await runDrill({
+          config,
+          storage,
+          logger,
+          signal: controller.signal,
+        });
+        state.lastDrillAt = new Date().toISOString();
+        metrics.recordDrillSuccess();
+        await notifier.notifySuccess("drill", {
+          database: result.database,
+          key: result.key,
+          size: 0,
+          durationMs: result.durationMs,
+          collections: { restoredCount: result.documents },
+          sha256: "verified",
+          encryption: false,
+        });
+      } catch (error) {
+        const err = error instanceof Error ? error : new Error(String(error));
+        metrics.recordDrillFailure();
+        await notifier.notifyFailure("drill", err);
+        logger.error({ err }, "Scheduled restore drill failed");
+      } finally {
+        activeDrillAbortController = null;
+      }
+    })().finally(() => {
+      activeDrillTask = null;
+    });
+
+    return activeDrillTask;
   }
 
   const tasks: ScheduledTask[] = [];
@@ -153,6 +183,8 @@ export function createScheduler({
     },
 
     start(): void {
+      if (started || isShuttingDown) return;
+      started = true;
       logger.info(
         { cron: config.schedule.cron, timezone: config.schedule.timezone },
         "Registering backup schedule",
@@ -215,10 +247,19 @@ export function createScheduler({
         logger.info("Aborting running backup for graceful shutdown");
         activeAbortController.abort(new Error("Daemon is shutting down"));
       }
+      if (activeDrillAbortController) {
+        logger.info("Aborting running drill for graceful shutdown");
+        activeDrillAbortController.abort(new Error("Daemon is shutting down"));
+      }
 
-      if (activeBackupPromise) {
+      if (activeBackupTask) {
         try {
-          await activeBackupPromise;
+          await activeBackupTask;
+        } catch {}
+      }
+      if (activeDrillTask) {
+        try {
+          await activeDrillTask;
         } catch {}
       }
     },

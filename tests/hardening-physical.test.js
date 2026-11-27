@@ -2008,4 +2008,34 @@ describe("physical-engine hardening fail-first suite", () => {
       );
     }
   });
+
+  it("[F-PHY-017] extractTarStream preserves file mode/mtime and does not trim trailing spaces in entry names", async () => {
+    const outDir = await makeTempDir("mv-phy-017-");
+    const targetName = "file-with-space ";
+    const payload = Buffer.from("hello-tar-meta");
+    const header = Buffer.alloc(512, 0);
+    Buffer.from(targetName, "utf8").copy(header, 0);
+    Buffer.from("000644 \0", "ascii").copy(header, 100);
+    Buffer.from("000000 \0", "ascii").copy(header, 108);
+    Buffer.from("000000 \0", "ascii").copy(header, 116);
+    Buffer.from(payload.length.toString(8).padStart(11, "0") + "\0", "ascii").copy(header, 124);
+    const mtimeSec = 1_700_000_123;
+    Buffer.from(mtimeSec.toString(8).padStart(11, "0") + "\0", "ascii").copy(header, 136);
+    Buffer.from("        ", "ascii").copy(header, 148);
+    header[156] = "0".charCodeAt(0);
+    Buffer.from("ustar\0", "ascii").copy(header, 257);
+    Buffer.from("00", "ascii").copy(header, 263);
+    let sum = 0;
+    for (let i = 0; i < 512; i++) sum += header[i];
+    Buffer.from(sum.toString(8).padStart(6, "0") + "\0 ", "ascii").copy(header, 148);
+
+    const padLen = (512 - (payload.length % 512)) % 512;
+    const tarBuf = Buffer.concat([header, payload, Buffer.alloc(padLen), Buffer.alloc(1024)]);
+
+    await extractTarStream(Readable.from([tarBuf]), outDir);
+    const extractedPath = path.join(outDir, targetName);
+    const st = await fs.stat(extractedPath);
+    expect(st.mode & 0o777).toBe(0o644);
+    expect(Math.floor(st.mtimeMs / 1000)).toBe(mtimeSec);
+  });
 });

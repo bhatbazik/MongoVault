@@ -75,7 +75,7 @@ import { runBackup } from "../src/backup.js";
 import { archiveKey, manifestKey, scopeOf, writeManifest } from "../src/catalog.js";
 import { createEncryptor, generateKey, parseKey } from "../src/crypto.js";
 import { EngineRegistry, PhysicalBackupEngine, ShardedBackupEngine } from "../src/engines.js";
-import { toBsonTimestamp, uploadOplogSlice } from "../src/oplog.js";
+import { getOplogBounds, toBsonTimestamp, uploadOplogSlice } from "../src/oplog.js";
 import {
   CLUSTER_SYSTEM_NS_EXCLUDE,
   IntegrityError,
@@ -2390,6 +2390,146 @@ describe("M3a logical-engine hardening regression & fault-injection suite", () =
       mr.stdin.end();
       await mr.done;
       expect(capturedArgs).toContain("--writeConcern=majority");
+    } finally {
+      await fs.rm(workDir, { recursive: true, force: true });
+    }
+  });
+
+  it("[F-LOG-002-RealCluster] getOplogBounds passes readPreference to replSetGetStatus and clamps majorityTs to read target's oplog.rs newestTs", async () => {
+    // Case A: Lagged secondary (newestDoc=190:1) while replSetGetStatus reports majorityTs=210:1
+    let capturedCmdOpts = null;
+    const makeClient = (oldest, newest, majority) => ({
+      connect: vi.fn(async () => {}),
+      close: vi.fn(async () => {}),
+      db: vi.fn((name) => {
+        if (name === "local") {
+          return {
+            collection: () => ({
+              find: () => ({
+                sort: (s) => ({
+                  limit: () => ({
+                    next: async () => ({
+                      ts: s.$natural === 1 ? toBsonTimestamp(oldest) : toBsonTimestamp(newest),
+                    }),
+                  }),
+                }),
+              }),
+            }),
+          };
+        }
+        if (name === "admin") {
+          return {
+            command: vi.fn(async (_cmd, opts) => {
+              capturedCmdOpts = opts;
+              return {
+                optimes: {
+                  lastCommittedOpTime: { ts: toBsonTimestamp(majority) },
+                  appliedOpTime: { ts: toBsonTimestamp(majority) },
+                },
+              };
+            }),
+          };
+        }
+        return { collection: () => ({}) };
+      }),
+    });
+
+    const secBounds = await getOplogBounds("mongodb://localhost:27017/?readPreference=secondary", {
+      phase: "pre",
+      createMongoClient: () => makeClient({ t: 100, i: 1 }, { t: 190, i: 1 }, { t: 210, i: 1 }),
+    });
+    expect(capturedCmdOpts).toEqual({ readPreference: "secondary" });
+    expect(secBounds.newestTs).toEqual({ t: 190, i: 1 });
+
+    // Case B: Primary with uncommitted w:1 write (newestDoc=210:1) while majorityTs=190:1
+    const priBounds = await getOplogBounds("mongodb://localhost:27017/?readPreference=primary", {
+      phase: "pre",
+      createMongoClient: () => makeClient({ t: 100, i: 1 }, { t: 210, i: 1 }, { t: 190, i: 1 }),
+    });
+    expect(capturedCmdOpts).toEqual({ readPreference: "primary" });
+    expect(priBounds.newestTs).toEqual({ t: 190, i: 1 });
+  });
+
+  it("[F-LOG-002-StepDown] runBackup with readPreference=primary aborts and cleans up partial upload if primary steps down mid-backup", async () => {
+    const storage = makeMemoryStorage();
+    const logger = makeLogger();
+    const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "mv-stepdown-"));
+    try {
+      const config = makeBaseConfig({
+        workDir,
+        mongo: {
+          uri: "mongodb://127.0.0.1:27017/?directConnection=true",
+          database: "*",
+          oplog: true,
+          excludeCollections: [],
+          parallelCollections: 1,
+          readPreference: "primary",
+        },
+      });
+
+      let helloCalls = 0;
+      mongoClientOverride.factory = () => ({
+        connect: vi.fn(async () => {}),
+        close: vi.fn(async () => {}),
+        db: vi.fn((name) => {
+          if (name === "admin") {
+            return {
+              command: vi.fn(async (cmd) => {
+                if (cmd.hello) {
+                  helloCalls++;
+                  return {
+                    isWritablePrimary: helloCalls === 1,
+                    me: "127.0.0.1:27017",
+                  };
+                }
+                if (cmd.replSetGetStatus) {
+                  return {
+                    optimes: {
+                      lastCommittedOpTime: { ts: toBsonTimestamp({ t: 100, i: 1 }) },
+                      appliedOpTime: { ts: toBsonTimestamp({ t: 100, i: 1 }) },
+                    },
+                  };
+                }
+                if (cmd.listDatabases) return { databases: [] };
+                return {};
+              }),
+            };
+          }
+          if (name === "local") {
+            return {
+              collection: () => ({
+                find: () => ({
+                  sort: () => ({
+                    limit: () => ({
+                      next: async () => ({ ts: toBsonTimestamp({ t: 100, i: 1 }) }),
+                    }),
+                  }),
+                }),
+              }),
+            };
+          }
+          return { collection: () => ({}) };
+        }),
+      });
+
+      const validArchive = Buffer.concat([
+        uint32LE(ARCHIVE_MAGIC_NUMBER),
+        Buffer.from(BSON.serialize({ concurrent_collections: 1, version: "0.1" })),
+        int32LE(-1),
+        int32LE(-1),
+      ]);
+
+      spawnOverride.fn = () =>
+        createFakeChild({
+          exitCode: 0,
+          stdoutChunks: [validArchive],
+          stderrLines: ["done dumping app.users (1 document)"],
+        });
+
+      await expect(runBackup({ config, storage, logger })).rejects.toThrow(/stepped down/i);
+      const keys = [];
+      for await (const obj of storage.list("")) keys.push(obj.key);
+      expect(keys).toEqual([]);
     } finally {
       await fs.rm(workDir, { recursive: true, force: true });
     }

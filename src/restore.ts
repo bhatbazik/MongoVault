@@ -15,6 +15,7 @@ import {
   filterOplogSliceFile,
   formatOplogTimestamp,
   incrementOplogTimestamp,
+  markPitrRestore,
   parseOplogTimestamp,
   resolvePitrPlan,
   streamOplogSlice,
@@ -37,7 +38,7 @@ import type {
  * so target cluster metadata, sessions, active transaction tables, pre-images,
  * shard/balancer history, internal signing keys, and FCV are never clobbered.
  *
- * Note on `admin.system.users` and `admin.system.roles` (R1 / PBM parity):
+ * Note on `admin.system.users` and `admin.system.roles`
  * `mongorestore` skips `admin.system.users` and `admin.system.roles` by default unless
  * `--restoreDbUsersAndRoles` is passed (which MongoVault never passes), and `local.*`
  * is skipped natively, so no user/role temporary-collection swap is performed.
@@ -637,6 +638,13 @@ export async function restoreBackup(
       );
     }
 
+    if (!options.skipPitrRestoreMarker && typeof storage.putJson === "function") {
+      const restoreScope = { prefix: config.storage.prefix, database: source };
+      await markPitrRestore(storage, restoreScope).catch((err) => {
+        log.warn({ err }, "Failed to write PITR restore marker");
+      });
+    }
+
     log.info({ restored: summary.restored, target }, "Restore completed");
     return { key, source, target, restored: summary.restored, manifest };
   } catch (error) {
@@ -774,6 +782,7 @@ export async function restorePointInTime(
     oplogReplay: replayedBaseOplog,
     oplogLimit: replayedBaseOplog ? exclusiveLimit : undefined,
     parallelCollections,
+    skipPitrRestoreMarker: options.skipPitrRestoreMarker,
   });
 
   // Stage 2: Replay continuous oplog slices up to plan.targetTs

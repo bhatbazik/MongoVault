@@ -821,8 +821,37 @@ export async function pruneOplogSlices(
 
   for (const scope of scopes) {
     const slices = await listOplogSlices(storage, scope);
-    const toDelete = slices.filter((s) => s.endTs.t < cutoff.t);
+    const toDelete = slices.filter((s) => compareTimestamps(s.endTs, cutoff) < 0);
+    const baseWindows: Array<{ key: string; start: OplogTimestamp; end: OplogTimestamp }> = [];
+    if (toDelete.length > 0) {
+      const backups = await listBackups(storage, scope);
+      for (const b of backups) {
+        if (!b.complete) continue;
+        const manifest = await readManifest(storage, b.key).catch(() => null);
+        const w = manifest?.oplogWindow;
+        if (!w) continue;
+        const start = parseOplogTimestamp(w.startTs);
+        const end = parseOplogTimestamp(w.endTs);
+        if (!start || !end) continue;
+        baseWindows.push({
+          key: b.key,
+          start,
+          end,
+        });
+      }
+    }
     for (const slice of toDelete) {
+      const overlappingBase = baseWindows.find(
+        (w) =>
+          compareTimestamps(slice.endTs, w.start) >= 0 &&
+          compareTimestamps(slice.startTs, w.end) <= 0,
+      );
+      if (overlappingBase) {
+        logger.warn(
+          { sliceKey: slice.key, backupKey: overlappingBase.key },
+          "Pruning oplog slice that overlaps a retained base backup oplogWindow",
+        );
+      }
       deletedKeys.push(slice.key);
       keysToDelete.push(manifestKey(slice.key), slice.key);
     }

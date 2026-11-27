@@ -5,7 +5,12 @@ import { linkedController, settleAll } from "./abort.js";
 import { MANIFEST_VERSION, archiveKey, scopeOf, writeManifest } from "./catalog.js";
 import { createEncryptor } from "./crypto.js";
 import { DigestStream } from "./digest.js";
-import { compareTimestamps, formatOplogTimestamp, getOplogBounds } from "./oplog.js";
+import {
+  compareTimestamps,
+  formatOplogTimestamp,
+  fromBsonTimestamp,
+  getOplogBounds,
+} from "./oplog.js";
 import { runStreamPipeline } from "./stream.js";
 import {
   isClusterDatabase,
@@ -323,6 +328,78 @@ async function estimateDatabaseSizeBytes(
   }
 }
 
+async function queryPrimaryInfo(
+  uri: string,
+  options?: { signal?: AbortSignal },
+): Promise<{ isWritablePrimary: boolean; me?: string } | null> {
+  const signal = options?.signal;
+  if (signal?.aborted) {
+    throw abortErrorFromSignal(signal);
+  }
+  const client = new MongoClient(uri, {
+    serverSelectionTimeoutMS: 5_000,
+    socketTimeoutMS: PRE_BACKUP_QUERY_TIMEOUT_MS,
+  });
+  try {
+    return await runClientWithAbort(client, signal, async () => {
+      await client.connect();
+      const res = (await client
+        .db("admin")
+        .command({ hello: 1 }, { timeoutMS: PRE_BACKUP_QUERY_TIMEOUT_MS })) as {
+        isWritablePrimary?: boolean;
+        ismaster?: boolean;
+        me?: string;
+      };
+      return {
+        isWritablePrimary: Boolean(res.isWritablePrimary ?? res.ismaster),
+        me: typeof res.me === "string" ? res.me : undefined,
+      };
+    });
+  } catch (err) {
+    if (signal?.aborted || (err as { name?: string } | null)?.name === "AbortError") {
+      throw signal?.aborted ? abortErrorFromSignal(signal) : err;
+    }
+    return null;
+  } finally {
+    await client.close().catch(() => {});
+  }
+}
+
+async function queryReadTargetAppliedOpTime(
+  uri: string,
+  readPreference: string,
+  options?: { signal?: AbortSignal },
+): Promise<OplogTimestamp | null> {
+  const signal = options?.signal;
+  if (signal?.aborted) {
+    throw abortErrorFromSignal(signal);
+  }
+  const client = new MongoClient(uri, {
+    serverSelectionTimeoutMS: 5_000,
+    socketTimeoutMS: PRE_BACKUP_QUERY_TIMEOUT_MS,
+  });
+  try {
+    return await runClientWithAbort(client, signal, async () => {
+      await client.connect();
+      const replStatus = (await client.db("admin").command(
+        { replSetGetStatus: 1 },
+        {
+          readPreference: readPreference as ReadPreferenceMode,
+          timeoutMS: PRE_BACKUP_QUERY_TIMEOUT_MS,
+        },
+      )) as { optimes?: { appliedOpTime?: { ts?: unknown } } };
+      return fromBsonTimestamp(replStatus?.optimes?.appliedOpTime?.ts);
+    });
+  } catch (err) {
+    if (signal?.aborted || (err as { name?: string } | null)?.name === "AbortError") {
+      throw signal?.aborted ? abortErrorFromSignal(signal) : err;
+    }
+    return null;
+  } finally {
+    await client.close().catch(() => {});
+  }
+}
+
 /**
  * Runs a logical mongodump backup with optional encryption and streaming upload.
  */
@@ -377,7 +454,8 @@ export async function runBackup({
   try {
     const oplogUri = withUriReadPreference(config.mongo.uri, config.mongo.readPreference);
     const requireOplogBounds = Boolean(config.pitr?.enabled);
-    const [preOplog, expectedSizeBytes, schemaMetadata] = await Promise.all([
+    const trackPrimaryStepDown = !tools && config.mongo.readPreference === "primary";
+    const [preOplog, expectedSizeBytes, schemaMetadata, prePrimaryInfo] = await Promise.all([
       config.mongo.oplog && effectiveTools.getOplogBounds
         ? effectiveTools.getOplogBounds(oplogUri, { phase: "pre" }).catch((err) => {
             if (requireOplogBounds) {
@@ -408,6 +486,9 @@ export async function runBackup({
             },
           )
         : Promise.resolve(undefined),
+      trackPrimaryStepDown
+        ? queryPrimaryInfo(config.mongo.uri, { signal: controller.signal })
+        : Promise.resolve(null),
     ]);
 
     assertActive();
@@ -488,6 +569,21 @@ export async function runBackup({
 
     const { collections, dumpEndOplog } = dumpSummary;
 
+    if (trackPrimaryStepDown && prePrimaryInfo) {
+      const postPrimaryInfo = await queryPrimaryInfo(config.mongo.uri, {
+        signal: controller.signal,
+      });
+      if (
+        !postPrimaryInfo ||
+        !postPrimaryInfo.isWritablePrimary ||
+        (prePrimaryInfo.me && postPrimaryInfo.me && postPrimaryInfo.me !== prePrimaryInfo.me)
+      ) {
+        throw new Error(
+          "Primary stepped down during backup (readPreference=primary); aborting and cleaning up",
+        );
+      }
+    }
+
     if (Object.keys(collections).length === 0) {
       log.warn(
         { database: config.mongo.database },
@@ -520,6 +616,16 @@ export async function runBackup({
         oplogStartTs = minTimestamp(preOplog?.newestTs, dumpSummary.oplogStartTs, oplogEndTs);
       }
     } else {
+      if (!tools && config.mongo.readPreference && config.mongo.readPreference !== "primary") {
+        const appliedTs = await queryReadTargetAppliedOpTime(
+          oplogUri,
+          config.mongo.readPreference,
+          { signal: controller.signal },
+        );
+        if (appliedTs && compareTimestamps(appliedTs, oplogEndTs) < 0) {
+          oplogEndTs = appliedTs;
+        }
+      }
       oplogStartTs = minTimestamp(preOplog?.newestTs, dumpSummary.oplogStartTs, oplogEndTs);
     }
 

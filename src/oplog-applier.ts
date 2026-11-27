@@ -95,6 +95,8 @@ const KNOWN_OPLOG_COMMANDS = new Set([
 const TARGET_COLL_COMMANDS = new Set([
   "create",
   "drop",
+  "convertToCapped",
+  "emptycapped",
   "createIndexes",
   "deleteIndex",
   "deleteIndexes",
@@ -102,6 +104,9 @@ const TARGET_COLL_COMMANDS = new Set([
   "dropIndexes",
   "collMod",
   "commitIndexBuild",
+  "createSearchIndex",
+  "updateSearchIndex",
+  "dropSearchIndex",
 ]);
 
 export interface OplogDoc {
@@ -216,7 +221,13 @@ export class MongoOplogTargetClient implements OplogTargetClient {
       bypassDocumentValidation: true,
     });
     if (!res || res.ok !== 1) {
-      throw new Error(`applyOps failed: ${res?.errmsg ?? JSON.stringify(res)}`);
+      const err = new Error(`applyOps failed: ${res?.errmsg ?? JSON.stringify(res)}`) as Error & {
+        code?: number;
+        codeName?: string;
+      };
+      if (typeof res?.code === "number") err.code = res.code;
+      if (typeof res?.codeName === "string") err.codeName = res.codeName;
+      throw err;
     }
   }
 
@@ -234,7 +245,18 @@ export class MongoOplogTargetClient implements OplogTargetClient {
     if (options?.commitQuorum !== undefined) {
       cmd.commitQuorum = options.commitQuorum;
     }
-    await this.client.db(dbName).command(cmd);
+    try {
+      await this.client.db(dbName).command(cmd);
+    } catch (err: unknown) {
+      const code = (err as { code?: number })?.code;
+      const msg = err instanceof Error ? err.message : String(err);
+      if (options?.commitQuorum !== undefined && (code === 72 || /commitQuorum/i.test(msg))) {
+        delete cmd.commitQuorum;
+        await this.client.db(dbName).command(cmd);
+        return;
+      }
+      throw err;
+    }
   }
 
   async ensureSystemViews(dbName: string): Promise<void> {
@@ -563,7 +585,35 @@ export class OplogFilter {
     // Database/collection cloning rewrite
     if (this.clone) {
       const { fromDb, toDb, fromColl, toColl } = this.clone;
+      const rewriteNs = (targetNs: string): string | null => {
+        if (fromColl) {
+          return targetNs === `${fromDb}.${fromColl}` ? `${toDb}.${toColl ?? fromColl}` : null;
+        }
+        return targetNs.startsWith(`${fromDb}.`)
+          ? `${toDb}.${targetNs.slice(fromDb.length + 1)}`
+          : null;
+      };
+
       const ns = String(doc.ns || "");
+      if (ns === "admin.$cmd" && doc.o && typeof doc.o.renameCollection === "string") {
+        const newFrom = rewriteNs(doc.o.renameCollection);
+        if (newFrom) {
+          doc.o.renameCollection = newFrom;
+          modified = true;
+        }
+        if (typeof doc.o.to === "string") {
+          const newTo = rewriteNs(doc.o.to);
+          if (newTo) {
+            doc.o.to = newTo;
+            modified = true;
+          }
+        }
+        if (modified && doc.ui !== undefined) {
+          delete doc.ui;
+        }
+        return modified;
+      }
+
       const dot = ns.indexOf(".");
       if (dot > 0) {
         const dbName = ns.slice(0, dot);
@@ -585,6 +635,14 @@ export class OplogFilter {
             }
           } else if (!fromColl || collName === fromColl) {
             doc.ns = `${toDb}.${fromColl && toColl ? toColl : collName}`;
+            if (collName === "system.views" && !fromColl) {
+              if (doc.o && typeof doc.o._id === "string" && doc.o._id.startsWith(`${fromDb}.`)) {
+                doc.o._id = `${toDb}.${doc.o._id.slice(fromDb.length + 1)}`;
+              }
+              if (doc.o2 && typeof doc.o2._id === "string" && doc.o2._id.startsWith(`${fromDb}.`)) {
+                doc.o2._id = `${toDb}.${doc.o2._id.slice(fromDb.length + 1)}`;
+              }
+            }
             if (doc.ui !== undefined) delete doc.ui;
             modified = true;
           }
@@ -732,6 +790,8 @@ export class TxnBuffer {
   private readonly committedDistTxns = new Map<string, OplogTimestamp | null>();
   private readonly committedTxnIds = new Set<string>();
   private lastCommittedId: string | null = null;
+  private totalInMemoryBytes = 0;
+  private sweptStaleSpillFiles = false;
   private readonly workDir: string;
   private readonly spillThresholdBytes: number;
 
@@ -740,7 +800,34 @@ export class TxnBuffer {
     this.spillThresholdBytes = spillThresholdBytes;
   }
 
+  private async sweepStaleSpillFilesOnce(): Promise<void> {
+    if (this.sweptStaleSpillFiles) return;
+    this.sweptStaleSpillFiles = true;
+    try {
+      const entries = await fs.readdir(this.workDir);
+      for (const name of entries) {
+        if (name.startsWith(".mongovault-txn-") && name.endsWith(".bson")) {
+          await fs.rm(path.join(this.workDir, name), { force: true }).catch(() => {});
+        }
+      }
+    } catch {
+      // workDir may not exist yet
+    }
+  }
+
+  private async spillEntryToDisk(entry: BufferedTxn): Promise<void> {
+    if (entry.spillFile) return;
+    await fs.mkdir(this.workDir, { recursive: true });
+    const spillFile = path.join(this.workDir, `.mongovault-txn-${randomUUID()}.bson`);
+    const existing = Buffer.concat(entry.inMemoryOps);
+    await fs.writeFile(spillFile, existing, { mode: 0o600 });
+    entry.spillFile = spillFile;
+    this.totalInMemoryBytes = Math.max(0, this.totalInMemoryBytes - existing.length);
+    entry.inMemoryOps = [];
+  }
+
   async addApplyOps(txnId: string, innerOps: OplogDoc[], isPartial: boolean): Promise<void> {
+    await this.sweepStaleSpillFilesOnce();
     let entry = this.txns.get(txnId);
     if (!entry) {
       entry = {
@@ -760,17 +847,27 @@ export class TxnBuffer {
     entry.totalBytes += addedBytes;
 
     if (!entry.spillFile && entry.totalBytes > this.spillThresholdBytes) {
-      await fs.mkdir(this.workDir, { recursive: true });
-      entry.spillFile = path.join(this.workDir, `.mongovault-txn-${randomUUID()}.bson`);
-      const existing = Buffer.concat(entry.inMemoryOps);
-      entry.inMemoryOps = [];
-      await fs.writeFile(entry.spillFile, existing, { mode: 0o600 });
+      await this.spillEntryToDisk(entry);
+    } else if (
+      !entry.spillFile &&
+      this.totalInMemoryBytes + addedBytes > this.spillThresholdBytes
+    ) {
+      let largest: BufferedTxn | null = null;
+      for (const candidate of this.txns.values()) {
+        if (!candidate.spillFile && (!largest || candidate.totalBytes > largest.totalBytes)) {
+          largest = candidate;
+        }
+      }
+      if (largest) {
+        await this.spillEntryToDisk(largest);
+      }
     }
 
     if (entry.spillFile) {
       await fs.appendFile(entry.spillFile, Buffer.concat(serialized));
     } else {
       entry.inMemoryOps.push(...serialized);
+      this.totalInMemoryBytes += addedBytes;
     }
   }
 
@@ -808,6 +905,10 @@ export class TxnBuffer {
   async discard(txnId: string): Promise<void> {
     const entry = this.txns.get(txnId);
     if (!entry) return;
+    if (!entry.spillFile) {
+      const memBytes = entry.inMemoryOps.reduce((sum, b) => sum + b.length, 0);
+      this.totalInMemoryBytes = Math.max(0, this.totalInMemoryBytes - memBytes);
+    }
     this.txns.delete(txnId);
     if (entry.spillFile) {
       await fs.rm(entry.spillFile, { force: true }).catch(() => {});
@@ -906,6 +1007,8 @@ export class OplogApplier {
   private partialTxns = 0;
   private readonly unknownCommands: string[] = [];
   private readonly seenPrecursorKeys = new Set<string>();
+  private readonly seenTxnOpTimes = new Set<string>();
+  private readonly missingPrecursorTxns = new Set<string>();
   private lastAppliedTs: OplogTimestamp | null = null;
   private reachedEnd = false;
 
@@ -1064,7 +1167,8 @@ export class OplogApplier {
 
     for (const id of uncommittedIds) {
       if (!clusterCommits.has(id)) continue;
-      if (!this.txnBuffer.isAllOps(id)) {
+      if (!this.txnBuffer.isAllOps(id) || this.missingPrecursorTxns.has(id)) {
+        this.missingPrecursorTxns.delete(id);
         partial++;
         this.partialTxns++;
         partialIds.push(id);
@@ -1114,12 +1218,22 @@ export class OplogApplier {
         { db: group.db, collection: group.collection, count: group.indexes.length },
         "Building indexes from oplog replay",
       );
-      await this.target.createIndexes(
-        group.db,
-        group.collection,
-        group.indexes,
-        options.standalone ? undefined : { commitQuorum: "votingMembers" },
-      );
+      try {
+        await this.target.createIndexes(
+          group.db,
+          group.collection,
+          group.indexes,
+          options.standalone ? undefined : { commitQuorum: "votingMembers" },
+        );
+      } catch (err: unknown) {
+        const code = (err as { code?: number })?.code;
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!options.standalone && (code === 72 || /commitQuorum/i.test(msg))) {
+          await this.target.createIndexes(group.db, group.collection, group.indexes, undefined);
+        } else {
+          throw err;
+        }
+      }
       built += group.indexes.length;
     }
 
@@ -1156,6 +1270,23 @@ export class OplogApplier {
     return `${Buffer.from(lsidBytes).toString("base64url")}-${txnNum}`;
   }
 
+  private extractValidPrevOpTimeTs(prevOpTime: unknown): OplogTimestamp | null {
+    if (!prevOpTime || typeof prevOpTime !== "object") return null;
+    const p = prevOpTime as { ts?: unknown; t?: unknown };
+    const termNum =
+      typeof p.t === "number"
+        ? p.t
+        : typeof p.t === "object" && p.t !== null && "toNumber" in p.t
+          ? (p.t as { toNumber: () => number }).toNumber()
+          : null;
+    if (termNum !== null && termNum < 0) return null;
+    const ts = extractBsonTimestamp(p.ts);
+    if (!ts) return null;
+    if (ts.t === 0 && ts.i === 0) return null;
+    if (ts.t === 0xffffffff) return null;
+    return ts;
+  }
+
   private async handleTxnOp(doc: OplogDoc): Promise<void> {
     const txnId = this.getTxnId(doc);
     const o = doc.o ?? {};
@@ -1168,6 +1299,15 @@ export class OplogApplier {
     const isSingleEntryCommit = hasApplyOps && !isPrepare && !isPartial && !isAbort;
     const isCommit = isExplicitCommit || isSingleEntryCommit;
 
+    const docTs = extractBsonTimestamp(doc.ts);
+    const prevOpTimeTs = this.extractValidPrevOpTimeTs(doc.prevOpTime);
+    if (prevOpTimeTs && !this.seenTxnOpTimes.has(`${prevOpTimeTs.t}:${prevOpTimeTs.i}`)) {
+      this.missingPrecursorTxns.add(txnId);
+    }
+    if (docTs) {
+      this.seenTxnOpTimes.add(`${docTs.t}:${docTs.i}`);
+    }
+
     if (hasApplyOps) {
       const innerOps = (o.applyOps as OplogDoc[]).map((inner) => ({
         ...inner,
@@ -1178,12 +1318,22 @@ export class OplogApplier {
     }
 
     if (isAbort) {
+      this.missingPrecursorTxns.delete(txnId);
       await this.txnBuffer.discard(txnId);
       return;
     }
 
     if (!isCommit) {
       return;
+    }
+
+    if (this.missingPrecursorTxns.has(txnId)) {
+      this.missingPrecursorTxns.delete(txnId);
+      this.partialTxns++;
+      await this.txnBuffer.discard(txnId);
+      throw new OplogReplayError(
+        `Cannot commit transaction "${txnId}": missing precursor operation in prevOpTime chain`,
+      );
     }
 
     // Deduplicate commit entry across overlapping slice boundaries
@@ -1282,7 +1432,16 @@ export class OplogApplier {
 
       switch (cmdKey) {
         case "applyOps": {
-          const nested = Array.isArray(o.applyOps) ? (o.applyOps as OplogDoc[]) : [];
+          if (!Array.isArray(o.applyOps)) {
+            if (this.strict) {
+              throw new OplogReplayError(
+                `Malformed applyOps command on namespace "${ns}": expected array`,
+              );
+            }
+            this.recordSkip("unrecognized");
+            return;
+          }
+          const nested = o.applyOps as OplogDoc[];
           for (const item of nested) {
             if (!this.filter.isIncluded(item)) {
               this.recordSkip("filtered");
@@ -1341,7 +1500,7 @@ export class OplogApplier {
         case "dropIndexes": {
           const targetColl = String(o[cmdKey] || "");
           const removedFromCatalog = this.indexCatalog.deleteIndexes(dbName, targetColl, o.index);
-          if (removedFromCatalog && this.backupType === "logical") {
+          if (removedFromCatalog && this.backupType === "logical" && o.index !== "*") {
             this.appliedEntries++;
             return;
           }
@@ -1370,6 +1529,11 @@ export class OplogApplier {
         case "create": {
           const targetColl = String(o.create || "");
           this.indexCatalog.dropCollection(dbName, targetColl);
+          if (targetColl === "system.views") {
+            await this.target.ensureSystemViews(dbName);
+            this.appliedEntries++;
+            return;
+          }
           // Ensure idempotent create when replaying onto existing collection
           await this.target
             .applyOps([{ op: "c", ns: `${dbName}.$cmd`, o: { drop: targetColl } }])
@@ -1405,9 +1569,17 @@ export class OplogApplier {
         return;
       }
 
-      // Allow duplicate key on config.chunks in unsafe/physical replay
+      // Allow duplicate key on config.* metadata collections in unsafe/physical replay
       const errCode = (err as { code?: number })?.code;
-      if (this.unsafe && cleanOp.ns === "config.chunks" && errCode === 11000) {
+      if (
+        this.unsafe &&
+        errCode === 11000 &&
+        (cleanOp.ns === "config.chunks" ||
+          cleanOp.ns === "config.databases" ||
+          cleanOp.ns === "config.collections" ||
+          cleanOp.ns === "config.tags" ||
+          cleanOp.ns === "config.settings")
+      ) {
         this.recordSkip("benignReplayRace");
         return;
       }
@@ -1416,7 +1588,11 @@ export class OplogApplier {
       if (
         cleanOp.op === "c" &&
         cleanOp.o &&
-        ("drop" in cleanOp.o || "dropIndexes" in cleanOp.o || "deleteIndexes" in cleanOp.o) &&
+        ("drop" in cleanOp.o ||
+          "dropIndex" in cleanOp.o ||
+          "deleteIndex" in cleanOp.o ||
+          "dropIndexes" in cleanOp.o ||
+          "deleteIndexes" in cleanOp.o) &&
         (errCode === 26 || errCode === 27)
       ) {
         this.recordSkip("benignReplayRace");

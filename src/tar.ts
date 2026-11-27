@@ -348,6 +348,9 @@ async function processTarStream(
     name: string;
     size: number;
     kind: "file" | "pax" | "pax-global";
+    mode?: number;
+    mtimeSec?: number;
+    fullPath?: string;
   } | null = null;
   let remainingBytes = 0;
   let remainingPad = 0;
@@ -467,12 +470,22 @@ async function processTarStream(
             continue;
           }
 
-          const baseName = headerBuf.toString("utf8", 0, 100).replace(/\0.*$/, "").trim();
-          const ustarPrefix = headerBuf.toString("utf8", 345, 500).replace(/\0.*$/, "").trim();
+          const baseName = headerBuf.toString("utf8", 0, 100).replace(/\0.*$/, "");
+          const ustarPrefix = headerBuf.toString("utf8", 345, 500).replace(/\0.*$/, "");
           const paxMeta = pendingPax;
           pendingPax = null;
           const rawName = paxMeta?.path ?? (ustarPrefix ? `${ustarPrefix}/${baseName}` : baseName);
           const effectiveSize = paxMeta?.size ?? size;
+          const rawMode = headerBuf
+            .toString("ascii", 100, 108)
+            .replace(/[\0 ]+$/g, "")
+            .trim();
+          const parsedMode = /^[0-7]+$/.test(rawMode) ? parseInt(rawMode, 8) & 0o777 : undefined;
+          const rawMtime = headerBuf
+            .toString("ascii", 136, 148)
+            .replace(/[\0 ]+$/g, "")
+            .trim();
+          const parsedMtimeSec = /^[0-7]+$/.test(rawMtime) ? parseInt(rawMtime, 8) : undefined;
 
           if (typeflag !== "5" && typeflag !== "0" && typeflag !== "\0") {
             throw new Error(
@@ -527,12 +540,19 @@ async function processTarStream(
             continue;
           }
 
-          currentHeader = { name: safeName, size: effectiveSize, kind: "file" };
+          currentHeader = {
+            name: safeName,
+            size: effectiveSize,
+            kind: "file",
+            mode: parsedMode,
+            mtimeSec: parsedMtimeSec,
+            fullPath,
+          };
           remainingBytes = effectiveSize;
 
           if (!dryRun) {
             await fs.mkdir(path.dirname(fullPath), { recursive: true });
-            currentFileHandle = await fs.open(fullPath, "w", 0o600);
+            currentFileHandle = await fs.open(fullPath, "w", parsedMode ?? 0o600);
           }
         }
 
@@ -558,8 +578,18 @@ async function processTarStream(
               paxChunks = [];
             } else if (currentHeader.kind === "file") {
               if (currentFileHandle) {
+                await currentFileHandle.sync();
                 await currentFileHandle.close();
                 currentFileHandle = null;
+                if (currentHeader.fullPath) {
+                  if (currentHeader.mode !== undefined) {
+                    await fs.chmod(currentHeader.fullPath, currentHeader.mode);
+                  }
+                  if (currentHeader.mtimeSec !== undefined) {
+                    const mtimeDate = new Date(currentHeader.mtimeSec * 1000);
+                    await fs.utimes(currentHeader.fullPath, mtimeDate, mtimeDate);
+                  }
+                }
               }
               extractedCount++;
             }

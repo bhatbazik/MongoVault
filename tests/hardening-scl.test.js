@@ -28,6 +28,7 @@ import {
   signManifest,
   verifyManifest,
 } from "../src/crypto.js";
+import { DigestStream } from "../src/digest.js";
 import {
   acquireDistributedLock,
   acquireHybridLock,
@@ -36,7 +37,7 @@ import {
   readLock,
 } from "../src/lock.js";
 import { oplogSliceKey, pitrPrefix } from "../src/oplog.js";
-import { deleteBackup, planRetention, prune } from "../src/retention.js";
+import { deleteBackup, planRetention, prune, pruneOplogSlices } from "../src/retention.js";
 import { FilesystemStorageClient, S3StorageClient } from "../src/storage.js";
 
 function makeSilentLogger() {
@@ -2311,6 +2312,101 @@ describe("M2 storage-crypto-lock hardening regression & contract suite", () => {
       expect(res.remove.map((b) => b.key)).not.toContain(bMid);
       expect(await storage.head(bMid)).not.toBeNull();
       expect(await storage.head(s2)).not.toBeNull();
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("[F-SCL-022] DigestStream.digest() caches final digest and can be called multiple times safely", async () => {
+    const digest = new DigestStream();
+    await pipeline(Readable.from([Buffer.from("hello-mongovault")]), digest, async (src) => {
+      for await (const _chunk of src) {
+        // drain
+      }
+    });
+    const first = digest.digest();
+    const second = digest.digest();
+    expect(first).toHaveLength(64);
+    expect(second).toBe(first);
+  });
+
+  it("[F-SCL-023] S3StorageClient.list() strips leading slashes and honors AbortSignal", async () => {
+    let seenPrefix = null;
+    const server = http.createServer((req, res) => {
+      const url = new URL(req.url, "http://127.0.0.1");
+      seenPrefix = url.searchParams.get("prefix");
+      res.writeHead(200, { "Content-Type": "application/xml" });
+      res.end(
+        `<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><Name>b</Name><IsTruncated>false</IsTruncated><Contents><Key>mv/a.txt</Key><Size>1</Size></Contents></ListBucketResult>`,
+      );
+    });
+    await new Promise((r) => server.listen(0, "127.0.0.1", r));
+    try {
+      const port = server.address().port;
+      const s3 = new S3StorageClient({
+        bucket: "b",
+        region: "us-east-1",
+        endpoint: `http://127.0.0.1:${port}`,
+        forcePathStyle: true,
+        credentials: { accessKeyId: "test", secretAccessKey: "test" },
+      });
+      const items = [];
+      for await (const obj of s3.list("/mv/")) {
+        items.push(obj.key);
+      }
+      expect(seenPrefix).toBe("mv/");
+      expect(items).toEqual(["mv/a.txt"]);
+
+      const ac = new AbortController();
+      ac.abort(new Error("cancelled"));
+      await expect(async () => {
+        for await (const _obj of s3.list("mv/", { signal: ac.signal })) {
+          // should abort
+        }
+      }).rejects.toThrow();
+    } finally {
+      await new Promise((r) => server.close(r));
+    }
+  });
+
+  it("[F-SCL-024] pruneOplogSlices() compares sub-second ordinal endTs.i and warns on base-backup overlap", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "mv-scl-024-"));
+    try {
+      const storage = new FilesystemStorageClient(dir);
+      const logger = makeSilentLogger();
+      const scope = { prefix: "mv", database: "*" };
+      const config = makeBaseConfig();
+
+      const b1 = "mv/_cluster/1970-01-01/19700101T000140Z.archive.gz";
+      await storage.upload(b1, Buffer.from("base"));
+      await writeManifest(
+        storage,
+        makeManifest({
+          key: b1,
+          oplogWindow: { startTs: "100:1", endTs: "100:10" },
+        }),
+      );
+
+      // Slice ending at 100:5 (< cutoff 100:8) overlaps base [100:1..100:10]
+      const sOld = oplogSliceKey(scope, { t: 100, i: 1 }, { t: 100, i: 5 });
+      await storage.upload(sOld, Buffer.from("s-old"));
+      await writeManifest(
+        storage,
+        makeManifest({ key: sOld, oplogWindow: { startTs: "100:1", endTs: "100:5" } }),
+      );
+
+      // Slice ending at 100:12 (>= cutoff 100:8, same second t=100) must be kept
+      const sNew = oplogSliceKey(scope, { t: 100, i: 6 }, { t: 100, i: 12 });
+      await storage.upload(sNew, Buffer.from("s-new"));
+      await writeManifest(
+        storage,
+        makeManifest({ key: sNew, oplogWindow: { startTs: "100:6", endTs: "100:12" } }),
+      );
+
+      const res = await pruneOplogSlices({ config, storage, logger }, { olderThan: "100:8" });
+      expect(res.deletedSlices).toEqual([sOld]);
+      expect(await storage.head(sNew)).not.toBeNull();
+      expect(logger.warn).toHaveBeenCalled();
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
     }

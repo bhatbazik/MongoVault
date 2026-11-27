@@ -66,7 +66,10 @@ export interface StorageClient {
   download: (key: string, options?: { signal?: AbortSignal }) => Promise<Readable>;
   putJson: (key: string, value: unknown, options?: PutJsonOptions) => Promise<void>;
   getJson: <T = unknown>(key: string) => Promise<GetJsonResult<T> | null>;
-  list: (prefix: string) => AsyncGenerator<StorageObject, void, unknown>;
+  list: (
+    prefix: string,
+    options?: { signal?: AbortSignal },
+  ) => AsyncGenerator<StorageObject, void, unknown>;
   remove: (key: string) => Promise<void>;
   removeMany?: (keys: string[]) => Promise<void>;
   cleanupStaleUploads?: (prefix: string, maxAgeMs: number) => Promise<number>;

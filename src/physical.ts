@@ -27,6 +27,7 @@ import {
   compareTimestamps,
   formatOplogTimestamp,
   fromBsonTimestamp,
+  markPitrRestore,
   parseOplogTimestamp,
   resolvePitrPlan,
   streamOplogSlice,
@@ -748,6 +749,7 @@ export async function runPhysicalBackup({
   let cursor: ReturnType<ReturnType<MongoClient["db"]>["aggregate"]> | null = null;
   let keepAliveTimer: NodeJS.Timeout | null = null;
   let fsyncWatchdogTimer: NodeJS.Timeout | null = null;
+  let watchdogError: Error | null = null;
   let uploadCompleted = false;
   let backupError: unknown = null;
   let unlockFailure: FsyncUnlockError | null = null;
@@ -1021,7 +1023,8 @@ export async function runPhysicalBackup({
           if (!locked || uploadCompleted) return;
           const msg = `Physical backup fsyncLock watchdog triggered after ${effectiveFsyncLockTimeoutMs}ms; aborting backup to release write lock`;
           log.error({ timeoutMs: effectiveFsyncLockTimeoutMs }, msg);
-          controller.abort(new Error(msg));
+          watchdogError = new Error(msg);
+          controller.abort(watchdogError);
         }, effectiveFsyncLockTimeoutMs);
         fsyncWatchdogTimer.unref();
       }
@@ -1285,7 +1288,7 @@ export async function runPhysicalBackup({
 
     return { manifest, filesCount: filesToArchive.length, totalBytes: digest.bytes };
   } catch (error) {
-    backupError = error;
+    backupError = watchdogError ?? error;
     if (typeof storage.remove === "function") {
       await storage.remove(key).catch(() => {});
     }
@@ -1405,7 +1408,7 @@ async function waitForMongodReady(
       if (logPath) {
         try {
           const raw = await fs.readFile(logPath, "utf8");
-          logTail = raw.trim().split("\n").slice(-15).join("\n");
+          logTail = raw.trim().split("\n").slice(-40).join("\n");
         } catch {}
       }
       throw new Error(
@@ -1566,7 +1569,6 @@ export class PhysicalRecoveryCoordinator {
             _id: new ObjectId(),
             t: -1,
             ts: new Timestamp({ t: 0, i: 1 }),
-            oplogDeleteFromPoint: new Timestamp({ t: 0, i: 0 }),
           });
           await localDb.collection("replset.oplogTruncateAfterPoint").insertOne({
             _id: "oplogTruncateAfterPoint" as unknown as ObjectId,
@@ -2283,6 +2285,16 @@ export async function restorePhysicalBackup({
 
   if (retainedRollbackDir) {
     await fs.rm(retainedRollbackDir, { recursive: true, force: true }).catch(() => {});
+  }
+
+  if (typeof storage.putJson === "function") {
+    const restoreScope = {
+      prefix: config.storage.prefix,
+      database: manifestData?.database ?? config.mongo.database,
+    };
+    await markPitrRestore(storage, restoreScope).catch((err) => {
+      log.warn({ err }, "Failed to write PITR restore marker");
+    });
   }
 
   if (!pitrPlan) {

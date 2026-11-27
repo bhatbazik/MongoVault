@@ -431,7 +431,14 @@ export class FilesystemStorageClient implements StorageClient {
     }
   }
 
-  async *list(prefix: string): AsyncGenerator<StorageObject, void, unknown> {
+  async *list(
+    prefix: string,
+    options?: { signal?: AbortSignal },
+  ): AsyncGenerator<StorageObject, void, unknown> {
+    const signal = options?.signal;
+    if (signal?.aborted) {
+      throw toAbortError(signal.reason, "Storage list aborted");
+    }
     const normPrefix = prefix.replace(/\\/g, "/").replace(/^\/+/, "");
     const basePath = this.resolvedBase;
 
@@ -1244,11 +1251,22 @@ export class S3StorageClient implements StorageClient {
     }
   }
 
-  async *list(prefix: string): AsyncGenerator<StorageObject, void, unknown> {
+  async *list(
+    prefix: string,
+    options?: { signal?: AbortSignal },
+  ): AsyncGenerator<StorageObject, void, unknown> {
+    const signal = options?.signal;
+    if (signal?.aborted) {
+      throw toAbortError(signal.reason, "Storage list aborted");
+    }
+    const normalizedPrefix = prefix.replace(/^\/+/, "");
     for await (const page of paginateListObjectsV2(
-      { client: this.client },
-      { Bucket: this.bucket, Prefix: prefix },
+      { client: this.client, ...(signal ? { abortSignal: signal } : {}) },
+      { Bucket: this.bucket, Prefix: normalizedPrefix },
     )) {
+      if (signal?.aborted) {
+        throw toAbortError(signal.reason, "Storage list aborted");
+      }
       for (const object of page.Contents ?? []) {
         yield { key: object.Key!, size: Number(object.Size), lastModified: object.LastModified };
       }

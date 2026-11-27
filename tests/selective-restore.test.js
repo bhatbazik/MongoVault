@@ -168,6 +168,11 @@ describe("selective restore (namespace filtering)", () => {
               size: 100,
               sha256: "abc",
               oplog: true,
+              oplogWindow: {
+                startTs: "1773144060:0",
+                endTs: "1773144060:0",
+                entries: 1,
+              },
             },
           };
         }
