@@ -49,9 +49,12 @@ export interface ShardedRestoreOptions {
   logger: Logger;
   ref?: string;
   pitr?: string;
+  uri?: string;
+  parallelCollections?: number;
   signal?: AbortSignal;
   drop?: boolean;
   preVerify?: boolean;
+  skipPitrRestoreMarker?: boolean;
   createMongoClient?: (uri: string) => MongoClient;
   restoreRunner?: (ctx: RestoreContext, opts: RestoreOptions) => Promise<RestoreResult>;
 }

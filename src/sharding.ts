@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { PassThrough, Readable } from "node:stream";
 import { createGunzip } from "node:zlib";
 import { BSON, Binary, Long, MongoClient } from "mongodb";
@@ -28,6 +28,7 @@ import {
   getOplogBounds,
   incrementOplogTimestamp,
   listOplogSlices,
+  markPitrRestore,
   parseOplogTimestamp,
   parsePitrTarget,
   pitrStateKey,
@@ -120,13 +121,20 @@ export function buildShardUri(baseUri: string, shardHost: string): string {
   const rsName = slashIdx !== -1 ? shardHost.slice(0, slashIdx).trim() : "";
   const hosts = (slashIdx !== -1 ? shardHost.slice(slashIdx + 1) : shardHost).trim();
 
-  const match = /^mongodb(?:\+srv)?:\/\/(?:([^@/]+)@)?[^/?]+(\/[^?]*)?(?:\?(.*))?$/i.exec(
-    baseUri.trim(),
-  );
+  const trimmed = baseUri.trim();
+  const isSrv = /^mongodb\+srv:\/\//i.test(trimmed);
+  const match = /^mongodb(?:\+srv)?:\/\/(?:([^@/]+)@)?[^/?]+(\/[^?]*)?(?:\?(.*))?$/i.exec(trimmed);
   const authPrefix = match?.[1] ? `${match[1]}@` : "";
+  const pathDb = match?.[2] ? match[2].replace(/^\/+/, "").trim() : "";
   const rawQuery = match?.[3] ?? "";
 
   const params = new URLSearchParams(rawQuery);
+  if (authPrefix && pathDb && !params.has("authSource")) {
+    params.set("authSource", pathDb);
+  }
+  if (isSrv && !params.has("tls") && !params.has("ssl")) {
+    params.set("tls", "true");
+  }
   if (rsName) {
     params.set("replicaSet", rsName);
   } else {
@@ -134,6 +142,9 @@ export function buildShardUri(baseUri: string, shardHost: string): string {
   }
   // Remove SRV-only or conflicting options when connecting directly to shard seed hosts
   params.delete("directConnection");
+  params.delete("loadBalanced");
+  params.delete("srvMaxHosts");
+  params.delete("srvServiceName");
 
   const queryStr = params.toString();
   return `mongodb://${authPrefix}${hosts}/${queryStr ? `?${queryStr}` : ""}`;
@@ -150,6 +161,8 @@ export class ActiveChunkMigrationError extends Error {
  * Controller for coordinating MongoDB sharded cluster balancer states.
  */
 export class BalancerController {
+  public stopIssued = false;
+
   constructor(
     private readonly client: MongoClient,
     private readonly logger?: Logger,
@@ -157,9 +170,18 @@ export class BalancerController {
 
   async stopAndDrain(timeoutMs = 30_000): Promise<boolean> {
     this.logger?.info("Stopping balancer and waiting for active chunk migrations to complete...");
+    this.stopIssued = true;
     try {
       await this.client.db("admin").command({ balancerStop: 1, maxTimeMS: timeoutMs });
     } catch (err) {
+      const code = (err as { code?: unknown })?.code;
+      const codeName = (err as { codeName?: unknown })?.codeName;
+      if (code === 50 || codeName === "MaxTimeMSExpired") {
+        throw new ActiveChunkMigrationError(
+          `balancerStop timed out after ${Math.round(timeoutMs / 1000)}s waiting for active chunk migration to drain. Aborting to prevent cross-shard inconsistency.`,
+        );
+      }
+      this.stopIssued = false;
       this.logger?.error({ err }, "Could not issue balancerStop command to cluster");
       throw err;
     }
@@ -178,6 +200,7 @@ export class BalancerController {
   async start(): Promise<void> {
     try {
       await this.client.db("admin").command({ balancerStart: 1 });
+      this.stopIssued = false;
       this.logger?.info("Cluster balancer restarted");
     } catch (err) {
       this.logger?.warn({ err }, "Could not restart cluster balancer automatically");
@@ -319,6 +342,7 @@ export class CsrsRestorer {
     drop,
     logger,
     signal,
+    targetShardIds,
     createMongoClient = (u) => new MongoClient(u),
   }: {
     config: AppConfig;
@@ -328,22 +352,40 @@ export class CsrsRestorer {
     drop: boolean;
     logger: Logger;
     signal?: AbortSignal;
+    targetShardIds?: Set<string>;
     createMongoClient?: (uri: string) => MongoClient;
   }): Promise<{ restoredDocs: number; backupSessionsUuidHex: string | null }> {
     const manifest = await readManifest(storage, backupKey);
+    if (config.requireEncryption && (!manifest || !manifest.encryption)) {
+      throw new Error(
+        `REQUIRE_ENCRYPTION is enabled, but config server backup ${backupKey} lacks an encrypted manifest`,
+      );
+    }
     const keyRing = resolveKeyRing(config);
     const isSigned = Boolean(manifest?.signature?.hmac || manifest?.encryption?.manifestHmac);
-    if (isSigned && manifest) {
-      if (keyRing.length === 0) {
+    const mustVerify =
+      isSigned ||
+      Boolean(manifest?.encryption) ||
+      keyRing.length > 0 ||
+      Boolean(config.requireEncryption);
+    if (mustVerify && manifest) {
+      if ((isSigned || manifest.encryption || config.requireEncryption) && keyRing.length === 0) {
         throw new Error(
-          `Config server manifest for ${backupKey} is signed, but ENCRYPTION_KEY is not configured`,
+          `Config server manifest for ${backupKey} requires HMAC verification, but ENCRYPTION_KEY is not configured`,
         );
       }
-      verifyManifest(keyRing, manifest);
-    } else if (manifest?.encryption && keyRing.length === 0) {
-      throw new Error(
-        `Config server backup ${backupKey} is encrypted, but ENCRYPTION_KEY is not set`,
-      );
+      verifyManifest(keyRing, manifest, {
+        requireSigned: Boolean(config.requireEncryption || manifest.encryption),
+      });
+    }
+
+    // Verify CSRS archive checksum & size BEFORE mutating target CSRS collections
+    if (
+      manifest &&
+      (manifest.sha256 || manifest.size !== undefined) &&
+      typeof storage.download === "function"
+    ) {
+      await verifyArchiveObject({ config, storage, logger, signal }, backupKey);
     }
 
     const client = createMongoClient(targetConfigsvrUri);
@@ -359,28 +401,20 @@ export class CsrsRestorer {
         .findOne({ _id: "config.system.sessions" as unknown as never })
         .catch(() => null);
       const targetSessionsUuid = targetSessionsDoc?.uuid ?? null;
+      const targetSessionsUuidHex = binaryToHex(targetSessionsUuid);
 
       if (drop) {
-        await configDb
-          .collection("databases")
-          .deleteMany({})
-          .catch(() => {});
-        await configDb
-          .collection("tags")
-          .deleteMany({})
-          .catch(() => {});
+        await configDb.collection("databases").deleteMany({});
+        await configDb.collection("tags").deleteMany({});
         await configDb
           .collection("collections")
-          .deleteMany({ _id: { $ne: "config.system.sessions" } } as unknown as never)
-          .catch(() => {});
+          .deleteMany({ _id: { $ne: "config.system.sessions" } } as unknown as never);
         await configDb
           .collection("chunks")
-          .deleteMany(targetSessionsUuid ? { uuid: { $ne: targetSessionsUuid } } : {})
-          .catch(() => {});
+          .deleteMany(targetSessionsUuid ? { uuid: { $ne: targetSessionsUuid } } : {});
         await configDb
           .collection("settings")
-          .deleteMany({ _id: { $nin: ["balancer", "automerge"] } } as unknown as never)
-          .catch(() => {});
+          .deleteMany({ _id: { $nin: ["balancer", "automerge"] } } as unknown as never);
       }
 
       const batches = new Map<string, Array<Record<string, unknown>>>();
@@ -417,6 +451,15 @@ export class CsrsRestorer {
       const csrsNsInclude =
         "config.databases,config.collections,config.chunks,config.tags,config.settings";
 
+      const cleanupStaleBackupSessionsChunks = async () => {
+        if (
+          backupSessionsUuid &&
+          (!targetSessionsUuidHex || backupSessionsUuidHex !== targetSessionsUuidHex)
+        ) {
+          await configDb.collection("chunks").deleteMany({ uuid: backupSessionsUuid });
+        }
+      };
+
       try {
         await settleAll(controller, [
           runStreamPipeline(stages, { signal: controller.signal }),
@@ -431,12 +474,7 @@ export class CsrsRestorer {
                   for (const collName of batches.keys()) {
                     await flushBatch(collName);
                   }
-                  if (backupSessionsUuid) {
-                    await configDb
-                      .collection("chunks")
-                      .deleteMany({ uuid: backupSessionsUuid })
-                      .catch(() => {});
-                  }
+                  await cleanupStaleBackupSessionsChunks();
                   flushedBeforeOplog = true;
                   oplogApplier = new OplogApplier({
                     target: new MongoOplogTargetClient(client),
@@ -475,6 +513,26 @@ export class CsrsRestorer {
               ) {
                 return;
               }
+              if (targetShardIds && targetShardIds.size > 0) {
+                if (
+                  collection === "databases" &&
+                  typeof doc.primary === "string" &&
+                  doc.primary !== "config" &&
+                  !targetShardIds.has(doc.primary)
+                ) {
+                  throw new Error(
+                    `CSRS backup references unknown primary shard "${doc.primary}" for database "${String(doc._id)}"`,
+                  );
+                }
+                if (
+                  collection === "chunks" &&
+                  typeof doc.shard === "string" &&
+                  doc.shard !== "config" &&
+                  !targetShardIds.has(doc.shard)
+                ) {
+                  throw new Error(`CSRS backup references unknown chunk shard "${doc.shard}"`);
+                }
+              }
 
               let list = batches.get(collection);
               if (!list) {
@@ -494,12 +552,7 @@ export class CsrsRestorer {
           for (const collName of batches.keys()) {
             await flushBatch(collName);
           }
-          if (backupSessionsUuid) {
-            await configDb
-              .collection("chunks")
-              .deleteMany({ uuid: backupSessionsUuid })
-              .catch(() => {});
-          }
+          await cleanupStaleBackupSessionsChunks();
         }
         if (oplogApplier) {
           await (oplogApplier as OplogApplier).buildPendingIndexes();
@@ -547,6 +600,7 @@ async function captureBridgingSlices({
   untilTs,
   keyPrefix,
   createMongoClient,
+  onSliceUploaded,
   activeTxnWaitTimeoutMs = 15_000,
 }: {
   config: AppConfig;
@@ -557,14 +611,19 @@ async function captureBridgingSlices({
   untilTs: OplogTimestamp;
   keyPrefix: string;
   createMongoClient: (uri: string) => MongoClient;
+  onSliceUploaded?: (key: string) => void;
   activeTxnWaitTimeoutMs?: number;
 }): Promise<string[]> {
   const keys: string[] = [];
   let cursorTs = sinceTs;
   let blockedSinceMs: number | null = null;
+  let confirmedQuietUpToTarget = false;
 
   for (let i = 0; i < MAX_BRIDGE_SLICE_ITERATIONS; i++) {
-    if (compareTimestamps(cursorTs, untilTs) >= 0) break;
+    if (compareTimestamps(cursorTs, untilTs) >= 0) {
+      confirmedQuietUpToTarget = true;
+      break;
+    }
     let cappedTxTs: OplogTimestamp | null = null;
     const sliceManifest = await captureOplogSlice({
       config,
@@ -591,10 +650,106 @@ async function captureBridgingSlices({
         await new Promise((r) => setTimeout(r, 250));
         continue;
       }
-      break;
+
+      // Verify whether the window (cursorTs, untilTs] was genuinely quiet at majority commit point
+      // or whether replication/majority commit is lagging behind `untilTs` or oplog rolled over.
+      const checkClient = createMongoClient(config.mongo.uri);
+      let majorityTs: OplogTimestamp | null;
+      let oldestTs: OplogTimestamp | null;
+      let newestTs: OplogTimestamp | null;
+      try {
+        await checkClient.connect();
+        const adminDb = typeof checkClient.db === "function" ? checkClient.db("admin") : null;
+        const localDb = typeof checkClient.db === "function" ? checkClient.db("local") : null;
+        const oplogCol =
+          localDb && typeof localDb.collection === "function"
+            ? localDb.collection("oplog.rs")
+            : null;
+        const [replStatus, oldestDoc, newestDoc] = await Promise.all([
+          adminDb && typeof adminDb.command === "function"
+            ? adminDb.command({ replSetGetStatus: 1 }).catch(() => null)
+            : Promise.resolve(null),
+          oplogCol && typeof oplogCol.find === "function"
+            ? oplogCol
+                .find({}, { projection: { ts: 1 } })
+                .sort({ $natural: 1 })
+                .limit(1)
+                .next()
+                .catch(() => null)
+            : Promise.resolve(null),
+          oplogCol && typeof oplogCol.find === "function"
+            ? oplogCol
+                .find({}, { projection: { ts: 1 } })
+                .sort({ $natural: -1 })
+                .limit(1)
+                .next()
+                .catch(() => null)
+            : Promise.resolve(null),
+        ]);
+        oldestTs = fromBsonTimestamp((oldestDoc as { ts?: unknown } | null)?.ts);
+        newestTs = fromBsonTimestamp((newestDoc as { ts?: unknown } | null)?.ts);
+        const committed = fromBsonTimestamp(
+          (replStatus as { optimes?: { lastCommittedOpTime?: { ts?: unknown } } } | null)?.optimes
+            ?.lastCommittedOpTime?.ts,
+        );
+        const applied = fromBsonTimestamp(
+          (replStatus as { optimes?: { appliedOpTime?: { ts?: unknown } } } | null)?.optimes
+            ?.appliedOpTime?.ts,
+        );
+        majorityTs =
+          committed && applied
+            ? compareTimestamps(committed, applied) <= 0
+              ? committed
+              : applied
+            : (committed ?? applied);
+      } finally {
+        await checkClient.close().catch(() => {});
+      }
+
+      if (oldestTs && compareTimestamps(oldestTs, cursorTs) > 0) {
+        throw new Error(
+          `Bridging oplog gap detected: local.oplog.rs rolled over to ${formatOplogTimestamp(oldestTs)} past ${formatOplogTimestamp(cursorTs)}`,
+        );
+      }
+      // On a quiet shard, `majorityTs` may be < `untilTs` (because `untilTs` came from another
+      // shard or mongos $clusterTime), while `majorityTs >= newestTs` and `majorityTs >= cursorTs`
+      // proves all local oplog writes on this shard are majority-committed and archived.
+      const shardCaughtUpLocally =
+        majorityTs &&
+        newestTs &&
+        compareTimestamps(majorityTs, newestTs) >= 0 &&
+        compareTimestamps(majorityTs, cursorTs) >= 0;
+      if (majorityTs && (compareTimestamps(majorityTs, untilTs) >= 0 || shardCaughtUpLocally)) {
+        confirmedQuietUpToTarget = true;
+        break;
+      }
+
+      if (blockedSinceMs === null) blockedSinceMs = Date.now();
+      if (Date.now() - blockedSinceMs >= activeTxnWaitTimeoutMs) {
+        throw new Error(
+          `Failed to capture bridging oplog slices up to ${formatOplogTimestamp(untilTs)}: majority commit point (${majorityTs ? formatOplogTimestamp(majorityTs) : "unknown"}) did not reach target within ${Math.round(activeTxnWaitTimeoutMs / 1000)}s`,
+        );
+      }
+      await new Promise((r) => setTimeout(r, 250));
+      continue;
     }
+
     blockedSinceMs = null;
     keys.push(sliceManifest.key);
+    onSliceUploaded?.(sliceManifest.key);
+
+    if (sliceManifest.oplogWindow?.gapDetected) {
+      throw new Error(
+        `Bridging oplog gap detected in slice ${sliceManifest.key} while bridging to ${formatOplogTimestamp(untilTs)}`,
+      );
+    }
+
+    const covStr = sliceManifest.oplogWindow?.coverageEndTs;
+    const covTs = covStr ? parseOplogTimestamp(covStr) : null;
+    if (covTs && compareTimestamps(covTs, untilTs) >= 0) {
+      confirmedQuietUpToTarget = true;
+      break;
+    }
 
     const endStr = sliceManifest.oplogWindow?.endTs;
     const nextTs = endStr ? parseOplogTimestamp(endStr) : null;
@@ -602,6 +757,12 @@ async function captureBridgingSlices({
       break;
     }
     cursorTs = nextTs;
+  }
+
+  if (!confirmedQuietUpToTarget && compareTimestamps(cursorTs, untilTs) < 0) {
+    throw new Error(
+      `Failed to capture bridging oplog slices up to ${formatOplogTimestamp(untilTs)}: stopped at ${formatOplogTimestamp(cursorTs)}`,
+    );
   }
 
   return keys;
@@ -617,7 +778,7 @@ async function settleShardPreparedTxnsAndOptime({
   uri,
   boundaryTs,
   createMongoClient,
-  logger,
+  logger: _logger,
   signal,
   timeoutMs = 15_000,
 }: {
@@ -648,8 +809,7 @@ async function settleShardPreparedTxnsAndOptime({
       while (!signal?.aborted) {
         const prepared = await txCol
           .find({ state: "prepared" }, { readConcern: { level: "local" } })
-          .toArray()
-          .catch(() => []);
+          .toArray();
         const straddling = prepared.filter((doc) => {
           const ts =
             fromBsonTimestamp((doc as { startOpTime?: { ts?: unknown } }).startOpTime?.ts) ??
@@ -668,6 +828,7 @@ async function settleShardPreparedTxnsAndOptime({
 
     // 2. Wait briefly for majority-committed optime to catch up to the node's own newest oplog entry
     let latestMajorityTs: OplogTimestamp | null = null;
+    let latestNewestTs: OplogTimestamp | null = null;
     if (adminDb && typeof adminDb.command === "function") {
       const catchupDeadline = Math.min(deadline, Date.now() + 5_000);
       while (!signal?.aborted) {
@@ -700,6 +861,7 @@ async function settleShardPreparedTxnsAndOptime({
           latestMajorityTs = majorityTs;
         }
         const newestTs = fromBsonTimestamp((newestDoc as { ts?: unknown } | null)?.ts);
+        latestNewestTs = newestTs;
         if (
           !newestTs ||
           !majorityTs ||
@@ -712,13 +874,18 @@ async function settleShardPreparedTxnsAndOptime({
       }
     }
 
-    return latestMajorityTs;
-  } catch (err) {
-    if (err instanceof Error && err.message.startsWith("Timed out waiting for")) {
-      throw err;
+    if (
+      latestMajorityTs &&
+      latestNewestTs &&
+      compareTimestamps(latestMajorityTs, latestNewestTs) < 0 &&
+      compareTimestamps(latestMajorityTs, boundaryTs) < 0
+    ) {
+      throw new Error(
+        `Majority commit point (${formatOplogTimestamp(latestMajorityTs)}) did not catch up to boundary ${formatOplogTimestamp(boundaryTs)} (newest oplog: ${formatOplogTimestamp(latestNewestTs)})`,
+      );
     }
-    logger.debug({ err }, "Skipping shard prepared-txn settle check on mock/unreachable node");
-    return null;
+
+    return latestMajorityTs;
   } finally {
     await shardClient.close().catch(() => {});
   }
@@ -751,6 +918,16 @@ export async function runShardedClusterBackup({
       "Refusing to create unencrypted sharded cluster backup: REQUIRE_ENCRYPTION is enabled but ENCRYPTION_KEY is not configured",
     );
   }
+  if (config.mongo.database && config.mongo.database !== "*" && config.mongo.database !== "all") {
+    throw new Error(
+      `Sharded cluster backup requires cluster-wide scope (database="*" or "all"), got "${config.mongo.database}"`,
+    );
+  }
+  if (config.mongo.excludeCollections && config.mongo.excludeCollections.length > 0) {
+    throw new Error(
+      "Sharded cluster backup does not support excludeCollections; cluster backups must be full-cluster",
+    );
+  }
   if (!config.encryptionKey) {
     log.warn(
       "ENCRYPTION_KEY is not configured; sharded cluster backup archives and manifests will be stored unencrypted and unsigned",
@@ -761,7 +938,8 @@ export async function runShardedClusterBackup({
   const client = createMongoClient(config.mongo.uri);
   const balancer = new BalancerController(client, log);
   let balancerStopped = false;
-  let topology: ClusterTopology | null = null;
+  let shouldRestartBalancer = false;
+  let topology: ClusterTopology;
 
   try {
     await client.connect();
@@ -773,14 +951,9 @@ export async function runShardedClusterBackup({
       );
     }
 
-    if (topology.hasConfigShard && topology.shards.length === 0) {
+    if (topology.hasConfigShard && (backupRunner === runBackup || topology.shards.length === 0)) {
       throw new Error(
-        "Embedded Config Shard-only cluster (_id: 'config' with no dedicated shards) is not supported by logical sharded backup. Add dedicated shards or use replica-set backup.",
-      );
-    }
-    if (topology.hasConfigShard) {
-      log.warn(
-        "Detected 'config' entry in config.shards; if running MongoDB 7.0/8.0 Embedded Config Shard mode, ensure user collections are migrated to dedicated shards before logical sharded restore.",
+        "Embedded Config Shard mode (_id: 'config' in config.shards) is not supported by logical sharded backup because user databases hosted on the config shard would be omitted.",
       );
     }
 
@@ -793,19 +966,24 @@ export async function runShardedClusterBackup({
     );
 
     // 1. Quiesce cluster chunk balancing to prevent migrations during snapshot
+    shouldRestartBalancer = Boolean(topology.balancerEnabled);
     if (topology.balancerEnabled) {
       balancerStopped = await balancer.stopAndDrain(30_000);
+    } else if (topology.balancerRunning) {
+      const bStatus = await waitForBalancerDisabled(client, 30_000);
+      if (bStatus.inBalancerRound || bStatus.mode !== "off") {
+        throw new ActiveChunkMigrationError(
+          `Active chunk migration round did not conclude within 30s (mode: "${bStatus.mode}", inBalancerRound: ${bStatus.inBalancerRound}). Aborting backup.`,
+        );
+      }
     }
 
     // 2. Capture cluster-wide committed timestamp
-    let clusterTimeStr = `${Math.floor(Date.now() / 1000)}:1`;
+    let initialClusterTs: OplogTimestamp | null = null;
     try {
       const pingRes = await client.db("admin").command({ ping: 1 });
       if (pingRes?.$clusterTime?.clusterTime) {
-        const parsed = fromBsonTimestamp(pingRes.$clusterTime.clusterTime);
-        if (parsed) {
-          clusterTimeStr = `${parsed.t}:${parsed.i}`;
-        }
+        initialClusterTs = fromBsonTimestamp(pingRes.$clusterTime.clusterTime);
       }
     } catch {
       // Ignore
@@ -814,7 +992,12 @@ export async function runShardedClusterBackup({
     // 3. Back up Config Server and shards with bounded concurrency (small-RAM safety)
     const configsvrDirectUri = topology.configsvr?.host
       ? buildShardUri(config.mongo.uri, topology.configsvr.host)
-      : null;
+      : config.sharding?.configsvrUri;
+    if (backupRunner === runBackup && !configsvrDirectUri) {
+      throw new Error(
+        "Failed to discover Config Server (CSRS) connection string via getShardMap/serverStatus; refusing to fall back to mongos dump.",
+      );
+    }
 
     const shardConcurrency = Math.min(
       MAX_CONCURRENT_SHARD_DUMPS,
@@ -935,21 +1118,63 @@ export async function runShardedClusterBackup({
       }
     });
 
-    inFlightChildTasks.push(configsvrPromise, shardsPromise);
+    inFlightChildTasks.push(
+      configsvrPromise.catch(() => {}),
+      shardsPromise.catch(() => {}),
+    );
     const [configsvrManifest] = await Promise.all([configsvrPromise, shardsPromise]);
 
-    // Determine common clusterTime >= configsvr and all shard oplogWindow.endTs
-    let clusterTimeTs = parseOplogTimestamp(clusterTimeStr)!;
+    // Verify shard topology did not change mid-backup (e.g. addShard / removeShard)
+    const postTopology = await discoverClusterTopology(client).catch(() => null);
+    if (postTopology?.isSharded) {
+      const beforeIds = topology.shards.map((s) => s.id).sort();
+      const afterIds = postTopology.shards.map((s) => s.id).sort();
+      if (
+        beforeIds.length !== afterIds.length ||
+        beforeIds.some((id, idx) => id !== afterIds[idx])
+      ) {
+        throw new Error(
+          `Sharded cluster topology changed during backup (before: [${beforeIds.join(", ")}], after: [${afterIds.join(", ")}]); aborting inconsistent cluster backup`,
+        );
+      }
+    }
+
+    // Determine common clusterTime >= configsvr, all shard oplogWindow.endTs, and postPing $clusterTime
+    let clusterTimeTs: OplogTimestamp | null = initialClusterTs;
+    const considerTs = (ts: OplogTimestamp | null) => {
+      if (!ts) return;
+      if (!clusterTimeTs || compareTimestamps(ts, clusterTimeTs) > 0) {
+        clusterTimeTs = ts;
+      }
+    };
+
+    try {
+      const postPing = await client.db("admin").command({ ping: 1 });
+      considerTs(fromBsonTimestamp(postPing?.$clusterTime?.clusterTime));
+    } catch {
+      // Ignore
+    }
+
     const allEndTimestamps = [
       ...(configsvrManifest.oplogWindow?.endTs ? [configsvrManifest.oplogWindow.endTs] : []),
       ...Object.values(shardEndTimestamps),
     ];
     for (const endStr of allEndTimestamps) {
-      const endTs = parseOplogTimestamp(endStr);
-      if (endTs && compareTimestamps(endTs, clusterTimeTs) > 0) {
-        clusterTimeTs = endTs;
-      }
+      considerTs(parseOplogTimestamp(endStr));
     }
+    if (configsvrPreBounds?.newestTs) {
+      considerTs(configsvrPreBounds.newestTs);
+    }
+
+    if (!clusterTimeTs) {
+      if (backupRunner === runBackup) {
+        throw new Error(
+          "Failed to determine clusterTime from $clusterTime or child oplogWindow bounds; refusing to fabricate wall-clock clusterTime",
+        );
+      }
+      clusterTimeTs = { t: Math.floor(Date.now() / 1000) >>> 0, i: 1 };
+    }
+    let finalClusterTimeTs: OplogTimestamp = clusterTimeTs;
 
     // Wait for any boundary-straddling prepared 2PC transactions across all shards to settle
     // and for majority-committed optimes to catch up before picking the final common clusterTime.
@@ -964,7 +1189,7 @@ export async function runShardedClusterBackup({
         settleUris.map((u) =>
           settleShardPreparedTxnsAndOptime({
             uri: u,
-            boundaryTs: clusterTimeTs,
+            boundaryTs: finalClusterTimeTs,
             createMongoClient,
             logger: log,
             signal: controller.signal,
@@ -972,27 +1197,18 @@ export async function runShardedClusterBackup({
         ),
       );
       for (const optTs of settledOptimes) {
-        if (optTs && compareTimestamps(optTs, clusterTimeTs) > 0) {
-          clusterTimeTs = optTs;
+        if (optTs && compareTimestamps(optTs, finalClusterTimeTs) > 0) {
+          finalClusterTimeTs = optTs;
         }
       }
     }
 
-    try {
-      const postPing = await client.db("admin").command({ ping: 1 });
-      const parsed = fromBsonTimestamp(postPing?.$clusterTime?.clusterTime);
-      if (parsed && compareTimestamps(parsed, clusterTimeTs) > 0) {
-        clusterTimeTs = parsed;
-      }
-    } catch {
-      // Ignore
-    }
-    clusterTimeStr = formatOplogTimestamp(clusterTimeTs);
+    const clusterTimeStr = formatOplogTimestamp(finalClusterTimeTs);
 
-    const stamp = startedAt
-      .toISOString()
-      .replace(/[-:]/g, "")
-      .replace(/\.\d{3}Z$/, "Z");
+    const ms = startedAt.getUTCMilliseconds();
+    const msPart = ms > 0 ? `.${String(ms).padStart(3, "0")}` : "";
+    const randSuffix = randomUUID().slice(0, 8);
+    const stamp = `${startedAt.toISOString().slice(0, 19).replace(/[-:]/g, "")}${msPart}-${randSuffix}Z`;
 
     // 4. Capture backup-scoped multi-slice bridging oplogs (never mutating PITR archiver state.json)
     const configsvrBridgeStartTs = configsvrManifest.oplogWindow?.endTs
@@ -1007,19 +1223,17 @@ export async function runShardedClusterBackup({
     const configsvrBridgePromise =
       configsvrDirectUri &&
       configsvrBridgeStartTs &&
-      compareTimestamps(configsvrBridgeStartTs, clusterTimeTs) < 0
+      compareTimestamps(configsvrBridgeStartTs, finalClusterTimeTs) < 0
         ? captureBridgingSlices({
             config: configsvrOplogConfig,
             storage,
             logger: log.child({ component: "configsvr", phase: "bridge-oplog" }),
             signal: controller.signal,
             sinceTs: configsvrBridgeStartTs,
-            untilTs: clusterTimeTs,
+            untilTs: finalClusterTimeTs,
             keyPrefix: `${config.storage.prefix}/configsvr/_cluster/_bridging/${stamp}/`,
             createMongoClient,
-          }).then((keys) => {
-            for (const k of keys) trackArtifact(k);
-            return keys;
+            onSliceUploaded: (k) => trackArtifact(k),
           })
         : Promise.resolve<string[]>([]);
 
@@ -1029,18 +1243,18 @@ export async function runShardedClusterBackup({
         const endStr = shardEndTimestamps[shard.id];
         const shardCfg = shardConfigs[shard.id];
         const endTs = endStr ? parseOplogTimestamp(endStr) : null;
-        if (endTs && shardCfg && compareTimestamps(endTs, clusterTimeTs) < 0) {
+        if (endTs && shardCfg && compareTimestamps(endTs, finalClusterTimeTs) < 0) {
           const keys = await captureBridgingSlices({
             config: shardCfg,
             storage,
             logger: log.child({ shardId: shard.id, phase: "bridge-oplog" }),
             signal: controller.signal,
             sinceTs: endTs,
-            untilTs: clusterTimeTs,
+            untilTs: finalClusterTimeTs,
             keyPrefix: `${config.storage.prefix}/shards/${shard.id}/_cluster/_bridging/${stamp}/`,
             createMongoClient,
+            onSliceUploaded: (k) => trackArtifact(k),
           });
-          for (const k of keys) trackArtifact(k);
           if (keys.length > 0) {
             shardBackups[shard.id]!.bridgingSliceKey = keys[0];
             shardBackups[shard.id]!.bridgingSliceKeys = keys;
@@ -1050,7 +1264,7 @@ export async function runShardedClusterBackup({
     ]);
 
     // 5. Restart cluster balancer if it was originally enabled
-    if (balancerStopped && topology?.balancerEnabled) {
+    if ((balancerStopped || balancer.stopIssued) && shouldRestartBalancer) {
       await balancer.start();
       balancerStopped = false;
     }
@@ -1122,7 +1336,7 @@ export async function runShardedClusterBackup({
       type: "sharded-cluster-backup",
       engine: "logical",
       key: clusterKey,
-      database: config.mongo.database,
+      database: "*",
       createdAt: startedAt.toISOString(),
       completedAt: completedAt.toISOString(),
       durationMs,
@@ -1168,7 +1382,7 @@ export async function runShardedClusterBackup({
     }
     throw error;
   } finally {
-    if (balancerStopped && topology?.balancerEnabled) {
+    if ((balancerStopped || balancer.stopIssued) && shouldRestartBalancer) {
       await balancer.start();
     }
     await client.close().catch(() => {});
@@ -1235,7 +1449,7 @@ export async function captureShardedOplogSlices({
       })
     : Promise.resolve(null);
 
-  const shardEntries = await Promise.all(
+  const shardSettled = await Promise.allSettled(
     topology.shards.map(async (shard) => {
       const shardUri = buildShardUri(config.mongo.uri, shard.host);
       const manifest = await captureOplogSlice({
@@ -1253,10 +1467,133 @@ export async function captureShardedOplogSlices({
     }),
   );
 
-  const configsvr = await configsvrPromise;
+  const [configsvrResult] = await Promise.allSettled([configsvrPromise]);
+  const configsvr =
+    configsvrResult.status === "fulfilled"
+      ? configsvrResult.value
+      : (logger.error({ err: configsvrResult.reason }, "configsvr PITR slice capture failed"),
+        null);
+
+  const shards: Record<string, BackupManifest | null> = {};
+  for (let idx = 0; idx < topology.shards.length; idx++) {
+    const shard = topology.shards[idx]!;
+    const res = shardSettled[idx]!;
+    if (res.status === "fulfilled") {
+      shards[shard.id] = res.value[1];
+    } else {
+      logger.error({ shardId: shard.id, err: res.reason }, "Shard PITR slice capture failed");
+      shards[shard.id] = null;
+    }
+  }
+
   return {
     configsvr,
-    shards: Object.fromEntries(shardEntries),
+    shards,
+  };
+}
+
+async function resolveClusterAnchoredPitrPlan(
+  storage: StorageClient,
+  scope: BackupScope,
+  label: string,
+  baseBackupKey: string,
+  baseManifest: BackupManifest | null,
+  anchorTs: OplogTimestamp,
+  targetTs: OplogTimestamp,
+  fallbackCreatedAt: string,
+): Promise<PitrPlan> {
+  const allSlices = (await listOplogSlices(storage, scope)).filter((s) => s.complete);
+  const candidateSlices = allSlices.filter(
+    (s) => compareTimestamps(s.endTs, anchorTs) >= 0 && compareTimestamps(s.startTs, targetTs) <= 0,
+  );
+  const verifiedSlices = [];
+  let expectedPrev = anchorTs;
+  let lastCovered = anchorTs;
+  for (const slice of candidateSlices) {
+    const sManifest = await readManifest(storage, slice.key);
+    if (sManifest?.oplogWindow?.gapDetected) {
+      throw new Error(`PITR timeline gap detected on ${label} before slice ${slice.key}`);
+    }
+    const prevEnd = sManifest?.oplogWindow?.previousEndTs
+      ? parseOplogTimestamp(sManifest.oplogWindow.previousEndTs)
+      : null;
+    if (prevEnd) {
+      if (compareTimestamps(prevEnd, expectedPrev) > 0) {
+        throw new Error(`PITR timeline gap detected on ${label} before slice ${slice.key}`);
+      }
+    } else if (sManifest?.oplogWindow && compareTimestamps(slice.startTs, expectedPrev) > 0) {
+      throw new Error(`PITR timeline gap detected on ${label} before slice ${slice.key}`);
+    }
+    verifiedSlices.push({ ...slice, manifest: sManifest });
+    if (compareTimestamps(slice.endTs, expectedPrev) > 0) expectedPrev = slice.endTs;
+    const covEnd = sManifest?.oplogWindow?.coverageEndTs
+      ? parseOplogTimestamp(sManifest.oplogWindow.coverageEndTs)
+      : null;
+    const bestEnd = covEnd && compareTimestamps(covEnd, slice.endTs) > 0 ? covEnd : slice.endTs;
+    if (compareTimestamps(bestEnd, lastCovered) > 0) lastCovered = bestEnd;
+  }
+  if (compareTimestamps(lastCovered, targetTs) < 0) {
+    const nextSlice = allSlices.find((s) => compareTimestamps(s.startTs, targetTs) > 0);
+    if (nextSlice) {
+      const nextManifest = await readManifest(storage, nextSlice.key);
+      const nextPrevEnd = nextManifest?.oplogWindow?.previousEndTs
+        ? parseOplogTimestamp(nextManifest.oplogWindow.previousEndTs)
+        : null;
+      if (
+        !nextManifest?.oplogWindow?.gapDetected &&
+        nextPrevEnd &&
+        compareTimestamps(nextPrevEnd, expectedPrev) <= 0
+      ) {
+        lastCovered = targetTs;
+      }
+    }
+  }
+  if (compareTimestamps(lastCovered, targetTs) < 0 && typeof storage.getJson === "function") {
+    const stateObj = await storage
+      .getJson<{ coverageEndTs?: string; lastTs?: string; gapDetected?: boolean }>(
+        pitrStateKey(scope),
+      )
+      .catch(() => null);
+    const stateCov = stateObj?.data?.coverageEndTs
+      ? parseOplogTimestamp(stateObj.data.coverageEndTs)
+      : null;
+    const stateLast = stateObj?.data?.lastTs ? parseOplogTimestamp(stateObj.data.lastTs) : null;
+    if (
+      !stateObj?.data?.gapDetected &&
+      stateCov &&
+      (!stateLast || compareTimestamps(stateLast, expectedPrev) <= 0) &&
+      compareTimestamps(stateCov, lastCovered) > 0
+    ) {
+      lastCovered = stateCov;
+    }
+  }
+  if (
+    compareTimestamps(targetTs, anchorTs) > 0 &&
+    verifiedSlices.length === 0 &&
+    compareTimestamps(lastCovered, targetTs) < 0
+  ) {
+    throw new Error(
+      `Target timestamp ${formatOplogTimestamp(targetTs)} is newer than sharded backup clusterTime (${formatOplogTimestamp(anchorTs)}), but no ${label} oplog slices are available to bridge the window`,
+    );
+  }
+  if (compareTimestamps(lastCovered, targetTs) < 0) {
+    throw new Error(
+      `PITR oplog coverage on ${label} ends at ${formatOplogTimestamp(lastCovered)}, which is before target ${formatOplogTimestamp(targetTs)}`,
+    );
+  }
+  return {
+    baseBackup: {
+      key: baseBackupKey,
+      size: baseManifest?.size ?? 0,
+      createdAt: new Date(baseManifest?.createdAt ?? fallbackCreatedAt),
+      encrypted: Boolean(baseManifest?.encryption),
+      complete: true,
+    },
+    baseManifest,
+    baseEndTs: anchorTs,
+    slices: verifiedSlices,
+    lastCoveredTs: lastCovered,
+    targetTs,
   };
 }
 
@@ -1330,104 +1667,16 @@ export async function resolveShardedPitrPlan(
       },
     );
   } else if (selectedMeta.configsvr.backupKey && selectedMeta.configsvr.host) {
-    // CSRS was dumped via `database: "config"` (oplog: false) + bridging slices up to clusterTime;
-    // collect contiguous continuous PITR slices from `{ prefix: "<prefix>/configsvr", database: "*" }`
-    // anchored at `clusterTs`.
-    const cfgScope: BackupScope = { prefix: `${scope.prefix}/configsvr`, database: "*" };
-    const allCfgSlices = (await listOplogSlices(storage, cfgScope)).filter((s) => s.complete);
-    const candidateSlices = allCfgSlices.filter(
-      (s) =>
-        compareTimestamps(s.endTs, clusterTs) >= 0 && compareTimestamps(s.startTs, targetTs) <= 0,
-    );
-    const verifiedSlices = [];
-    let expectedPrev = clusterTs;
-    let lastCovered = clusterTs;
-    for (const slice of candidateSlices) {
-      const sManifest = await readManifest(storage, slice.key);
-      if (sManifest?.oplogWindow?.gapDetected) {
-        throw new Error(`PITR timeline gap detected on configsvr before slice ${slice.key}`);
-      }
-      const prevEnd = sManifest?.oplogWindow?.previousEndTs
-        ? parseOplogTimestamp(sManifest.oplogWindow.previousEndTs)
-        : null;
-      if (prevEnd) {
-        if (compareTimestamps(prevEnd, expectedPrev) > 0) {
-          throw new Error(`PITR timeline gap detected on configsvr before slice ${slice.key}`);
-        }
-      } else if (sManifest?.oplogWindow && compareTimestamps(slice.startTs, expectedPrev) > 0) {
-        throw new Error(`PITR timeline gap detected on configsvr before slice ${slice.key}`);
-      }
-      verifiedSlices.push({ ...slice, manifest: sManifest });
-      if (compareTimestamps(slice.endTs, expectedPrev) > 0) expectedPrev = slice.endTs;
-      const covEnd = sManifest?.oplogWindow?.coverageEndTs
-        ? parseOplogTimestamp(sManifest.oplogWindow.coverageEndTs)
-        : null;
-      const bestEnd = covEnd && compareTimestamps(covEnd, slice.endTs) > 0 ? covEnd : slice.endTs;
-      if (compareTimestamps(bestEnd, lastCovered) > 0) lastCovered = bestEnd;
-    }
-    if (compareTimestamps(lastCovered, targetTs) < 0) {
-      const nextSlice = allCfgSlices.find((s) => compareTimestamps(s.startTs, targetTs) > 0);
-      if (nextSlice) {
-        const nextManifest = await readManifest(storage, nextSlice.key);
-        const nextPrevEnd = nextManifest?.oplogWindow?.previousEndTs
-          ? parseOplogTimestamp(nextManifest.oplogWindow.previousEndTs)
-          : null;
-        if (
-          !nextManifest?.oplogWindow?.gapDetected &&
-          nextPrevEnd &&
-          compareTimestamps(nextPrevEnd, expectedPrev) <= 0
-        ) {
-          lastCovered = targetTs;
-        }
-      }
-    }
-    if (compareTimestamps(lastCovered, targetTs) < 0 && typeof storage.getJson === "function") {
-      const stateObj = await storage
-        .getJson<{ coverageEndTs?: string; lastTs?: string; gapDetected?: boolean }>(
-          pitrStateKey(cfgScope),
-        )
-        .catch(() => null);
-      const stateCov = stateObj?.data?.coverageEndTs
-        ? parseOplogTimestamp(stateObj.data.coverageEndTs)
-        : null;
-      const stateLast = stateObj?.data?.lastTs ? parseOplogTimestamp(stateObj.data.lastTs) : null;
-      if (
-        !stateObj?.data?.gapDetected &&
-        stateCov &&
-        (!stateLast || compareTimestamps(stateLast, expectedPrev) <= 0) &&
-        compareTimestamps(stateCov, lastCovered) > 0
-      ) {
-        lastCovered = stateCov;
-      }
-    }
-    if (
-      compareTimestamps(targetTs, clusterTs) > 0 &&
-      verifiedSlices.length === 0 &&
-      compareTimestamps(lastCovered, targetTs) < 0
-    ) {
-      throw new Error(
-        `Target timestamp ${formatOplogTimestamp(targetTs)} is newer than sharded backup clusterTime (${formatOplogTimestamp(clusterTs)}), but no configsvr oplog slices are available to bridge the window`,
-      );
-    }
-    if (compareTimestamps(lastCovered, targetTs) < 0) {
-      throw new Error(
-        `PITR oplog coverage on configsvr ends at ${formatOplogTimestamp(lastCovered)}, which is before target ${formatOplogTimestamp(targetTs)}`,
-      );
-    }
-    configsvrPlan = {
-      baseBackup: {
-        key: selectedMeta.configsvr.backupKey,
-        size: configsvrManifest?.size ?? 0,
-        createdAt: new Date(configsvrManifest?.createdAt ?? selectedManifest.createdAt),
-        encrypted: Boolean(configsvrManifest?.encryption),
-        complete: true,
-      },
-      baseManifest: configsvrManifest,
-      baseEndTs: clusterTs,
-      slices: verifiedSlices,
-      lastCoveredTs: lastCovered,
+    configsvrPlan = await resolveClusterAnchoredPitrPlan(
+      storage,
+      { prefix: `${scope.prefix}/configsvr`, database: "*" },
+      "configsvr",
+      selectedMeta.configsvr.backupKey,
+      configsvrManifest,
+      clusterTs,
       targetTs,
-    };
+      selectedManifest.createdAt,
+    );
   }
 
   const shardPlans: Record<string, PitrPlan> = {};
@@ -1435,15 +1684,27 @@ export async function resolveShardedPitrPlan(
     if (shard.status !== "success" || !shard.backupKey) {
       throw new Error(`Cannot perform sharded PITR: shard "${shardId}" has incomplete base backup`);
     }
-    shardPlans[shardId] = await resolvePitrPlan(
-      storage,
-      { prefix: `${scope.prefix}/shards/${shardId}`, database: "*" },
-      targetTs,
-      {
+    const shardScope: BackupScope = { prefix: `${scope.prefix}/shards/${shardId}`, database: "*" };
+    try {
+      shardPlans[shardId] = await resolvePitrPlan(storage, shardScope, targetTs, {
         engine: "logical",
         baseKey: shard.backupKey,
-      },
-    );
+      });
+    } catch (err) {
+      const hasBridging = Boolean(shard.bridgingSliceKeys?.length || shard.bridgingSliceKey);
+      if (!hasBridging) throw err;
+      const shardManifest = await readManifest(storage, shard.backupKey);
+      shardPlans[shardId] = await resolveClusterAnchoredPitrPlan(
+        storage,
+        shardScope,
+        shardId,
+        shard.backupKey,
+        shardManifest,
+        clusterTs,
+        targetTs,
+        selectedManifest.createdAt,
+      );
+    }
   }
 
   return {
@@ -1480,19 +1741,41 @@ function collectOrderedSliceKeys(
  * programmatic CSRS restore, zero-disk streaming oplog replay, and
  * cross-shard distributed transaction reconciliation.
  */
+function isCommandNotFoundError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const code = (err as { code?: unknown }).code;
+  const codeName = (err as { codeName?: unknown }).codeName;
+  return code === 59 || codeName === "CommandNotFound";
+}
+
 export async function restoreShardedCluster({
   config,
   storage,
   logger,
   ref = "latest",
   pitr,
+  uri,
+  parallelCollections,
   signal,
   drop = false,
-  preVerify = drop,
+  preVerify = true,
+  skipPitrRestoreMarker = false,
   createMongoClient = (u) => new MongoClient(u),
   restoreRunner = restoreBackup,
 }: ShardedRestoreOptions): Promise<ShardedRestoreResult> {
-  const scope = scopeOf(config);
+  const effectiveUri = uri ?? config.mongo.uri;
+  const effectiveConfig: AppConfig =
+    uri || parallelCollections !== undefined
+      ? {
+          ...config,
+          mongo: {
+            ...config.mongo,
+            uri: effectiveUri,
+            ...(parallelCollections !== undefined ? { parallelCollections } : {}),
+          },
+        }
+      : config;
+  const scope = scopeOf(effectiveConfig);
   const pitrPlan = pitr ? await resolveShardedPitrPlan(storage, scope, pitr) : null;
   const resolvedKey = pitrPlan
     ? pitrPlan.clusterBackupKey
@@ -1510,19 +1793,30 @@ export async function restoreShardedCluster({
   }
 
   // Fail closed on HMAC manifest verification
-  const keyRing = resolveKeyRing(config);
+  if (effectiveConfig.requireEncryption && !manifest.encryption) {
+    throw new Error(
+      `REQUIRE_ENCRYPTION is enabled, but sharded cluster backup ${resolvedKey} lacks an encrypted manifest`,
+    );
+  }
+  const keyRing = resolveKeyRing(effectiveConfig);
   const isSigned = Boolean(manifest.signature?.hmac || manifest.encryption?.manifestHmac);
-  if (isSigned) {
-    if (keyRing.length === 0) {
+  const mustVerify =
+    isSigned ||
+    Boolean(manifest.encryption) ||
+    keyRing.length > 0 ||
+    Boolean(effectiveConfig.requireEncryption);
+  if (mustVerify) {
+    if (
+      (isSigned || manifest.encryption || effectiveConfig.requireEncryption) &&
+      keyRing.length === 0
+    ) {
       throw new Error(
-        `Sharded cluster manifest for ${resolvedKey} is signed with HMAC, but ENCRYPTION_KEY / key ring is not configured`,
+        `Sharded cluster manifest for ${resolvedKey} requires HMAC verification, but ENCRYPTION_KEY / key ring is not configured`,
       );
     }
-    verifyManifest(keyRing, manifest);
-  } else if (manifest.encryption && keyRing.length === 0) {
-    throw new Error(
-      `Sharded cluster backup ${resolvedKey} is encrypted, but ENCRYPTION_KEY is not set`,
-    );
+    verifyManifest(keyRing, manifest, {
+      requireSigned: Boolean(effectiveConfig.requireEncryption || manifest.encryption),
+    });
   }
 
   // Fail fast if any shard in the backup failed or is missing its backupKey
@@ -1534,7 +1828,7 @@ export async function restoreShardedCluster({
     }
   }
 
-  const client = createMongoClient(config.mongo.uri);
+  const client = createMongoClient(effectiveUri);
   const balancer = new BalancerController(client, log);
   let balancerStopped = false;
   let balancerWasEnabled = false;
@@ -1549,11 +1843,19 @@ export async function restoreShardedCluster({
     balancerWasEnabled = Boolean(targetTopology?.balancerEnabled);
     if (balancerWasEnabled) {
       balancerStopped = await balancer.stopAndDrain(30_000);
+    } else if (targetTopology?.balancerRunning) {
+      const bStatus = await waitForBalancerDisabled(client, 30_000);
+      if (bStatus.inBalancerRound || bStatus.mode !== "off") {
+        throw new ActiveChunkMigrationError(
+          `Active chunk migration round did not conclude within 30s (mode: "${bStatus.mode}", inBalancerRound: ${bStatus.inBalancerRound}). Aborting restore.`,
+        );
+      }
     } else if (!targetTopology) {
       try {
         await client.db("admin").command({ balancerStop: 1 });
         balancerStopped = true;
         balancerWasEnabled = true;
+        await waitForBalancerDisabled(client, 30_000);
       } catch {}
     }
 
@@ -1614,35 +1916,30 @@ export async function restoreShardedCluster({
 
     // If drop=true, drop existing user databases via mongos before restoring routing + shard data
     if (drop) {
-      try {
-        const listRes = (await client
-          .db("admin")
-          .command({ listDatabases: 1, nameOnly: true })) as {
-          databases?: Array<{ name?: string }>;
-        };
-        if (Array.isArray(listRes?.databases)) {
-          for (const dbInfo of listRes.databases) {
-            const dbName = dbInfo?.name;
-            if (dbName && !SYSTEM_DATABASES.has(dbName)) {
-              log.info(
-                { database: dbName },
-                "Dropping existing user database before sharded restore",
-              );
-              await client
-                .db(dbName)
-                .dropDatabase()
-                .catch(() => {});
-            }
+      const adminDb = client.db("admin");
+      const listRes =
+        typeof adminDb.command === "function"
+          ? ((await adminDb.command({ listDatabases: 1, nameOnly: true }).catch(() => null)) as {
+              databases?: Array<{ name?: string }>;
+            } | null)
+          : null;
+      if (Array.isArray(listRes?.databases)) {
+        for (const dbInfo of listRes.databases) {
+          const dbName = dbInfo?.name;
+          if (dbName && !SYSTEM_DATABASES.has(dbName)) {
+            log.info(
+              { database: dbName },
+              "Dropping existing user database before sharded restore",
+            );
+            await client.db(dbName).dropDatabase();
           }
         }
-      } catch {
-        // Non-fatal if target mongos does not support listDatabases or mock doesn't return databases
       }
     }
 
     const targetConfigsvrUri = targetTopology?.configsvr?.host
-      ? buildShardUri(config.mongo.uri, targetTopology.configsvr.host)
-      : config.mongo.uri;
+      ? buildShardUri(effectiveUri, targetTopology.configsvr.host)
+      : effectiveUri;
 
     const clusterTs = parseOplogTimestamp(clusterMeta.clusterTime);
     const effectiveTargetTs = pitrPlan ? pitrPlan.targetTs : clusterTs;
@@ -1673,19 +1970,20 @@ export async function restoreShardedCluster({
 
     if (useProgrammaticCsrs) {
       const csrsRes = await new CsrsRestorer().restore({
-        config,
+        config: effectiveConfig,
         storage,
         backupKey: clusterMeta.configsvr.backupKey,
         targetConfigsvrUri,
         drop,
         logger: log.child({ target: "configsvr" }),
         signal,
+        targetShardIds: new Set(targetShardMap.keys()),
         createMongoClient,
       });
       backupSessionsUuidHex = csrsRes.backupSessionsUuidHex;
     } else {
       await restoreRunner(
-        { config, storage, logger: log.child({ target: "configsvr" }), signal },
+        { config: effectiveConfig, storage, logger: log.child({ target: "configsvr" }), signal },
         {
           ref: clusterMeta.configsvr.backupKey,
           uri: targetConfigsvrUri,
@@ -1696,55 +1994,73 @@ export async function restoreShardedCluster({
       );
     }
 
-    // 3. Restore base snapshot on every shard
-    const restoredShards: string[] = [];
+    // 3. Restore base snapshot on every shard (bounded concurrency)
+    const shardEntries = Object.entries(clusterMeta.shards);
     const shardUris = new Map<string, string>();
     const shardBaseEndTs = new Map<string, OplogTimestamp | undefined>();
-
-    for (const [shardId, shard] of Object.entries(clusterMeta.shards)) {
+    for (const [shardId] of shardEntries) {
       const resolvedHost = targetShardMap.get(shardId);
       if (!resolvedHost) {
         throw new Error(`Target cluster topology is missing mapping for shard "${shardId}"`);
       }
-      const targetShardUri = buildShardUri(config.mongo.uri, resolvedHost);
-      shardUris.set(shardId, targetShardUri);
-      const shardPitrPlan = pitrPlan?.shardPlans[shardId] ?? null;
-      const shardBridgeKeys = collectOrderedSliceKeys(
-        shard.bridgingSliceKeys,
-        shard.bridgingSliceKey,
-      );
-      const hasPostBaseSlices =
-        shardBridgeKeys.length > 0 || Boolean(shardPitrPlan && shardPitrPlan.slices.length > 0);
+      shardUris.set(shardId, buildShardUri(effectiveUri, resolvedHost));
+    }
 
-      log.info({ shardId, backupKey: shard.backupKey }, "Restoring shard base backup...");
-      await restoreRunner(
-        { config, storage, logger: log.child({ target: shardId }), signal },
-        {
-          ref: shard.backupKey,
-          uri: targetShardUri,
-          database: "*",
-          drop,
-          ...(preVerifiedAllChildren ? { preVerify: false } : {}),
-          oplogReplay: true,
-          oplogLimit: hasPostBaseSlices ? undefined : exclusiveLimit,
+    let restoredShards: string[];
+    try {
+      restoredShards = await runWithConcurrency(
+        shardEntries,
+        Math.min(MAX_CONCURRENT_SHARD_DUMPS, Math.max(1, shardEntries.length)),
+        async ([shardId, shard]) => {
+          const targetShardUri = shardUris.get(shardId)!;
+          const shardPitrPlan = pitrPlan?.shardPlans[shardId] ?? null;
+          const shardBridgeKeys = collectOrderedSliceKeys(
+            shard.bridgingSliceKeys,
+            shard.bridgingSliceKey,
+          );
+          const hasPostBaseSlices =
+            shardBridgeKeys.length > 0 || Boolean(shardPitrPlan && shardPitrPlan.slices.length > 0);
+
+          log.info({ shardId, backupKey: shard.backupKey }, "Restoring shard base backup...");
+          await restoreRunner(
+            { config: effectiveConfig, storage, logger: log.child({ target: shardId }), signal },
+            {
+              ref: shard.backupKey,
+              uri: targetShardUri,
+              database: "*",
+              drop,
+              ...(preVerifiedAllChildren ? { preVerify: false } : {}),
+              oplogReplay: true,
+              oplogLimit: hasPostBaseSlices ? undefined : exclusiveLimit,
+            },
+          );
+
+          if (shardPitrPlan?.baseEndTs) {
+            shardBaseEndTs.set(shardId, shardPitrPlan.baseEndTs);
+          } else {
+            const sManifest = await readManifest(storage, shard.backupKey).catch(() => null);
+            const endTs = sManifest?.oplogWindow?.endTs
+              ? parseOplogTimestamp(sManifest.oplogWindow.endTs)
+              : undefined;
+            shardBaseEndTs.set(shardId, endTs ?? undefined);
+          }
+
+          return shardId;
         },
       );
-
-      if (shardPitrPlan?.baseEndTs) {
-        shardBaseEndTs.set(shardId, shardPitrPlan.baseEndTs);
-      } else {
-        const sManifest = await readManifest(storage, shard.backupKey).catch(() => null);
-        const endTs = sManifest?.oplogWindow?.endTs
-          ? parseOplogTimestamp(sManifest.oplogWindow.endTs)
-          : undefined;
-        shardBaseEndTs.set(shardId, endTs ?? undefined);
-      }
-
-      restoredShards.push(shardId);
+    } catch (shardRestoreErr) {
+      log.error(
+        { err: shardRestoreErr },
+        "CRITICAL: Shard restore failed after CSRS metadata was already mutated; cluster is in a partial restore state and requires a full re-restore",
+      );
+      throw shardRestoreErr;
     }
 
     // 4. Streaming oplog replay across configsvr & all shards + cross-shard distributed txn reconciliation
     if (totalSlicesToReplay > 0 && effectiveTargetTs) {
+      const configsvrManifest = await readManifest(storage, clusterMeta.configsvr.backupKey).catch(
+        () => null,
+      );
       const activeNodes: Array<{
         id: string;
         client: MongoClient;
@@ -1758,9 +2074,10 @@ export async function restoreShardedCluster({
           await cfgClient.connect();
           const cfgApplier = new OplogApplier({
             target: new MongoOplogTargetClient(cfgClient),
-            workDir: config.workDir,
+            workDir: effectiveConfig.workDir,
             logger: log.child({ target: "configsvr-oplog" }),
             endTs: effectiveTargetTs,
+            unsafe: !configsvrManifest?.oplog,
             filter: {
               nsInclude: targetTopology?.configsvr?.host ? configsvrNsInclude : undefined,
               sessionsUuidHex: backupSessionsUuidHex ?? undefined,
@@ -1775,14 +2092,18 @@ export async function restoreShardedCluster({
           });
         }
 
+        const zeroSliceShards: string[] = [];
         for (const shardId of restoredShards) {
           const sliceKeys = shardSliceKeyMap.get(shardId) ?? [];
-          if (sliceKeys.length === 0) continue;
+          if (sliceKeys.length === 0) {
+            zeroSliceShards.push(shardId);
+            continue;
+          }
           const shardClient = createMongoClient(shardUris.get(shardId)!);
           await shardClient.connect();
           const shardApplier = new OplogApplier({
             target: new MongoOplogTargetClient(shardClient),
-            workDir: config.workDir,
+            workDir: effectiveConfig.workDir,
             logger: log.child({ target: `${shardId}-oplog` }),
             startExclusiveTs: shardBaseEndTs.get(shardId),
             endTs: effectiveTargetTs,
@@ -1800,8 +2121,10 @@ export async function restoreShardedCluster({
         await Promise.all(
           activeNodes.map(async (node) => {
             for (const sliceKey of node.sliceKeys) {
-              await streamOplogSlice({ config, storage, signal }, sliceKey, (stream) =>
-                node.applier.applyStream(stream, signal),
+              await streamOplogSlice(
+                { config: effectiveConfig, storage, signal },
+                sliceKey,
+                (stream) => node.applier.applyStream(stream, signal),
               );
             }
           }),
@@ -1809,13 +2132,43 @@ export async function restoreShardedCluster({
         replayedSlices = totalSlicesToReplay;
 
         // Cross-shard distributed transaction reconciliation:
-        // Union all committed distributed txns across shards/configsvr, then resolve
-        // any buffered prepared/uncommitted txns on every node.
+        // Union all committed distributed txns across shards/configsvr (including 0-slice shards
+        // whose base dump already included the commit), then resolve buffered prepared txns.
         const clusterCommits = new Map<string, OplogTimestamp | null>();
         for (const node of activeNodes) {
           const { committedDistTxns } = node.applier.getTxnLeftovers();
           for (const committed of committedDistTxns) {
             clusterCommits.set(committed.id, committed.commitTs);
+          }
+        }
+        for (const zShardId of zeroSliceShards) {
+          const zUri = shardUris.get(zShardId);
+          if (!zUri) continue;
+          const zClient = createMongoClient(zUri);
+          try {
+            await zClient.connect();
+            const zCfg = typeof zClient.db === "function" ? zClient.db("config") : null;
+            const zTxCol =
+              zCfg && typeof zCfg.collection === "function"
+                ? zCfg.collection("transactions")
+                : null;
+            if (zTxCol && typeof zTxCol.find === "function") {
+              const committedDocs = await zTxCol.find({ state: "committed" }).toArray();
+              for (const txDoc of committedDocs) {
+                const lsid = (txDoc as { _id?: unknown })._id;
+                const txnNum = (txDoc as { txnNum?: unknown }).txnNum;
+                if (lsid && typeof lsid === "object" && txnNum !== undefined) {
+                  const lsidBytes = BSON.serialize(lsid as Record<string, unknown>);
+                  const txnId = `${Buffer.from(lsidBytes).toString("base64url")}-${String(txnNum)}`;
+                  const commitTs = fromBsonTimestamp(
+                    (txDoc as { lastWriteOpTime?: { ts?: unknown } }).lastWriteOpTime?.ts,
+                  );
+                  clusterCommits.set(txnId, commitTs);
+                }
+              }
+            }
+          } finally {
+            await zClient.close().catch(() => {});
           }
         }
         for (const node of activeNodes) {
@@ -1849,11 +2202,6 @@ export async function restoreShardedCluster({
     }
 
     // 5. Synchronize routing & authoritative shard catalog metadata across CSRS, all shards, and mongos
-    // Order matters (especially on MongoDB 9.0 Authoritative Shards):
-    //   5a. Flush CSRS RoutingInformationCache so CSRS serves the restored config.{databases,collections,chunks}
-    //   5b. On each shard primary, commit restored DB/collection metadata into config.shard.catalog.*
-    //       (MongoDB 9.0+) or flush routing/database cache updates (MongoDB 7.0/8.0), then flushRouterConfig
-    //   5c. Flush mongos router cache LAST so subsequent queries see fully converged CSRS + shard metadata
     let restoredConfigDbs: Array<{ _id: string; primary?: string; version?: unknown }> = [];
     let restoredConfigColls: Array<{ _id: string }> = [];
 
@@ -1861,34 +2209,26 @@ export async function restoreShardedCluster({
       const cfgSyncClient = createMongoClient(targetConfigsvrUri);
       try {
         await cfgSyncClient.connect();
-        await cfgSyncClient
-          .db("admin")
-          .command({ flushRouterConfig: 1 })
-          .catch(() => {});
-        const cfgDb = cfgSyncClient.db("config");
-        if (typeof cfgDb.collection === "function") {
+        const cfgAdmin = typeof cfgSyncClient.db === "function" ? cfgSyncClient.db("admin") : null;
+        if (cfgAdmin && typeof cfgAdmin.command === "function") {
+          await cfgAdmin.command({ flushRouterConfig: 1 });
+        }
+        const cfgDb = typeof cfgSyncClient.db === "function" ? cfgSyncClient.db("config") : null;
+        if (cfgDb && typeof cfgDb.collection === "function") {
           const dbsColl = cfgDb.collection<{ _id: string; primary?: string; version?: unknown }>(
             "databases",
           );
           if (typeof dbsColl.find === "function") {
-            restoredConfigDbs = await dbsColl
-              .find({})
-              .toArray()
-              .catch(() => []);
+            restoredConfigDbs = await dbsColl.find({}).toArray();
           }
           const collsColl = cfgDb.collection<{ _id: string }>("collections");
           if (typeof collsColl.find === "function") {
-            const allColls = await collsColl
-              .find({})
-              .toArray()
-              .catch(() => []);
+            const allColls = await collsColl.find({}).toArray();
             restoredConfigColls = allColls.filter(
               (c) => typeof c._id === "string" && c._id !== "config.system.sessions",
             );
           }
         }
-      } catch {
-        // Non-fatal on mocked or unreachable direct configsvr clients
       } finally {
         await cfgSyncClient.close().catch(() => {});
       }
@@ -1901,12 +2241,13 @@ export async function restoreShardedCluster({
       }
     }
 
-    for (const [shardId, shardUri] of shardUris.entries()) {
+    for (const [, shardUri] of shardUris.entries()) {
       const sClient = createMongoClient(shardUri);
       try {
         await sClient.connect();
-        // MongoDB 9.0+ Authoritative Shards: commit restored CSRS metadata into each shard's
-        // durable `config.shard.catalog.*` and reinstall in-memory CSS/DSS caches.
+        const sAdmin = typeof sClient.db === "function" ? sClient.db("admin") : null;
+        if (!sAdmin || typeof sAdmin.command !== "function") continue;
+
         if (
           (restoredConfigDbs.length > 0 || restoredConfigColls.length > 0) &&
           typeof sClient.startSession === "function"
@@ -1915,10 +2256,9 @@ export async function restoreShardedCluster({
           let txnSeq = 1;
           try {
             for (const dbDoc of restoredConfigDbs) {
-              if (dbDoc.primary === shardId && dbDoc.version) {
-                await sClient
-                  .db(dbDoc._id)
-                  .command(
+              if (dbDoc.version) {
+                try {
+                  await sClient.db(dbDoc._id).command(
                     {
                       _shardsvrCommitCreateDatabaseMetadata: 1,
                       dbVersion: dbDoc.version,
@@ -1926,8 +2266,10 @@ export async function restoreShardedCluster({
                       writeConcern: { w: "majority" },
                     },
                     { session: syncSession },
-                  )
-                  .catch(() => {});
+                  );
+                } catch (err) {
+                  if (!isCommandNotFoundError(err)) throw err;
+                }
               }
             }
             for (const collDoc of restoredConfigColls) {
@@ -1936,9 +2278,8 @@ export async function restoreShardedCluster({
               const dbName = collDoc._id.slice(0, dot);
               const primaryShardId = dbPrimaryMap.get(dbName);
               if (!primaryShardId) continue;
-              await sClient
-                .db("admin")
-                .command(
+              try {
+                await sAdmin.command(
                   {
                     _shardsvrCommitCreateCollectionMetadata: collDoc._id,
                     primaryShardId,
@@ -1946,45 +2287,74 @@ export async function restoreShardedCluster({
                     writeConcern: { w: "majority" },
                   },
                   { session: syncSession },
-                )
-                .catch(() => {});
+                );
+              } catch (err) {
+                if (!isCommandNotFoundError(err)) throw err;
+              }
             }
           } finally {
             await syncSession.endSession().catch(() => {});
           }
         }
 
-        // MongoDB 7.0 / 8.0 legacy cache refresh (no-op / deprecated on MongoDB 9.0+)
+        // MongoDB 7.0 / 8.0 legacy cache refresh (ignore CommandNotFound on MongoDB 9.0+)
         for (const dbDoc of restoredConfigDbs) {
-          await sClient
-            .db("admin")
-            .command({ _flushDatabaseCacheUpdates: dbDoc._id, syncFromConfig: true })
-            .catch(() => {});
+          try {
+            await sAdmin.command({ _flushDatabaseCacheUpdates: dbDoc._id, syncFromConfig: true });
+          } catch (err) {
+            if (!isCommandNotFoundError(err)) throw err;
+          }
         }
         for (const collDoc of restoredConfigColls) {
-          await sClient
-            .db("admin")
-            .command({ _flushRoutingTableCacheUpdates: collDoc._id, syncFromConfig: true })
-            .catch(() => {});
+          try {
+            await sAdmin.command({
+              _flushRoutingTableCacheUpdates: collDoc._id,
+              syncFromConfig: true,
+            });
+          } catch (err) {
+            if (!isCommandNotFoundError(err)) throw err;
+          }
         }
 
-        await sClient
-          .db("admin")
-          .command({ flushRouterConfig: 1 })
-          .catch(() => {});
-      } catch {
-        // Non-fatal
+        await sAdmin.command({ flushRouterConfig: 1 });
       } finally {
         await sClient.close().catch(() => {});
       }
     }
 
-    await client
-      .db("admin")
-      .command({ flushRouterConfig: 1 })
-      .catch(() => {});
+    await client.db("admin").command({ flushRouterConfig: 1 });
 
-    if (balancerStopped && balancerWasEnabled) {
+    // Clear stale PITR state.json checkpoints across configsvr and shards so post-restore PITR
+    // re-anchors cleanly rather than skipping new writes behind pre-restore future timestamps.
+    if (!skipPitrRestoreMarker && typeof storage.remove === "function") {
+      const stateKeysToReset = [
+        pitrStateKey(scope),
+        pitrStateKey({ prefix: `${scope.prefix}/configsvr`, database: "*" }),
+        ...restoredShards.map((sid) =>
+          pitrStateKey({ prefix: `${scope.prefix}/shards/${sid}`, database: "*" }),
+        ),
+      ];
+      await Promise.allSettled(stateKeysToReset.map((k) => storage.remove(k).catch(() => {})));
+    }
+    if (!skipPitrRestoreMarker && typeof storage.putJson === "function") {
+      const scopesToMark = [
+        scope,
+        { prefix: `${scope.prefix}/configsvr`, database: "*" },
+        ...restoredShards.map((sid) => ({
+          prefix: `${scope.prefix}/shards/${sid}`,
+          database: "*",
+        })),
+      ];
+      await Promise.allSettled(
+        scopesToMark.map((sc) =>
+          markPitrRestore(storage, sc).catch((err) => {
+            log.warn({ err, scope: sc.prefix }, "Failed to write PITR restore marker");
+          }),
+        ),
+      );
+    }
+
+    if ((balancerStopped || balancer.stopIssued) && balancerWasEnabled) {
       await balancer.start();
       balancerStopped = false;
     }
@@ -2008,7 +2378,7 @@ export async function restoreShardedCluster({
       ...(oplogStats ? { oplogStats } : {}),
     };
   } finally {
-    if (balancerStopped && balancerWasEnabled) {
+    if ((balancerStopped || balancer.stopIssued) && balancerWasEnabled) {
       await balancer.start();
     }
     await client.close().catch(() => {});
