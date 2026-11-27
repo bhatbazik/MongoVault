@@ -287,10 +287,27 @@ describe("E2E-M2: Logical Backup/Restore, PITR Slicer/Replay & Ops/Daemon (F5–
           .insertOne({ _id: "d0", step: 0 }, { writeConcern: { w: "majority" } });
         const latestBeforeLag = await getLatestOplogTs(rsF5.uri);
         await waitForMajorityCatchup(rsF5.uri, latestBeforeLag);
-        const t0 = await getLatestOplogTs(sec0.directUri);
-
-        // Freeze replication apply on sec0, then commit d1 to primary + sec1
-        await rsF5.setFailPoint(sec0, "rsSyncApplyStop", { mode: "alwaysOn" });
+        // Wait for sec0 specifically to apply d0 before freezing replication apply on sec0
+        const sec0Client = new MongoClient(sec0.directUri, { directConnection: true });
+        let t0;
+        try {
+          await sec0Client.connect();
+          const appliedD0 = await waitForCondition(
+            async () =>
+              (await sec0Client.db("f5lag").collection("items").countDocuments({ _id: "d0" })) ===
+              1,
+            10_000,
+            50,
+          );
+          expect(appliedD0).toBe(true);
+          await rsF5.setFailPoint(sec0, "stopReplProducer", { mode: "alwaysOn" });
+          const sec0Status = await sec0Client.db("admin").command({ replSetGetStatus: 1 });
+          t0 =
+            fromBsonTimestamp(sec0Status?.optimes?.appliedOpTime?.ts) ??
+            (await getLatestOplogTs(sec0.directUri));
+        } finally {
+          await sec0Client.close().catch(() => {});
+        }
         await client
           .db("f5lag")
           .collection("items")
@@ -319,6 +336,7 @@ describe("E2E-M2: Logical Backup/Restore, PITR Slicer/Replay & Ops/Daemon (F5–
         const recordedEndTs = parseOplogTimestamp(manifest.oplogWindow.endTs);
         expect(compareTimestamps(recordedEndTs, t0)).toBeLessThanOrEqual(0);
       } finally {
+        await rsF5.clearFailPoint(sec0, "stopReplProducer").catch(() => {});
         await rsF5.clearFailPoint(sec0, "rsSyncApplyStop").catch(() => {});
         if (!sec1.isRunning()) {
           await sec1.restart().catch(() => {});
@@ -562,17 +580,30 @@ describe("E2E-M2: Logical Backup/Restore, PITR Slicer/Replay & Ops/Daemon (F5–
 
         const endTs = parseOplogTimestamp(manifest.oplogWindow.endTs);
 
-        // Map each inserted _id to its exact oplog ts before dropping
+        // Map each inserted _id to its exact oplog ts before dropping (including batched applyOps from insertMany)
         const writeTsById = new Map();
         const oplogDocs = await client
           .db("local")
           .collection("oplog.rs")
-          .find({ op: "i", ns: "f5bounds.items" })
+          .find({
+            $or: [
+              { op: "i", ns: "f5bounds.items" },
+              { op: "c", "o.applyOps.ns": "f5bounds.items" },
+            ],
+          })
           .toArray();
         for (const entry of oplogDocs) {
-          const id = entry.o?._id;
           const ts = fromBsonTimestamp(entry.ts);
-          if (id && ts) writeTsById.set(id, ts);
+          if (!ts) continue;
+          if (entry.op === "i" && entry.o?._id) {
+            writeTsById.set(entry.o._id, ts);
+          } else if (entry.op === "c" && Array.isArray(entry.o?.applyOps)) {
+            for (const sub of entry.o.applyOps) {
+              if (sub?.op === "i" && sub?.ns === "f5bounds.items" && sub?.o?._id) {
+                writeTsById.set(sub.o._id, ts);
+              }
+            }
+          }
         }
 
         await client.db("f5bounds").dropDatabase();
@@ -663,7 +694,10 @@ describe("E2E-M2: Logical Backup/Restore, PITR Slicer/Replay & Ops/Daemon (F5–
 
         expect(manifest.oplog).toBe(true);
         expect(observedPreOplog?.newestTs).toBeTruthy();
-        expect(manifest.oplogWindow?.entries).toBe(0);
+        // mongodump --oplog queries { ts: { $gte: startTs } }, so on a quiet cluster it embeds
+        // at most the single inclusive anchor entry at preOplog.newestTs.
+        expect(manifest.oplogWindow?.entries).toBeLessThanOrEqual(1);
+        expect(manifest.oplogWindow?.startTs).toBe(formatOplogTimestamp(observedPreOplog.newestTs));
         expect(manifest.oplogWindow?.endTs).toBe(formatOplogTimestamp(observedPreOplog.newestTs));
       } finally {
         await client.close().catch(() => {});
@@ -3088,12 +3122,33 @@ describe("E2E-M2: Logical Backup/Restore, PITR Slicer/Replay & Ops/Daemon (F5–
         const oplogDocs = await client
           .db("local")
           .collection("oplog.rs")
-          .find({ op: "i", ns: "f15skew.events" })
+          .find({
+            $or: [
+              { op: "i", ns: "f15skew.events" },
+              { op: "c", "o.applyOps.ns": "f15skew.events" },
+            ],
+          })
           .toArray();
         for (const entry of oplogDocs) {
-          const id = entry.o?._id;
-          const ts = fromBsonTimestamp(entry.ts);
-          if (id && ts) writeTsById.set(id, ts);
+          if (entry.op === "i") {
+            const id = entry.o?._id;
+            const ts = fromBsonTimestamp(entry.ts);
+            if (typeof id === "string" && ts) {
+              writeTsById.set(id, ts);
+            }
+          } else if (Array.isArray(entry.o?.applyOps)) {
+            const ts = fromBsonTimestamp(entry.ts);
+            for (const sub of entry.o.applyOps) {
+              if (
+                sub.op === "i" &&
+                sub.ns === "f15skew.events" &&
+                typeof sub.o?._id === "string" &&
+                ts
+              ) {
+                writeTsById.set(sub.o._id, ts);
+              }
+            }
+          }
         }
 
         await client.db("f15skew").dropDatabase();

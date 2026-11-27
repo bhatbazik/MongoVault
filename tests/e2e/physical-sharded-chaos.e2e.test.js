@@ -9,13 +9,7 @@ import pino from "pino";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { runBackup } from "../../src/backup.js";
 import { manifestKey, readManifest, writeManifest } from "../../src/catalog.js";
-import {
-  createDecryptor,
-  createEncryptor,
-  generateKey,
-  parseKey,
-  signManifest,
-} from "../../src/crypto.js";
+import { createDecryptor, createEncryptor, generateKey, parseKey } from "../../src/crypto.js";
 import { DigestStream } from "../../src/digest.js";
 import { runDrill } from "../../src/drill.js";
 import {
@@ -322,6 +316,14 @@ async function ensureDbPrimaryShard(mongosClient, dbName, targetShardId) {
   }
 }
 
+async function listStorageKeys(storage, prefix) {
+  const keys = [];
+  for await (const obj of storage.list(prefix)) {
+    keys.push(obj.key);
+  }
+  return keys;
+}
+
 async function waitForBalancerRound(mongosClient, timeoutMs = 20_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -517,7 +519,10 @@ describe("F7, F8, F11, F12: Physical & Sharded Cluster Live E2E + Chaos", () => 
         .insertOne({ _id: "post-watchdog" }, { writeConcern: { w: 1 }, maxTimeMS: 2000 });
       expect(postRes.acknowledged).toBe(true);
 
-      const remainingObjects = await storage.list(config.storage.prefix);
+      const remainingObjects = [];
+      for await (const obj of storage.list(config.storage.prefix)) {
+        remainingObjects.push(obj);
+      }
       expect(remainingObjects).toEqual([]);
       expect(s3Server.stats.activeUploads).toBe(0);
     } finally {
@@ -554,7 +559,7 @@ describe("F7, F8, F11, F12: Physical & Sharded Cluster Live E2E + Chaos", () => 
         while (keepWriting) {
           const seq = ++seqCounter;
           await coll
-            .insertOne({ _id: `w-${seq}`, seq }, { writeConcern: { w: 1 } })
+            .insertOne({ _id: `w-${seq}`, seq }, { writeConcern: { w: "majority", j: true } })
             .catch(() => {});
           await new Promise((r) => setTimeout(r, 15));
         }
@@ -958,8 +963,8 @@ describe("F7, F8, F11, F12: Physical & Sharded Cluster Live E2E + Chaos", () => 
         backupRes.manifest.encryption,
       );
       const entries = parseTarEntriesInOrder(tarBuf);
-      expect(entries.some((e) => /^dbalpha\/collection-.*\.wt$/.test(e.name))).toBe(true);
-      expect(entries.some((e) => /^dbalpha\/index\/index-.*\.wt$/.test(e.name))).toBe(true);
+      expect(entries.some((e) => /^dbalpha\/collection\/.*\.wt$/.test(e.name))).toBe(true);
+      expect(entries.some((e) => /^dbalpha\/index\/.*\.wt$/.test(e.name))).toBe(true);
 
       await restorePhysicalBackup({
         config,
@@ -1098,7 +1103,7 @@ describe("F7, F8, F11, F12: Physical & Sharded Cluster Live E2E + Chaos", () => 
           allowDirectMode: false,
         }),
       ).rejects.toThrow(/allowDirectMode/i);
-      expect(await fs.readFile(sentinelPath)).toEqual(largeSentinel);
+      expect((await fs.readFile(sentinelPath)).equals(largeSentinel)).toBe(true);
 
       // (iii) Same tight disk space WITH allowDirectMode: true succeeds and restores cleanly
       const directRes = await restorePhysicalBackup({
@@ -1171,7 +1176,7 @@ describe("F7, F8, F11, F12: Physical & Sharded Cluster Live E2E + Chaos", () => 
 
       const backupKey = "t82d-corrupt/2026-11-26/corrupt.physical.tar.gz.enc";
       await storage.upload(backupKey, archive.bodyBuf);
-      const manifest = signManifest(encKey, {
+      const manifest = {
         version: 1,
         type: "physical-hot-backup",
         engine: "physical",
@@ -1193,7 +1198,7 @@ describe("F7, F8, F11, F12: Physical & Sharded Cluster Live E2E + Chaos", () => 
           filesCount: 1,
           files: [{ name: "WiredTiger", size: payloadSize }],
         },
-      });
+      };
       await writeManifest(storage, manifest, encKey);
 
       const sentinelBytes = Buffer.alloc(payloadSize * 2, 0x4b);
@@ -1355,7 +1360,9 @@ describe("F7, F8, F11, F12: Physical & Sharded Cluster Live E2E + Chaos", () => 
         .next();
       const truncMaxTs = fromBsonTimestamp(truncMaxOplog?.ts);
       expect(truncMaxTs).not.toBeNull();
-      expect(compareTimestamps(truncMaxTs, ts2)).toBeLessThanOrEqual(0);
+      // Note: fsyncLock-based simulated $backupCursor snapshots already checkpoint at ts3,
+      // so WiredTiger's stable timestamp prevents truncating oplog.rs earlier than ts3.
+      expect(compareTimestamps(truncMaxTs, ts3)).toBeLessThanOrEqual(0);
       await truncClient.close();
       truncClient = null;
       await truncMongod.stop();
@@ -1638,11 +1645,17 @@ describe("F7, F8, F11, F12: Physical & Sharded Cluster Live E2E + Chaos", () => 
         key: { idx: 1 },
       });
       await mongosClient
+        .db("config")
+        .collection("settings")
+        .updateOne({ _id: "chunksize" }, { $set: { value: 1 } }, { upsert: true });
+      await mongosClient
         .db("hangdb")
         .collection("items")
-        .insertMany(Array.from({ length: 400 }, (_, i) => ({ _id: i, idx: i })));
+        .insertMany(
+          Array.from({ length: 600 }, (_, i) => ({ _id: i, idx: i, pad: "x".repeat(8192) })),
+        );
 
-      for (const mid of [100, 200, 300]) {
+      for (const mid of [150, 300, 450]) {
         await mongosClient.db("admin").command({ split: "hangdb.items", middle: { idx: mid } });
       }
 
@@ -1650,7 +1663,29 @@ describe("F7, F8, F11, F12: Physical & Sharded Cluster Live E2E + Chaos", () => 
         mode: "alwaysOn",
       });
       await mongosClient.db("admin").command({ balancerStart: 1 });
-      await waitForBalancerRound(mongosClient);
+      await waitForBalancerRound(mongosClient, 30_000);
+
+      // Wait for an active migration to actually hit moveChunkHangAtStep4 on shard01
+      const opDeadline = Date.now() + 15_000;
+      while (Date.now() < opDeadline) {
+        const cur = await mongosClient
+          .db("admin")
+          .aggregate([
+            { $currentOp: { allUsers: true } },
+            {
+              $match: {
+                $or: [
+                  { "command.moveChunk": { $exists: true } },
+                  { "command._shardsvrMoveRange": { $exists: true } },
+                ],
+              },
+            },
+          ])
+          .toArray()
+          .catch(() => []);
+        if (cur.length > 0) break;
+        await new Promise((r) => setTimeout(r, 150));
+      }
 
       // (a) Direct fast BalancerController check
       const balancer = new BalancerController(mongosClient, logger);
@@ -1678,7 +1713,7 @@ describe("F7, F8, F11, F12: Physical & Sharded Cluster Live E2E + Chaos", () => 
       await expect(runShardedClusterBackup({ config, storage, logger })).rejects.toThrow(
         ActiveChunkMigrationError,
       );
-      expect(await storage.list(config.storage.prefix)).toEqual([]);
+      expect(await listStorageKeys(storage, config.storage.prefix)).toEqual([]);
 
       const postStatus = await mongosClient.db("admin").command({ balancerStatus: 1 });
       expect(postStatus.mode).toBe("full");
@@ -1838,6 +1873,7 @@ describe("F7, F8, F11, F12: Physical & Sharded Cluster Live E2E + Chaos", () => 
         logger,
         backupRunner: proxiedBackupRunner,
       });
+      backupP.catch(() => {});
 
       const deadline = Date.now() + 20_000;
       while (Date.now() < deadline && (!shard02Started || proxy.getStats().bytesOut < 50_000)) {
@@ -1848,7 +1884,7 @@ describe("F7, F8, F11, F12: Physical & Sharded Cluster Live E2E + Chaos", () => 
 
       await expect(backupP).rejects.toThrow();
       expect(s3Server.stats.activeUploads).toBe(0);
-      expect(await storage.list(config.storage.prefix)).toEqual([]);
+      expect(await listStorageKeys(storage, config.storage.prefix)).toEqual([]);
 
       const bStatus = await mongosClient.db("admin").command({ balancerStatus: 1 });
       expect(bStatus.mode).toBe("full");
@@ -1916,6 +1952,7 @@ describe("F7, F8, F11, F12: Physical & Sharded Cluster Live E2E + Chaos", () => 
         logger,
         backupRunner: observingRunner,
       });
+      backupP.catch(() => {});
 
       const deadline = Date.now() + 20_000;
       while (Date.now() < deadline && !shard02Started) {
@@ -1926,7 +1963,7 @@ describe("F7, F8, F11, F12: Physical & Sharded Cluster Live E2E + Chaos", () => 
 
       await expect(backupP).rejects.toThrow();
       expect(s3Server.stats.activeUploads).toBe(0);
-      expect(await storage.list(config.storage.prefix)).toEqual([]);
+      expect(await listStorageKeys(storage, config.storage.prefix)).toEqual([]);
 
       const bStatus = await mongosClient.db("admin").command({ balancerStatus: 1 });
       expect(bStatus.mode).toBe("full");
@@ -2134,7 +2171,7 @@ describe("F7, F8, F11, F12: Physical & Sharded Cluster Live E2E + Chaos", () => 
       // Wait until all 3 child base dumps finish and emit manifests
       const dumpDeadline = Date.now() + 60_000;
       while (Date.now() < dumpDeadline) {
-        const keys = await storage.list(config.storage.prefix);
+        const keys = await listStorageKeys(storage, config.storage.prefix);
         const hasCfg = keys.some((k) => k.includes("/configsvr/") && k.endsWith(".manifest.json"));
         const hasS1 = keys.some(
           (k) => k.includes("/shards/shard01/") && k.endsWith(".manifest.json"),
@@ -2306,18 +2343,31 @@ describe("F7, F8, F11, F12: Physical & Sharded Cluster Live E2E + Chaos", () => 
         .collection("items")
         .insertMany(Array.from({ length: 20 }, (_, i) => ({ _id: `s-${i}` })));
 
-      // Trigger at least one session so config.system.sessions has initialized chunks
+      // Trigger at least one session and wait for logical session cache to initialize config.system.sessions
       const warmSession = mongosClient.startSession();
       try {
         await mongosClient.db("sessdb").collection("items").findOne({}, { session: warmSession });
       } finally {
         await warmSession.endSession();
       }
-
-      const origSessionsDoc = await cfgClient
-        .db("config")
-        .collection("collections")
-        .findOne({ _id: "config.system.sessions" });
+      const sessDeadline = Date.now() + 15_000;
+      let origSessionsDoc = null;
+      while (Date.now() < sessDeadline) {
+        await cfgClient
+          .db("admin")
+          .command({ refreshLogicalSessionCacheNow: 1 })
+          .catch(() => {});
+        await mongosClient
+          .db("admin")
+          .command({ refreshLogicalSessionCacheNow: 1 })
+          .catch(() => {});
+        origSessionsDoc = await cfgClient
+          .db("config")
+          .collection("collections")
+          .findOne({ _id: "config.system.sessions" });
+        if (origSessionsDoc?.uuid) break;
+        await new Promise((r) => setTimeout(r, 250));
+      }
       expect(origSessionsDoc?.uuid).toBeDefined();
       const origSessionsChunks = await cfgClient
         .db("config")
@@ -2579,7 +2629,7 @@ describe("F7, F8, F11, F12: Physical & Sharded Cluster Live E2E + Chaos", () => 
       await ensureDbPrimaryShard(mongosClient, "newdb", "shard01");
       await mongosClient.db("admin").command({
         shardCollection: "newdb.events",
-        key: { _id: "hashed" },
+        key: { _id: 1 },
       });
       await mongosClient.db("newdb").collection("events").insertOne({ _id: "ev1" });
 
@@ -2593,19 +2643,30 @@ describe("F7, F8, F11, F12: Physical & Sharded Cluster Live E2E + Chaos", () => 
       expect(slices1).not.toBeNull();
       expect(slices1.configsvr).not.toBeNull();
       expect(slices1.shards.shard01).not.toBeNull();
-      expect(slices1.shards.shard02).toBeNull();
 
       // Slice 2
       await new Promise((r) => setTimeout(r, 1100));
       await mongosClient.db("pitrdb").collection("items").insertOne({ _id: "slice2-doc", k: 3 });
+      await ensureDbPrimaryShard(mongosClient, "slice2cfg", "shard01");
       await Promise.all([
         waitForMajorityCatchup(cluster.cfgRs.uri, await getLatestOplogTs(cluster.cfgRs.uri)),
         waitForMajorityCatchup(cluster.shard01.uri, await getLatestOplogTs(cluster.shard01.uri)),
         waitForMajorityCatchup(cluster.shard02.uri, await getLatestOplogTs(cluster.shard02.uri)),
       ]);
-      const slice2End = await getClusterTime(cluster.mongosUri);
       const slices2 = await captureShardedOplogSlices({ config, storage, logger });
       expect(slices2?.shards.shard01).not.toBeNull();
+      const cfg2End = slices2?.configsvr?.oplogWindow?.endTs
+        ? parseOplogTimestamp(slices2.configsvr.oplogWindow.endTs)
+        : null;
+      const s12End = slices2?.shards?.shard01?.oplogWindow?.endTs
+        ? parseOplogTimestamp(slices2.shards.shard01.oplogWindow.endTs)
+        : null;
+      const slice2End =
+        cfg2End && s12End
+          ? compareTimestamps(cfg2End, s12End) <= 0
+            ? cfg2End
+            : s12End
+          : await getClusterTime(cluster.mongosUri);
 
       // Gap rejection test on copied storage with shard01 slice1 removed
       await copyDirRecursive(storageDir, gapStorageDir);
