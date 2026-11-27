@@ -22,6 +22,11 @@ function buildChildEnv(extraEnv = {}, workDir, clockSkewMs) {
     PATH: currentPath.startsWith(nodeDir) ? currentPath : `${nodeDir}:${currentPath}`,
     WORK_DIR: extraEnv.WORK_DIR ?? workDir,
   };
+  for (const [k, v] of Object.entries(extraEnv)) {
+    if (v === undefined && k !== "WORK_DIR") {
+      delete env[k];
+    }
+  }
   if (clockSkewMs !== undefined && clockSkewMs !== 0) {
     env.MONGOVAULT_CLOCK_SKEW_MS = String(clockSkewMs);
   }
@@ -151,12 +156,24 @@ export async function runCliCommand(
       );
     }
 
+    let json = null;
+    if (parseJson) {
+      try {
+        json = JSON.parse(stdout);
+      } catch (err) {
+        throw new Error(
+          `Failed to parse JSON stdout from "node dist/index.js ${args.join(" ")}" (exitCode=${exitCode}): ${err instanceof Error ? err.message : String(err)}\nstdout:\n${stdout}\nstderr:\n${stderr}`,
+          { cause: err },
+        );
+      }
+    }
+
     return {
       exitCode,
       signal,
       stdout,
       stderr,
-      json: parseJson ? JSON.parse(stdout) : null,
+      json,
       durationMs: Date.now() - startedAt,
     };
   } finally {
@@ -267,6 +284,11 @@ export async function startDaemon({
       return { status: res.status, text: await res.text() };
     },
     signal(sig = "SIGTERM") {
+      if (proc.exitCode === null && proc.signalCode === null) {
+        proc.kill(sig);
+      }
+    },
+    kill(sig = "SIGTERM") {
       if (proc.exitCode === null && proc.signalCode === null) {
         proc.kill(sig);
       }

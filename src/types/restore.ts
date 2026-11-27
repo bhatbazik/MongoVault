@@ -1,3 +1,4 @@
+import type { MongoClient } from "mongodb";
 import type { BackupManifest } from "./catalog.js";
 import type { AppConfig } from "./config.js";
 import type { Logger } from "./logger.js";
@@ -11,6 +12,7 @@ export interface RestoreContext {
   logger: Logger;
   signal?: AbortSignal;
   tools?: RestoreTools;
+  createMongoClient?: (uri: string) => MongoClient;
 }
 
 export interface RestoreOptions {

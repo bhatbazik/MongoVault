@@ -1,12 +1,18 @@
+import { randomUUID } from "node:crypto";
 import { PassThrough } from "node:stream";
-import { MongoClient } from "mongodb";
+import { MongoClient, type ReadPreferenceMode } from "mongodb";
 import { linkedController, settleAll } from "./abort.js";
 import { MANIFEST_VERSION, archiveKey, scopeOf, writeManifest } from "./catalog.js";
 import { createEncryptor } from "./crypto.js";
 import { DigestStream } from "./digest.js";
-import { formatOplogTimestamp, getOplogBounds } from "./oplog.js";
+import { compareTimestamps, formatOplogTimestamp, getOplogBounds } from "./oplog.js";
 import { runStreamPipeline } from "./stream.js";
-import { isClusterDatabase, mongodump } from "./tools.js";
+import {
+  isClusterDatabase,
+  mongodump,
+  uriHasReadPreference,
+  withUriReadPreference,
+} from "./tools.js";
 import type { BackupContext } from "./types/backup.js";
 import type {
   BackupManifest,
@@ -16,9 +22,75 @@ import type {
   SchemaIndexSpec,
   SchemaViewMeta,
 } from "./types/catalog.js";
+import type { Logger } from "./types/logger.js";
+import type { OplogTimestamp } from "./types/oplog.js";
 import type { BackupTools } from "./types/tools.js";
 
 const SYSTEM_DBS_FOR_SCHEMA = new Set(["admin", "local", "config"]);
+const PRE_BACKUP_QUERY_TIMEOUT_MS = 10_000;
+
+function abortErrorFromSignal(signal?: AbortSignal, fallbackMessage = "Backup aborted"): Error {
+  const reason = signal?.reason;
+  if (reason instanceof Error) return reason;
+  const err = new Error(reason ? String(reason) : fallbackMessage);
+  err.name = "AbortError";
+  return err;
+}
+
+function isLockLossError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const code = (err as { code?: unknown }).code;
+  if (code === "LOCK_LOST") return true;
+  const msg = (err as { message?: unknown }).message;
+  return (
+    typeof msg === "string" &&
+    /(?:lock.*lost|lost.*lock|fencing|lease.*(?:lost|expired))/i.test(msg)
+  );
+}
+
+function minTimestamp(
+  ...candidates: Array<OplogTimestamp | null | undefined>
+): OplogTimestamp | null {
+  let best: OplogTimestamp | null = null;
+  for (const ts of candidates) {
+    if (!ts) continue;
+    if (!best || compareTimestamps(ts, best) < 0) {
+      best = ts;
+    }
+  }
+  return best;
+}
+
+async function runClientWithAbort<T>(
+  client: MongoClient,
+  signal: AbortSignal | undefined,
+  fn: () => Promise<T>,
+): Promise<T> {
+  if (signal?.aborted) {
+    void client.close(true).catch(() => {});
+    throw abortErrorFromSignal(signal);
+  }
+  if (!signal) {
+    return fn();
+  }
+  let onAbort: (() => void) | undefined;
+  try {
+    return await Promise.race([
+      fn(),
+      new Promise<never>((_resolve, reject) => {
+        onAbort = () => {
+          void client.close(true).catch(() => {});
+          reject(abortErrorFromSignal(signal));
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+      }),
+    ]);
+  } finally {
+    if (onAbort) {
+      signal.removeEventListener("abort", onAbort);
+    }
+  }
+}
 
 function normalizeIndexSpec(raw: Record<string, unknown>): SchemaIndexSpec | null {
   if (typeof raw.name !== "string" || !raw.key || typeof raw.key !== "object") {
@@ -72,73 +144,108 @@ async function collectSchemaMetadata(
   uri: string,
   database: string,
   excludeCollections: string[] = [],
+  options?: {
+    readPreference?: string;
+    signal?: AbortSignal;
+    logger?: Logger;
+  },
 ): Promise<BackupSchemaMetadata | undefined> {
-  const client = new MongoClient(uri, { serverSelectionTimeoutMS: 5_000 });
+  const signal = options?.signal;
+  const logger = options?.logger;
+  if (signal?.aborted) {
+    throw abortErrorFromSignal(signal);
+  }
+  const client = new MongoClient(uri, {
+    serverSelectionTimeoutMS: 5_000,
+    socketTimeoutMS: PRE_BACKUP_QUERY_TIMEOUT_MS,
+    ...(!uriHasReadPreference(uri) && options?.readPreference
+      ? { readPreference: options.readPreference as ReadPreferenceMode }
+      : {}),
+  });
   const isCluster = isClusterDatabase(database);
   const excludedSet = new Set(excludeCollections);
 
   try {
-    await client.connect();
-    let dbNames: string[];
-    if (isCluster) {
-      const res = (await client.db("admin").command({ listDatabases: 1, nameOnly: true })) as {
-        databases?: Array<{ name?: string }>;
-      };
-      dbNames = (res.databases ?? [])
-        .map((d) => d.name)
-        .filter((n): n is string => Boolean(n) && !SYSTEM_DBS_FOR_SCHEMA.has(n!));
-    } else {
-      dbNames = [database];
-    }
-
-    const collections: Record<string, SchemaCollectionMeta> = {};
-    const views: SchemaViewMeta[] = [];
-
-    for (const dbName of dbNames) {
-      const db = client.db(dbName);
-      const infos = await db.listCollections({}, { nameOnly: false }).toArray();
-      for (const info of infos) {
-        const collName = info.name;
-        if (!collName || collName.startsWith("system.")) continue;
-        if (!isCluster && excludedSet.has(collName)) continue;
-
-        const key = isCluster ? `${dbName}.${collName}` : collName;
-        if (info.type === "view") {
-          const opts = (
-            info as { options?: { viewOn?: string; pipeline?: Record<string, unknown>[] } }
-          ).options;
-          if (opts?.viewOn) {
-            views.push({
-              name: key,
-              viewOn: opts.viewOn,
-              pipeline: Array.isArray(opts.pipeline) ? opts.pipeline : [],
-            });
-          }
-          continue;
-        }
-
-        const rawIndexes = await db
-          .collection(collName)
-          .indexes()
-          .catch(() => [] as Record<string, unknown>[]);
-        const indexes = rawIndexes
-          .map((idx) => normalizeIndexSpec(idx as Record<string, unknown>))
-          .filter((idx): idx is SchemaIndexSpec => idx !== null);
-        const options = extractCollectionOptions(
-          (info as { options?: Record<string, unknown> }).options,
-        );
-        collections[key] = {
-          indexes,
-          ...(options ? { options } : {}),
+    return await runClientWithAbort(client, signal, async () => {
+      await client.connect();
+      let dbNames: string[];
+      if (isCluster) {
+        const res = (await client
+          .db("admin")
+          .command(
+            { listDatabases: 1, nameOnly: true, maxTimeMS: PRE_BACKUP_QUERY_TIMEOUT_MS },
+            { timeoutMS: PRE_BACKUP_QUERY_TIMEOUT_MS },
+          )) as {
+          databases?: Array<{ name?: string }>;
         };
+        dbNames = (res.databases ?? [])
+          .map((d) => d.name)
+          .filter((n): n is string => Boolean(n) && !SYSTEM_DBS_FOR_SCHEMA.has(n!));
+      } else {
+        dbNames = [database];
       }
-    }
 
-    if (Object.keys(collections).length === 0 && views.length === 0) {
-      return undefined;
+      const collections: Record<string, SchemaCollectionMeta> = {};
+      const views: SchemaViewMeta[] = [];
+
+      for (const dbName of dbNames) {
+        if (signal?.aborted) {
+          throw abortErrorFromSignal(signal);
+        }
+        const db = client.db(dbName);
+        const infos = await db
+          .listCollections({}, { nameOnly: false, maxTimeMS: PRE_BACKUP_QUERY_TIMEOUT_MS })
+          .toArray();
+        for (const info of infos) {
+          if (signal?.aborted) {
+            throw abortErrorFromSignal(signal);
+          }
+          const collName = info.name;
+          if (!collName || collName.startsWith("system.")) continue;
+          if (!isCluster && excludedSet.has(collName)) continue;
+
+          const key = isCluster ? `${dbName}.${collName}` : collName;
+          if (info.type === "view") {
+            const opts = (
+              info as { options?: { viewOn?: string; pipeline?: Record<string, unknown>[] } }
+            ).options;
+            if (opts?.viewOn) {
+              views.push({
+                name: key,
+                viewOn: opts.viewOn,
+                pipeline: Array.isArray(opts.pipeline) ? opts.pipeline : [],
+              });
+            }
+            continue;
+          }
+
+          const rawIndexes = await db
+            .collection(collName)
+            .indexes()
+            .catch(() => [] as Record<string, unknown>[]);
+          const indexes = rawIndexes
+            .map((idx) => normalizeIndexSpec(idx as Record<string, unknown>))
+            .filter((idx): idx is SchemaIndexSpec => idx !== null);
+          const collOpts = extractCollectionOptions(
+            (info as { options?: Record<string, unknown> }).options,
+          );
+          collections[key] = {
+            indexes,
+            ...(collOpts ? { options: collOpts } : {}),
+          };
+        }
+      }
+
+      if (Object.keys(collections).length === 0 && views.length === 0) {
+        return undefined;
+      }
+      return { collections, views };
+    });
+  } catch (err) {
+    if (signal?.aborted || (err as { name?: string } | null)?.name === "AbortError") {
+      throw signal?.aborted ? abortErrorFromSignal(signal) : err;
     }
-    return { collections, views };
-  } catch {
+    logger?.warn({ err, database }, "Failed to collect pre-backup schema metadata");
     return undefined;
   } finally {
     await client.close().catch(() => {});
@@ -153,31 +260,63 @@ async function collectSchemaMetadata(
 async function estimateDatabaseSizeBytes(
   uri: string,
   database: string,
+  options?: {
+    readPreference?: string;
+    signal?: AbortSignal;
+    logger?: Logger;
+  },
 ): Promise<number | undefined> {
-  const client = new MongoClient(uri, { serverSelectionTimeoutMS: 5_000 });
+  const signal = options?.signal;
+  const logger = options?.logger;
+  if (signal?.aborted) {
+    throw abortErrorFromSignal(signal);
+  }
+  const client = new MongoClient(uri, {
+    serverSelectionTimeoutMS: 5_000,
+    socketTimeoutMS: PRE_BACKUP_QUERY_TIMEOUT_MS,
+    ...(!uriHasReadPreference(uri) && options?.readPreference
+      ? { readPreference: options.readPreference as ReadPreferenceMode }
+      : {}),
+  });
   try {
-    await client.connect();
-    if (isClusterDatabase(database)) {
-      const res = (await client.db("admin").command({ listDatabases: 1 })) as {
-        totalSize?: number;
-        databases?: Array<{ sizeOnDisk?: number }>;
+    return await runClientWithAbort(client, signal, async () => {
+      await client.connect();
+      if (isClusterDatabase(database)) {
+        const res = (await client
+          .db("admin")
+          .command(
+            { listDatabases: 1, maxTimeMS: PRE_BACKUP_QUERY_TIMEOUT_MS },
+            { timeoutMS: PRE_BACKUP_QUERY_TIMEOUT_MS },
+          )) as {
+          totalSize?: number;
+          databases?: Array<{ sizeOnDisk?: number }>;
+        };
+        if (typeof res.totalSize === "number" && res.totalSize > 0) {
+          return res.totalSize;
+        }
+        if (Array.isArray(res.databases)) {
+          const sum = res.databases.reduce((acc, d) => acc + (d.sizeOnDisk ?? 0), 0);
+          return sum > 0 ? sum : undefined;
+        }
+        return undefined;
+      }
+      const stats = (await client
+        .db(database)
+        .command(
+          { dbStats: 1, maxTimeMS: PRE_BACKUP_QUERY_TIMEOUT_MS },
+          { timeoutMS: PRE_BACKUP_QUERY_TIMEOUT_MS },
+        )) as {
+        dataSize?: number;
+        storageSize?: number;
       };
-      if (typeof res.totalSize === "number" && res.totalSize > 0) {
-        return res.totalSize;
-      }
-      if (Array.isArray(res.databases)) {
-        const sum = res.databases.reduce((acc, d) => acc + (d.sizeOnDisk ?? 0), 0);
-        return sum > 0 ? sum : undefined;
-      }
-      return undefined;
+      const size = stats.dataSize ?? stats.storageSize;
+      return typeof size === "number" && size > 0 ? size : undefined;
+    });
+  } catch (err) {
+    if (signal?.aborted || (err as { name?: string } | null)?.name === "AbortError") {
+      throw signal?.aborted ? abortErrorFromSignal(signal) : err;
     }
-    const stats = (await client.db(database).command({ dbStats: 1 })) as {
-      dataSize?: number;
-      storageSize?: number;
-    };
-    const size = stats.dataSize ?? stats.storageSize;
-    return typeof size === "number" && size > 0 ? size : undefined;
-  } catch {
+    logger?.warn({ err, database }, "Failed to estimate pre-backup database size");
     return undefined;
   } finally {
     await client.close().catch(() => {});
@@ -193,6 +332,7 @@ export async function runBackup({
   logger,
   signal,
   tools,
+  assertLockValid,
 }: BackupContext): Promise<BackupManifest> {
   const effectiveTools: BackupTools = tools ?? { mongodump, getOplogBounds };
   const startedAt = new Date();
@@ -202,9 +342,30 @@ export async function runBackup({
       "Refusing to create unencrypted backup: REQUIRE_ENCRYPTION is enabled but ENCRYPTION_KEY is not configured",
     );
   }
-  const key = archiveKey(scopeOf(config), startedAt, { encrypted });
+  const key = archiveKey(scopeOf(config), startedAt, {
+    encrypted,
+    suffix: randomUUID().slice(0, 8),
+  });
   const log = logger.child({ key });
   const controller = linkedController(signal);
+  let lockLost = false;
+
+  const assertActive = () => {
+    if (assertLockValid) {
+      try {
+        assertLockValid();
+      } catch (err) {
+        lockLost = true;
+        throw err;
+      }
+    }
+    if (controller.signal.aborted) {
+      if (isLockLossError(controller.signal.reason)) {
+        lockLost = true;
+      }
+      throw abortErrorFromSignal(controller.signal);
+    }
+  };
 
   if (!encrypted) {
     log.warn(
@@ -214,10 +375,11 @@ export async function runBackup({
   log.info({ database: config.mongo.database, encrypted }, "Backup started");
 
   try {
+    const oplogUri = withUriReadPreference(config.mongo.uri, config.mongo.readPreference);
     const requireOplogBounds = Boolean(config.pitr?.enabled);
     const [preOplog, expectedSizeBytes, schemaMetadata] = await Promise.all([
       config.mongo.oplog && effectiveTools.getOplogBounds
-        ? effectiveTools.getOplogBounds(config.mongo.uri, { phase: "pre" }).catch((err) => {
+        ? effectiveTools.getOplogBounds(oplogUri, { phase: "pre" }).catch((err) => {
             if (requireOplogBounds) {
               throw new Error(
                 `Failed to determine pre-backup oplog boundary for PITR-enabled backup: ${err instanceof Error ? err.message : String(err)}`,
@@ -228,16 +390,27 @@ export async function runBackup({
           })
         : Promise.resolve(null),
       !tools
-        ? estimateDatabaseSizeBytes(config.mongo.uri, config.mongo.database)
+        ? estimateDatabaseSizeBytes(config.mongo.uri, config.mongo.database, {
+            readPreference: config.mongo.readPreference,
+            signal: controller.signal,
+            logger: log,
+          })
         : Promise.resolve(undefined),
       !tools
         ? collectSchemaMetadata(
             config.mongo.uri,
             config.mongo.database,
             config.mongo.excludeCollections,
+            {
+              readPreference: config.mongo.readPreference,
+              signal: controller.signal,
+              logger: log,
+            },
           )
         : Promise.resolve(undefined),
     ]);
+
+    assertActive();
 
     const dump = await effectiveTools.mongodump({
       uri: config.mongo.uri,
@@ -264,23 +437,24 @@ export async function runBackup({
       const hasTapBounds = res.oplogEndTs !== undefined || res.oplogEntries !== undefined;
       const dumpEndOplog =
         !hasTapBounds && config.mongo.oplog && effectiveTools.getOplogBounds
-          ? await effectiveTools
-              .getOplogBounds(config.mongo.uri, { phase: "post" })
-              .catch((err) => {
-                if (requireOplogBounds) {
-                  throw new Error(
-                    `Failed to determine post-backup oplog boundary for PITR-enabled backup: ${err instanceof Error ? err.message : String(err)}`,
-                  );
-                }
-                log.warn({ err }, "Failed to determine post-backup oplog boundary");
-                return null;
-              })
+          ? await effectiveTools.getOplogBounds(oplogUri, { phase: "post" }).catch((err) => {
+              if (requireOplogBounds) {
+                throw new Error(
+                  `Failed to determine post-backup oplog boundary for PITR-enabled backup: ${err instanceof Error ? err.message : String(err)}`,
+                );
+              }
+              log.warn({ err }, "Failed to determine post-backup oplog boundary");
+              return null;
+            })
           : null;
       return {
         collections: res.collections,
         oplogStartTs: res.oplogStartTs,
         oplogEndTs: res.oplogEndTs,
         oplogEntries: res.oplogEntries,
+        validArchive: res.validArchive,
+        archiveTerminated: res.archiveTerminated,
+        archiveBytes: res.archiveBytes,
         dumpEndOplog,
       };
     });
@@ -296,6 +470,22 @@ export async function runBackup({
       runStreamPipeline(stages, { signal: controller.signal }),
     ]);
 
+    if (
+      config.mongo.oplog &&
+      (dumpSummary.validArchive !== undefined || dumpSummary.archiveTerminated !== undefined)
+    ) {
+      const hasNonEmptyArchive =
+        dumpSummary.archiveBytes !== undefined ? dumpSummary.archiveBytes > 0 : digest.bytes > 0;
+      if (
+        hasNonEmptyArchive &&
+        (dumpSummary.validArchive !== true || dumpSummary.archiveTerminated !== true)
+      ) {
+        throw new Error(
+          "mongodump produced a corrupt or truncated archive stream; oplog bounds cannot be trusted",
+        );
+      }
+    }
+
     const { collections, dumpEndOplog } = dumpSummary;
 
     if (Object.keys(collections).length === 0) {
@@ -305,6 +495,7 @@ export async function runBackup({
       );
     }
 
+    assertActive();
     const stored = await storage.head(key);
     if (stored?.size !== digest.bytes) {
       throw new Error(
@@ -314,21 +505,22 @@ export async function runBackup({
 
     const completedAt = new Date();
     // Exact embedded oplog bounds from ArchiveOplogTap prevent post-dump timeline gaps:
-    // - If embedded oplog has >= 1 entry: endTs = exact last embedded oplog entry.
+    // - If embedded oplog has >= 1 entry: endTs = exact last embedded oplog entry,
+    //   and startTs = min(preOplog.newestTs, dumpSummary.oplogStartTs, endTs).
     // - If ArchiveOplogTap saw 0 embedded entries (quiet dump): endTs = preOplog.newestTs (never postOplog > dumpEnd).
     // - Otherwise (mocked tool without tap): fall back to dumpEndOplog?.newestTs ?? preOplog?.newestTs.
     let oplogEndTs = dumpSummary.oplogEndTs ?? null;
-    let oplogStartTs = dumpSummary.oplogStartTs ?? null;
+    let oplogStartTs: OplogTimestamp | null;
     if (!oplogEndTs) {
       if (dumpSummary.oplogEntries === 0) {
         oplogEndTs = preOplog?.newestTs ?? null;
-        oplogStartTs = preOplog?.newestTs ?? null;
+        oplogStartTs = oplogEndTs;
       } else {
         oplogEndTs = dumpEndOplog?.newestTs ?? preOplog?.newestTs ?? null;
-        oplogStartTs = preOplog?.newestTs ?? oplogEndTs;
+        oplogStartTs = minTimestamp(preOplog?.newestTs, dumpSummary.oplogStartTs, oplogEndTs);
       }
-    } else if (!oplogStartTs) {
-      oplogStartTs = preOplog?.newestTs ?? oplogEndTs;
+    } else {
+      oplogStartTs = minTimestamp(preOplog?.newestTs, dumpSummary.oplogStartTs, oplogEndTs);
     }
 
     const oplogWindow = oplogEndTs
@@ -363,6 +555,7 @@ export async function runBackup({
       ...(schemaMetadata ? { schema: schemaMetadata } : {}),
     };
 
+    assertActive();
     await writeManifest(storage, manifest, config.encryptionKey);
 
     log.info(
@@ -375,9 +568,15 @@ export async function runBackup({
     );
     return manifest;
   } catch (error) {
-    await storage.remove(key).catch((cleanupError) => {
-      log.warn({ err: cleanupError }, "Could not remove partial upload");
-    });
+    const abortedByLockLoss =
+      lockLost || isLockLossError(controller.signal.reason) || isLockLossError(error);
+    if (!abortedByLockLoss) {
+      await storage.remove(key).catch((cleanupError) => {
+        log.warn({ err: cleanupError }, "Could not remove partial upload");
+      });
+    } else {
+      log.warn({ key }, "Skipping partial upload cleanup because backup lock was lost");
+    }
     throw error;
   } finally {
     controller.dispose();

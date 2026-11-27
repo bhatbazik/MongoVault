@@ -605,11 +605,12 @@ export class FilesystemStorageClient implements StorageClient {
     const { token, record } = createLockRecord(holder, ttlMs);
     const content = JSON.stringify(record, null, 2);
 
-    if (await this.writeLockExclusive(dest, content)) {
-      return token;
-    }
-
     return withFileLockMutex(dest, async (assertHeld) => {
+      assertHeld();
+      if (await this.writeLockExclusive(dest, content)) {
+        return token;
+      }
+
       const state = await this.readLockState(dest);
       if (state.exists) {
         if (state.corrupt) {

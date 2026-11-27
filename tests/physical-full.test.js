@@ -228,6 +228,7 @@ describe("Physical Backup & Recovery (physical.ts full coverage)", () => {
         storage,
         logger,
         targetDbPath: dstDb,
+        allowDirectMode: true,
         skipRecovery: true,
       });
 

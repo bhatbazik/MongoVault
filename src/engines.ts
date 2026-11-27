@@ -1,4 +1,5 @@
 import { runBackup } from "./backup.js";
+import { isClusterScope } from "./catalog.js";
 import { runPhysicalBackup, restorePhysicalBackup } from "./physical.js";
 import { restoreBackup } from "./restore.js";
 import { runShardedClusterBackup, restoreShardedCluster } from "./sharding.js";
@@ -56,6 +57,11 @@ export class LogicalBackupEngine implements BackupEngineStrategy {
   }
 
   async restore(options: RestoreEngineOptions): Promise<unknown> {
+    if (options.dbPath) {
+      throw new Error(
+        "Logical restore does not support --db-path; use the physical engine instead",
+      );
+    }
     const targetUri = options.uri || options.config.mongo.uri;
     return restoreBackup(
       {
@@ -99,6 +105,17 @@ export class PhysicalBackupEngine implements BackupEngineStrategy {
   }
 
   async restore(options: RestoreEngineOptions): Promise<unknown> {
+    if (
+      options.nsInclude ||
+      options.nsExclude ||
+      options.database ||
+      options.oplogReplay !== undefined ||
+      options.oplogLimit
+    ) {
+      throw new Error(
+        "Physical restore does not support namespace filters, --database, --oplog-replay, or --oplog-limit",
+      );
+    }
     if (!options.dbPath) {
       throw new Error("Target WiredTiger dbPath (--db-path) is required for physical restore");
     }
@@ -132,6 +149,18 @@ export class ShardedBackupEngine implements BackupEngineStrategy {
   }
 
   async restore(options: RestoreEngineOptions): Promise<unknown> {
+    if (
+      options.dbPath ||
+      options.nsInclude ||
+      options.nsExclude ||
+      (options.database && !isClusterScope(options.database)) ||
+      options.oplogReplay !== undefined ||
+      options.oplogLimit
+    ) {
+      throw new Error(
+        "Sharded cluster restore does not support --db-path, selective namespace filters, --oplog-replay, or --oplog-limit",
+      );
+    }
     return restoreShardedCluster({
       config: options.config,
       storage: options.storage,
@@ -140,6 +169,7 @@ export class ShardedBackupEngine implements BackupEngineStrategy {
       pitr: options.pitr,
       signal: options.signal,
       drop: options.drop,
+      preVerify: options.preVerify,
     });
   }
 }
@@ -177,7 +207,13 @@ export class EngineRegistry {
     config: AppConfig;
   }): BackupEngineStrategy {
     if (params.engine) {
-      return this.get(params.engine);
+      const engine = this.get(params.engine);
+      if ((params.sharding || params.config.sharding?.enabled) && params.engine !== "sharded") {
+        throw new Error(
+          `Conflicting backup options: explicit engine "${params.engine}" cannot be used with sharding enabled`,
+        );
+      }
+      return engine;
     }
     if (params.sharding || params.config.sharding?.enabled) {
       return this.get("sharded");
@@ -195,21 +231,57 @@ export class EngineRegistry {
     sharding?: boolean;
     config: AppConfig;
   }): BackupEngineStrategy {
-    if (
-      params.dbPath ||
-      params.engine === "physical" ||
-      /\.physical\.tar\.gz(\.enc)?$/.test(params.key || "")
-    ) {
+    const key = params.key || "";
+    const keyIsPhysical = /\.physical\.tar\.gz(\.enc)?$/.test(key);
+    const keyIsSharded = /\.cluster(\.enc)?$/.test(key);
+    const keyIsLogical = /\.archive\.gz(\.enc)?$/.test(key);
+
+    if (params.engine) {
+      const engine = this.get(params.engine);
+      if (params.engine !== "physical" && (params.dbPath || keyIsPhysical)) {
+        throw new Error(
+          `Conflicting restore options: explicit engine "${params.engine}" is incompatible with physical restore target/archive`,
+        );
+      }
+      if (params.engine !== "sharded" && (params.sharding || keyIsSharded)) {
+        throw new Error(
+          `Conflicting restore options: explicit engine "${params.engine}" is incompatible with sharded restore target/archive`,
+        );
+      }
+      if (params.engine !== "logical" && keyIsLogical) {
+        throw new Error(
+          `Conflicting restore options: explicit engine "${params.engine}" is incompatible with logical archive key "${key}"`,
+        );
+      }
+      return engine;
+    }
+
+    if (params.dbPath && params.sharding) {
+      throw new Error("Conflicting restore options: --db-path and --sharding cannot both be set");
+    }
+    if (params.dbPath && (keyIsSharded || keyIsLogical)) {
+      throw new Error(
+        `Conflicting restore options: --db-path is incompatible with non-physical archive key "${key}"`,
+      );
+    }
+    if (params.sharding && (keyIsPhysical || keyIsLogical)) {
+      throw new Error(
+        `Conflicting restore options: --sharding is incompatible with non-sharded archive key "${key}"`,
+      );
+    }
+
+    if (keyIsPhysical || params.dbPath) {
       return this.get("physical");
     }
-    if (
-      params.sharding ||
-      params.engine === "sharded" ||
-      /\.cluster(\.enc)?$/.test(params.key || "") ||
-      params.config.sharding?.enabled
-    ) {
+    if (keyIsSharded || params.sharding) {
       return this.get("sharded");
     }
-    return this.get(params.engine || params.config.engine || "logical");
+    if (keyIsLogical) {
+      return this.get("logical");
+    }
+    if (params.config.sharding?.enabled) {
+      return this.get("sharded");
+    }
+    return this.get(params.config.engine || "logical");
   }
 }

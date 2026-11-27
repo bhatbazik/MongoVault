@@ -157,23 +157,27 @@ export async function acquireLock(
     return releaseFn;
   };
 
-  if (await writeLockExclusiveLocal(file, JSON.stringify(createPayload()))) {
-    return buildHandle();
-  }
+  const acquired = await withFileLockMutex(file, async (assertHeld) => {
+    assertHeld();
+    if (await writeLockExclusiveLocal(file, JSON.stringify(createPayload()))) {
+      return true;
+    }
 
-  const acquiredAfterTakeover = await withFileLockMutex(file, async (assertHeld) => {
-    if (!(await isStale(file, staleAfterMs))) {
+    const { stale, existed } = await checkLockStaleness(file, staleAfterMs);
+    if (!stale) {
       return false;
     }
 
-    assertHeld();
-    const tombstone = `${file}.stale.${randomUUID()}`;
-    try {
-      await fs.rename(file, tombstone);
-      await fs.rm(tombstone, { force: true });
-    } catch (err: unknown) {
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-        return false;
+    if (existed) {
+      assertHeld();
+      const tombstone = `${file}.stale.${randomUUID()}`;
+      try {
+        await fs.rename(file, tombstone);
+        await fs.rm(tombstone, { force: true });
+      } catch (err: unknown) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+          return false;
+        }
       }
     }
 
@@ -181,7 +185,7 @@ export async function acquireLock(
     return writeLockExclusiveLocal(file, JSON.stringify(createPayload()));
   });
 
-  return acquiredAfterTakeover ? buildHandle() : null;
+  return acquired ? buildHandle() : null;
 }
 
 export async function readLock(file: string): Promise<LockPayload | null> {
@@ -193,31 +197,37 @@ export async function readLock(file: string): Promise<LockPayload | null> {
 }
 
 async function release(file: string, token: string): Promise<void> {
-  await withFileLockMutex(file, async () => {
+  await withFileLockMutex(file, async (assertHeld) => {
     const owner = await readLock(file);
     if (owner?.token === token) {
+      assertHeld();
       await fs.rm(file, { force: true });
     }
   });
 }
 
-export async function isStale(file: string, staleAfterMs: number): Promise<boolean> {
+async function checkLockStaleness(
+  file: string,
+  staleAfterMs: number,
+): Promise<{ stale: boolean; existed: boolean }> {
   let stat;
   try {
     stat = await fs.stat(file);
   } catch (error: unknown) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { stale: true, existed: false };
+    }
     throw error;
   }
 
   const age = Date.now() - stat.mtimeMs;
   const owner = await readLock(file);
   if (!owner) {
-    return age > UNREADABLE_GRACE_MS;
+    return { stale: age > UNREADABLE_GRACE_MS, existed: true };
   }
 
   if (owner.hostname && owner.hostname !== os.hostname()) {
-    return age > staleAfterMs;
+    return { stale: age > staleAfterMs, existed: true };
   }
 
   if (owner.pid === process.pid) {
@@ -226,23 +236,27 @@ export async function isStale(file: string, staleAfterMs: number): Promise<boole
       owner.instanceId !== PROCESS_INSTANCE_ID &&
       !activeLocalTokens.has(owner.token)
     ) {
-      return true;
+      return { stale: true, existed: true };
     }
-    return age > staleAfterMs;
+    return { stale: age > staleAfterMs, existed: true };
   }
 
   if (!isAlive(owner.pid)) {
-    return true;
+    return { stale: true, existed: true };
   }
 
   if (owner.pidStartTime) {
     const currentStart = await getLinuxPidStartTime(owner.pid);
     if (currentStart !== undefined && currentStart !== owner.pidStartTime) {
-      return true;
+      return { stale: true, existed: true };
     }
   }
 
-  return age > staleAfterMs;
+  return { stale: age > staleAfterMs, existed: true };
+}
+
+export async function isStale(file: string, staleAfterMs: number): Promise<boolean> {
+  return (await checkLockStaleness(file, staleAfterMs)).stale;
 }
 
 function isAlive(pid: number): boolean {

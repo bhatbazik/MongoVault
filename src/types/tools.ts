@@ -47,6 +47,9 @@ export interface MongodumpResult {
     oplogStartTs?: { t: number; i: number } | null;
     oplogEndTs?: { t: number; i: number } | null;
     oplogEntries?: number;
+    validArchive?: boolean;
+    archiveTerminated?: boolean;
+    archiveBytes?: number;
   }>;
 }
 

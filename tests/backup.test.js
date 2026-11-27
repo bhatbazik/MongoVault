@@ -88,7 +88,7 @@ describe("Logical Backup Runner (backup.ts)", () => {
     });
 
     expect(manifest.encryption).not.toBeNull();
-    expect(manifest.oplogWindow).toEqual({ startTs: "201:1", endTs: "205:2", entries: 5 });
+    expect(manifest.oplogWindow).toEqual({ startTs: "200:1", endTs: "205:2", entries: 5 });
     expect(storage.jsons.size).toBe(1);
   });
 

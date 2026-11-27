@@ -73,9 +73,10 @@ describe("POSIX UStar / PAX TAR streamer (tar.ts full coverage)", () => {
       const payload = Buffer.alloc(512, 0);
       payload.write("123", 0, "utf8");
       const evilStream = Readable.from([Buffer.concat([evilHdr, payload, Buffer.alloc(1024, 0)])]);
-      const res = await extractTarStream(evilStream, path.join(workDir, "out"));
-      expect(res.extractedCount).toBe(1);
-      expect(await fs.readFile(path.join(workDir, "out", "etc", "passwd"), "utf8")).toBe("123");
+      await expect(extractTarStream(evilStream, path.join(workDir, "out"))).rejects.toThrow(
+        /escapes target directory/i,
+      );
+      await expect(fs.stat(path.join(workDir, "out", "etc", "passwd"))).rejects.toThrow();
 
       const ac = new AbortController();
       ac.abort(new Error("cancelled"));

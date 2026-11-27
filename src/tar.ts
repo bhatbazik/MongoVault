@@ -139,27 +139,59 @@ function buildPaxExtendedHeader(cleanName: string, mtime: number): Buffer {
     : Buffer.concat([paxHeader, payload]);
 }
 
-function parsePaxPath(payload: Buffer): string | null {
+interface PaxHeaders {
+  path?: string;
+  size?: number;
+}
+
+function parsePaxHeaders(payload: Buffer): PaxHeaders {
+  const result: PaxHeaders = {};
   let offset = 0;
   while (offset < payload.length) {
     const spaceIdx = payload.indexOf(0x20, offset);
-    if (spaceIdx === -1) break;
-    const recLen = parseInt(payload.toString("ascii", offset, spaceIdx), 10);
-    if (!Number.isFinite(recLen) || recLen <= 0 || offset + recLen > payload.length) {
-      break;
+    if (spaceIdx === -1) {
+      throw new Error("Corrupted tar PAX header: missing record length delimiter");
     }
-    const record = payload.toString("utf8", spaceIdx + 1, offset + recLen - 1);
+    const lenStr = payload.toString("ascii", offset, spaceIdx);
+    if (!/^\d+$/.test(lenStr)) {
+      throw new Error(`Corrupted tar PAX header: invalid record length "${lenStr}"`);
+    }
+    const recLen = Number(lenStr);
+    const minPrefixLen = spaceIdx - offset + 1;
+    if (
+      !Number.isSafeInteger(recLen) ||
+      recLen <= minPrefixLen ||
+      offset + recLen > payload.length
+    ) {
+      throw new Error(
+        `Corrupted tar PAX header: record length ${lenStr} out of bounds (offset=${offset}, payloadLength=${payload.length})`,
+      );
+    }
+    if (payload[offset + recLen - 1] !== 0x0a) {
+      throw new Error("Corrupted tar PAX header: record missing trailing newline");
+    }
+    const recordEnd = offset + recLen - 1;
+    const record = payload.toString("utf8", spaceIdx + 1, recordEnd);
     const eqIdx = record.indexOf("=");
     if (eqIdx > 0) {
       const key = record.slice(0, eqIdx);
       const value = record.slice(eqIdx + 1);
       if (key === "path") {
-        return value;
+        result.path = value;
+      } else if (key === "size") {
+        if (!/^\d+$/.test(value)) {
+          throw new Error(`Invalid PAX size value: "${value}"`);
+        }
+        const parsedSize = Number(value);
+        if (!Number.isSafeInteger(parsedSize) || parsedSize < 0) {
+          throw new Error(`PAX size out of safe integer range: "${value}"`);
+        }
+        result.size = parsedSize;
       }
     }
     offset += recLen;
   }
-  return null;
+  return result;
 }
 
 /**
@@ -213,9 +245,12 @@ async function writeAll(fh: fs.FileHandle, data: Buffer): Promise<void> {
 export async function* generateTarStream(
   files: TarEntry[],
   signal?: AbortSignal,
-  options: { includeEof?: boolean } = {},
+  options: {
+    includeEof?: boolean;
+    onEntrySize?: (entry: TarEntry, actualSize: number) => void;
+  } = {},
 ): AsyncGenerator<Buffer, void, unknown> {
-  const { includeEof = true } = options;
+  const { includeEof = true, onEntrySize } = options;
   for (const file of files) {
     if (signal?.aborted) {
       throw makeAbortError(signal.reason);
@@ -231,6 +266,7 @@ export async function* generateTarStream(
       );
     }
     const expectedSize = stat.size;
+    onEntrySize?.(file, expectedSize);
     const headerBlock = createTarHeaderBlock(file.name, expectedSize, stat.mtimeMs);
     yield headerBlock;
 
@@ -295,24 +331,32 @@ export function createTarPackStream(files: TarEntry[], signal?: AbortSignal): Re
  * Extracts a streaming POSIX tar archive safely to targetDir with path traversal guards,
  * PAX extended path support, full short-write handling, and truncation detection.
  */
-export async function extractTarStream(
+async function processTarStream(
   stream: Readable,
-  targetDir: string,
+  targetDir: string | null,
   signal?: AbortSignal,
 ): Promise<TarExtractResult> {
-  await fs.mkdir(targetDir, { recursive: true });
-  const resolvedRoot = path.resolve(targetDir);
+  const dryRun = targetDir === null;
+  let resolvedRoot: string | null = null;
+  if (!dryRun) {
+    await fs.mkdir(targetDir, { recursive: true });
+    resolvedRoot = path.resolve(targetDir);
+  }
 
   let buffer = Buffer.alloc(0);
-  let currentHeader: { name: string; size: number; isPax: boolean } | null = null;
+  let currentHeader: {
+    name: string;
+    size: number;
+    kind: "file" | "pax" | "pax-global";
+  } | null = null;
   let remainingBytes = 0;
   let remainingPad = 0;
   let currentFileHandle: fs.FileHandle | null = null;
   let paxChunks: Buffer[] = [];
-  let pendingPaxPath: string | null = null;
+  let pendingPax: PaxHeaders | null = null;
   let extractedCount = 0;
   let totalBytes = 0;
-  let sawEof = false;
+  let zeroBlocks = 0;
 
   try {
     for await (const chunk of stream) {
@@ -335,11 +379,22 @@ export async function extractTarStream(
           const headerBuf = buffer.subarray(0, 512);
           buffer = buffer.subarray(512);
 
-          // Check for 512-byte zero block (end-of-archive indicator)
+          // Check for 512-byte zero block (end-of-archive indicator: POSIX requires 2 blocks)
           const isZero = headerBuf.every((b) => b === 0);
           if (isZero) {
-            sawEof = true;
+            if (pendingPax !== null) {
+              throw new Error(
+                "Truncated tar archive: dangling PAX extended header before end-of-archive",
+              );
+            }
+            zeroBlocks++;
             continue;
+          }
+
+          if (zeroBlocks > 0) {
+            throw new Error(
+              "Corrupted tar archive: unexpected non-zero block after end-of-archive marker",
+            );
           }
 
           // Verify tar header checksum (bytes 148..156 treated as ASCII spaces)
@@ -360,66 +415,137 @@ export async function extractTarStream(
           let size: number;
           if ((headerBuf[124]! & 0x80) !== 0) {
             // GNU base-256 encoded size
+            if ((headerBuf[124]! & 0x40) !== 0) {
+              throw new Error("Corrupted tar header: invalid entry size (negative base-256)");
+            }
             let bigSize = BigInt(headerBuf[124]! & 0x7f);
             for (let i = 125; i < 136; i++) {
               bigSize = (bigSize << 8n) | BigInt(headerBuf[i]!);
             }
+            if (bigSize > BigInt(Number.MAX_SAFE_INTEGER)) {
+              throw new Error(
+                "Corrupted tar header: invalid entry size (exceeds MAX_SAFE_INTEGER)",
+              );
+            }
             size = Number(bigSize);
           } else {
-            const rawSize = headerBuf.toString("ascii", 124, 136).replace(/\0.*$/, "").trim();
-            size = parseInt(rawSize, 8) || 0;
+            const rawSize = headerBuf
+              .toString("ascii", 124, 136)
+              .replace(/[\0 ]+$/g, "")
+              .trim();
+            if (rawSize.length === 0) {
+              size = 0;
+            } else {
+              if (!/^[0-7]+$/.test(rawSize)) {
+                throw new Error(`Corrupted tar header: invalid octal size "${rawSize}"`);
+              }
+              size = parseInt(rawSize, 8);
+            }
+          }
+          if (!Number.isSafeInteger(size) || size < 0) {
+            throw new Error(`Corrupted tar header: invalid entry size (${size})`);
           }
 
           if (typeflag === "x") {
             if (size > MAX_PAX_PAYLOAD_BYTES) {
               throw new Error(`PAX extended header exceeds safety limit (${size} bytes)`);
             }
-            currentHeader = { name: "", size, isPax: true };
+            currentHeader = { name: "", size, kind: "pax" };
             remainingBytes = size;
             paxChunks = [];
             continue;
           }
 
+          if (typeflag === "g") {
+            if (size > MAX_PAX_PAYLOAD_BYTES) {
+              throw new Error(`PAX global header exceeds safety limit (${size} bytes)`);
+            }
+            if (size > 0) {
+              currentHeader = { name: "", size, kind: "pax-global" };
+              remainingBytes = size;
+            }
+            continue;
+          }
+
           const baseName = headerBuf.toString("utf8", 0, 100).replace(/\0.*$/, "").trim();
           const ustarPrefix = headerBuf.toString("utf8", 345, 500).replace(/\0.*$/, "").trim();
-          const rawName = pendingPaxPath ?? (ustarPrefix ? `${ustarPrefix}/${baseName}` : baseName);
-          pendingPaxPath = null;
-          if (!rawName) continue;
+          const paxMeta = pendingPax;
+          pendingPax = null;
+          const rawName = paxMeta?.path ?? (ustarPrefix ? `${ustarPrefix}/${baseName}` : baseName);
+          const effectiveSize = paxMeta?.size ?? size;
 
-          // Path traversal sanitization
-          const safeName = path.posix
-            .normalize(rawName.replace(/\\/g, "/"))
-            .replace(/^(\.\.\/)+/, "")
-            .replace(/^\/+/, "");
-          if (!safeName || safeName === "." || safeName === "..") continue;
+          if (typeflag !== "5" && typeflag !== "0" && typeflag !== "\0") {
+            throw new Error(
+              `Unsupported tar entry typeflag ${JSON.stringify(typeflag)} for entry: ${rawName || "<unnamed>"}`,
+            );
+          }
 
-          const fullPath = path.resolve(resolvedRoot, safeName);
-          if (fullPath !== resolvedRoot && !fullPath.startsWith(`${resolvedRoot}${path.sep}`)) {
+          if (!rawName) {
+            throw new Error("Corrupted tar header: missing entry name");
+          }
+
+          // Reject traversal / absolute paths BEFORE normalization strips prefixes
+          if (rawName.includes("\0")) {
+            throw new Error(`Tar entry escapes target directory: ${rawName}`);
+          }
+          const slashNormalized = rawName.replace(/\\/g, "/");
+          if (slashNormalized.startsWith("/") || /^[A-Za-z]:/.test(slashNormalized)) {
+            throw new Error(`Tar entry escapes target directory: ${rawName}`);
+          }
+          const rawSegments = slashNormalized.split("/");
+          if (rawSegments.includes("..")) {
+            throw new Error(`Tar entry escapes target directory: ${rawName}`);
+          }
+          const safeName = path.posix.normalize(slashNormalized);
+          if (!safeName || safeName === ".." || safeName.startsWith("../")) {
+            throw new Error(`Tar entry escapes target directory: ${rawName}`);
+          }
+          if (safeName === ".") {
+            if (typeflag === "5") {
+              const remainder = effectiveSize % 512;
+              remainingPad = effectiveSize + (remainder > 0 ? 512 - remainder : 0);
+              continue;
+            }
+            throw new Error(`Tar entry escapes target directory: ${rawName}`);
+          }
+
+          const containmentRoot = resolvedRoot ?? path.resolve("/tar-verify-root");
+          const fullPath = path.resolve(containmentRoot, safeName);
+          if (
+            fullPath !== containmentRoot &&
+            !fullPath.startsWith(`${containmentRoot}${path.sep}`)
+          ) {
             throw new Error(`Tar entry escapes target directory: ${rawName}`);
           }
 
           if (typeflag === "5") {
-            await fs.mkdir(fullPath, { recursive: true });
-            const remainder = size % 512;
-            remainingPad = size + (remainder > 0 ? 512 - remainder : 0);
+            if (!dryRun) {
+              await fs.mkdir(fullPath, { recursive: true });
+            }
+            const remainder = effectiveSize % 512;
+            remainingPad = effectiveSize + (remainder > 0 ? 512 - remainder : 0);
             continue;
           }
 
-          currentHeader = { name: safeName, size, isPax: false };
-          remainingBytes = size;
+          currentHeader = { name: safeName, size: effectiveSize, kind: "file" };
+          remainingBytes = effectiveSize;
 
-          await fs.mkdir(path.dirname(fullPath), { recursive: true });
-          currentFileHandle = await fs.open(fullPath, "w", 0o600);
+          if (!dryRun) {
+            await fs.mkdir(path.dirname(fullPath), { recursive: true });
+            currentFileHandle = await fs.open(fullPath, "w", 0o600);
+          }
         }
 
         if (currentHeader) {
           if (remainingBytes > 0) {
             const toWrite = Math.min(buffer.length, remainingBytes);
             const slice = buffer.subarray(0, toWrite);
-            if (currentHeader.isPax) {
+            if (currentHeader.kind === "pax") {
               paxChunks.push(Buffer.from(slice));
-            } else if (currentFileHandle) {
-              await writeAll(currentFileHandle, slice);
+            } else if (currentHeader.kind === "file") {
+              if (currentFileHandle) {
+                await writeAll(currentFileHandle, slice);
+              }
               totalBytes += toWrite;
             }
             buffer = buffer.subarray(toWrite);
@@ -427,12 +553,14 @@ export async function extractTarStream(
           }
 
           if (remainingBytes === 0) {
-            if (currentHeader.isPax) {
-              pendingPaxPath = parsePaxPath(Buffer.concat(paxChunks));
+            if (currentHeader.kind === "pax") {
+              pendingPax = parsePaxHeaders(Buffer.concat(paxChunks));
               paxChunks = [];
-            } else if (currentFileHandle) {
-              await currentFileHandle.close();
-              currentFileHandle = null;
+            } else if (currentHeader.kind === "file") {
+              if (currentFileHandle) {
+                await currentFileHandle.close();
+                currentFileHandle = null;
+              }
               extractedCount++;
             }
 
@@ -449,10 +577,16 @@ export async function extractTarStream(
     if (signal?.aborted) {
       throw makeAbortError(signal.reason);
     }
-    if (remainingBytes > 0 || currentHeader !== null) {
+    if (remainingBytes > 0 || remainingPad > 0 || currentHeader !== null) {
       throw new Error("Truncated tar archive: unexpected end of stream mid-entry");
     }
-    if (!sawEof && (extractedCount > 0 || buffer.length > 0)) {
+    if (pendingPax !== null) {
+      throw new Error("Truncated tar archive: dangling PAX extended header");
+    }
+    if (buffer.length > 0) {
+      throw new Error("Truncated tar archive: trailing incomplete block at end of stream");
+    }
+    if (zeroBlocks < 2) {
       throw new Error("Truncated tar archive: missing end-of-archive zero blocks");
     }
   } finally {
@@ -462,4 +596,28 @@ export async function extractTarStream(
   }
 
   return { extractedCount, totalBytes };
+}
+
+/**
+ * Extracts a streaming POSIX tar archive safely to targetDir with path traversal guards,
+ * PAX extended path/size support, strict typeflag validation, full short-write handling,
+ * and 2-block EOF truncation detection.
+ */
+export async function extractTarStream(
+  stream: Readable,
+  targetDir: string,
+  signal?: AbortSignal,
+): Promise<TarExtractResult> {
+  return processTarStream(stream, targetDir, signal);
+}
+
+/**
+ * Validates a streaming POSIX tar archive in-memory (headers, checksums, PAX, typeflags,
+ * path containment, entry bounds, and 2-block EOF) without writing any files to disk.
+ */
+export async function verifyTarStream(
+  stream: Readable,
+  signal?: AbortSignal,
+): Promise<TarExtractResult> {
+  return processTarStream(stream, null, signal);
 }

@@ -5,6 +5,21 @@ import path from "node:path";
 import { MongoClient } from "mongodb";
 import { formatOplogTimestamp, fromBsonTimestamp } from "../../src/oplog.js";
 
+const pausedProcs = new Set();
+
+export function resumeAllPausedProcesses() {
+  for (const proc of [...pausedProcs]) {
+    try {
+      if (proc && proc.exitCode === null && proc.signalCode === null) {
+        proc.kill("SIGCONT");
+      }
+    } catch {
+      // Ignore
+    }
+    pausedProcs.delete(proc);
+  }
+}
+
 export async function findFreePort() {
   return new Promise((resolve, reject) => {
     const srv = net.createServer();
@@ -72,7 +87,14 @@ export async function waitForPrimary(uriOrUris, timeoutMs = 45_000) {
 }
 
 export async function stopProcess(proc, uri) {
-  if (!proc || proc.exitCode !== null || proc.signalCode !== null) return;
+  if (!proc || proc.exitCode !== null || proc.signalCode !== null) {
+    pausedProcs.delete(proc);
+    return;
+  }
+  try {
+    proc.kill("SIGCONT");
+  } catch {}
+  pausedProcs.delete(proc);
   const exitPromise = new Promise((resolve) => {
     proc.once("close", resolve);
     proc.once("error", resolve);
@@ -151,6 +173,7 @@ export async function startReplicaSet({
   oplogSizeMb = 64,
   priorities,
   enableTestCommands = false,
+  extraArgs = [],
   startupTimeoutMs = 45_000,
 }) {
   const ports = await Promise.all(Array.from({ length: members }, () => findFreePort()));
@@ -182,8 +205,14 @@ export async function startReplicaSet({
       if (role === "configsvr") args.push("--configsvr");
       if (role === "shardsvr") args.push("--shardsvr");
       if (enableTestCommands) args.push("--setParameter=enableTestCommands=1");
+      if (Array.isArray(extraArgs) && extraArgs.length > 0) args.push(...extraArgs);
 
+      const trackProcExit = (p) => {
+        p.once("close", () => pausedProcs.delete(p));
+        p.once("error", () => pausedProcs.delete(p));
+      };
       let currentProc = spawn("mongod", args, { stdio: "ignore" });
+      trackProcExit(currentProc);
       const directUri = `mongodb://127.0.0.1:${port}/?directConnection=true`;
 
       const isRunning = () =>
@@ -209,6 +238,8 @@ export async function startReplicaSet({
         async kill(sig = "SIGKILL") {
           if (!isRunning()) return;
           if (sig === "SIGSTOP" || sig === "SIGCONT") {
+            if (sig === "SIGSTOP") pausedProcs.add(currentProc);
+            else pausedProcs.delete(currentProc);
             currentProc.kill(sig);
             return;
           }
@@ -224,6 +255,7 @@ export async function startReplicaSet({
             await stopProcess(currentProc, directUri);
           }
           currentProc = spawn("mongod", args, { stdio: "ignore" });
+          trackProcExit(currentProc);
           await waitForPing(directUri, currentProc, nodeLogPath, startupTimeoutMs);
         },
       };
@@ -484,11 +516,216 @@ export async function startMultiNodeReplicaSet(options) {
   });
 }
 
+export async function startReplicaSetFromDbPath({
+  rootDir,
+  name,
+  primaryDbPath,
+  members = 3,
+  oplogSizeMb = 64,
+  enableTestCommands = false,
+  extraArgs = [],
+  startupTimeoutMs = 60_000,
+}) {
+  const ports = await Promise.all(Array.from({ length: members }, () => findFreePort()));
+
+  const nodes = await Promise.all(
+    ports.map(async (port, idx) => {
+      const nodeDbPath = idx === 0 ? primaryDbPath : path.join(rootDir, `db-${name}-n${idx}`);
+      const nodeLogPath =
+        members === 1
+          ? path.join(rootDir, `${name}.log`)
+          : path.join(rootDir, `${name}-n${idx}.log`);
+      await fs.mkdir(nodeDbPath, { recursive: true });
+
+      const args = [
+        `--replSet=${name}`,
+        `--port=${port}`,
+        `--dbpath=${nodeDbPath}`,
+        "--bind_ip=127.0.0.1",
+        `--oplogSize=${oplogSizeMb}`,
+        `--logpath=${nodeLogPath}`,
+      ];
+      if (enableTestCommands) args.push("--setParameter=enableTestCommands=1");
+      if (Array.isArray(extraArgs) && extraArgs.length > 0) args.push(...extraArgs);
+
+      const trackProcExit = (p) => {
+        p.once("close", () => pausedProcs.delete(p));
+        p.once("error", () => pausedProcs.delete(p));
+      };
+      let currentProc = spawn("mongod", args, { stdio: "ignore" });
+      trackProcExit(currentProc);
+      const directUri = `mongodb://127.0.0.1:${port}/?directConnection=true`;
+
+      const isRunning = () =>
+        currentProc !== null && currentProc.exitCode === null && currentProc.signalCode === null;
+
+      return {
+        id: idx,
+        port,
+        dbPath: nodeDbPath,
+        logPath: nodeLogPath,
+        directUri,
+        args,
+        get proc() {
+          return currentProc;
+        },
+        get pid() {
+          return currentProc?.pid ?? null;
+        },
+        isRunning,
+        async stop() {
+          await stopProcess(currentProc, directUri);
+        },
+        async kill(sig = "SIGKILL") {
+          if (!isRunning()) return;
+          if (sig === "SIGSTOP" || sig === "SIGCONT") {
+            if (sig === "SIGSTOP") pausedProcs.add(currentProc);
+            else pausedProcs.delete(currentProc);
+            currentProc.kill(sig);
+            return;
+          }
+          const exitPromise = new Promise((resolve) => {
+            currentProc.once("close", resolve);
+            currentProc.once("error", resolve);
+          });
+          currentProc.kill(sig);
+          await exitPromise;
+        },
+        async restart() {
+          if (isRunning()) {
+            await stopProcess(currentProc, directUri);
+          }
+          currentProc = spawn("mongod", args, { stdio: "ignore" });
+          trackProcExit(currentProc);
+          await waitForPing(directUri, currentProc, nodeLogPath, startupTimeoutMs);
+        },
+      };
+    }),
+  );
+
+  await Promise.all(
+    nodes.map((node) => waitForPing(node.directUri, node.proc, node.logPath, startupTimeoutMs)),
+  );
+
+  const initClient = new MongoClient(nodes[0].directUri, { directConnection: true });
+  try {
+    await initClient.connect();
+    await initClient.db("admin").command({
+      replSetInitiate: {
+        _id: name,
+        members: [
+          {
+            _id: 0,
+            host: `127.0.0.1:${nodes[0].port}`,
+            ...(members > 1 ? { priority: 2 } : {}),
+          },
+        ],
+      },
+    });
+  } finally {
+    await initClient.close().catch(() => {});
+  }
+
+  await waitForPrimary(nodes[0].directUri, startupTimeoutMs);
+
+  if (members > 1) {
+    const reconfigClient = new MongoClient(nodes[0].directUri, { directConnection: true });
+    try {
+      await reconfigClient.connect();
+      const cfgRes = await reconfigClient.db("admin").command({ replSetGetConfig: 1 });
+      const currentCfg = cfgRes.config;
+      const nextCfg = {
+        ...currentCfg,
+        version: (currentCfg.version || 1) + 1,
+        members: nodes.map((n, i) => ({
+          _id: i,
+          host: `127.0.0.1:${n.port}`,
+          priority: i === 0 ? 2 : 1,
+        })),
+      };
+      await reconfigClient.db("admin").command({ replSetReconfig: nextCfg });
+    } finally {
+      await reconfigClient.close().catch(() => {});
+    }
+    await waitForSecondariesReady(nodes[0].directUri, members - 1, startupTimeoutMs);
+  }
+
+  const hostsCsv = nodes.map((n) => `127.0.0.1:${n.port}`).join(",");
+  const host = `${name}/${hostsCsv}`;
+  const rsUri = `mongodb://${hostsCsv}/?replicaSet=${name}`;
+
+  async function getPrimaryNode() {
+    for (const node of nodes) {
+      if (!node.isRunning()) continue;
+      const client = new MongoClient(node.directUri, {
+        directConnection: true,
+        serverSelectionTimeoutMS: 2000,
+      });
+      try {
+        await client.connect();
+        const hello = await client.db("admin").command({ hello: 1 });
+        if (hello.isWritablePrimary) return node;
+      } catch {
+        // Ignore
+      } finally {
+        await client.close().catch(() => {});
+      }
+    }
+    throw new Error(`No writable PRIMARY found in replica set "${name}"`);
+  }
+
+  async function getSecondaryNodes() {
+    const secondaries = [];
+    for (const node of nodes) {
+      if (!node.isRunning()) continue;
+      const client = new MongoClient(node.directUri, {
+        directConnection: true,
+        serverSelectionTimeoutMS: 2000,
+      });
+      try {
+        await client.connect();
+        const hello = await client.db("admin").command({ hello: 1 });
+        if (hello.secondary) secondaries.push(node);
+      } catch {
+        // Ignore
+      } finally {
+        await client.close().catch(() => {});
+      }
+    }
+    return secondaries;
+  }
+
+  return {
+    name,
+    port: nodes[0].port,
+    dbPath: nodes[0].dbPath,
+    logPath: nodes[0].logPath,
+    host,
+    directUri: nodes[0].directUri,
+    uri: rsUri,
+    nodes,
+    oplogSizeMb,
+    enableTestCommands,
+    get proc() {
+      return nodes[0].proc;
+    },
+    get pid() {
+      return nodes[0].pid;
+    },
+    getPrimaryNode,
+    getSecondaryNodes,
+    stop: async () => {
+      await Promise.all(nodes.map((n) => n.stop()));
+    },
+  };
+}
+
 export async function startStandalone({
   rootDir,
   dbPath,
   name = "standalone",
   enableTestCommands = false,
+  extraArgs = [],
   startupTimeoutMs = 45_000,
 }) {
   const port = await findFreePort();
@@ -501,6 +738,7 @@ export async function startStandalone({
     `--logpath=${logPath}`,
   ];
   if (enableTestCommands) args.push("--setParameter=enableTestCommands=1");
+  if (Array.isArray(extraArgs) && extraArgs.length > 0) args.push(...extraArgs);
 
   const proc = spawn("mongod", args, { stdio: "ignore" });
   const uri = `mongodb://127.0.0.1:${port}/?directConnection=true`;

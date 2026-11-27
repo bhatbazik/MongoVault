@@ -17,6 +17,7 @@ export interface BackupCursorFile {
   filename: string;
   fileLen?: number;
   fileSize?: number;
+  length?: number;
 }
 
 export interface PhysicalBackupOptions {
@@ -58,6 +59,11 @@ export interface PhysicalRestoreOptions {
   ref?: string;
   pitr?: string;
   signal?: AbortSignal;
+  /**
+   * Explicit opt-in required before allowing destructive 1x-disk direct mode
+   * (wipes targetDbPath after zero-disk pre-verification when free space is insufficient for 2x staging).
+   */
+  allowDirectMode?: boolean;
   /**
    * Test-only hook to bypass booting an ephemeral `mongod` for WiredTiger/RS recovery.
    * Defaults to `false` (full multi-step recovery always runs in production).

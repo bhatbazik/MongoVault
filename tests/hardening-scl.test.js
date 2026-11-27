@@ -504,6 +504,153 @@ describe("M2 storage-crypto-lock hardening regression & contract suite", () => {
     }
   });
 
+  it("[F-SCL-004-ENOENT-Race] prevents dual lock acquisition when isStale hits ENOENT during concurrent acquireLock()", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "mv-f-scl-004-enoent-"));
+    const lockFile = path.join(dir, ".backup.lock");
+    const mutexDir = `${lockFile}.lck`;
+
+    const origRm = fs.rm.bind(fs);
+    const origMkdir = fs.mkdir.bind(fs);
+    const origStat = fs.stat.bind(fs);
+    const origLink = fs.link.bind(fs);
+    const origRename = fs.rename.bind(fs);
+
+    try {
+      // Scenario 1: P1 releases lock right as P2 waits on withFileLockMutex; P3 arrives concurrently
+      const rel1 = await acquireLock(lockFile, { staleAfterMs: 60_000 });
+      expect(rel1).toBeTypeOf("function");
+
+      let notifyP1InRm;
+      const p1InRmPromise = new Promise((r) => {
+        notifyP1InRm = r;
+      });
+      let notifyP2WaitingMutex;
+      const p2WaitingMutexPromise = new Promise((r) => {
+        notifyP2WaitingMutex = r;
+      });
+
+      let p1RmPaused = false;
+      const rmSpy = vi.spyOn(fs, "rm").mockImplementation(async (target, opts) => {
+        if (!p1RmPaused && target === lockFile) {
+          p1RmPaused = true;
+          notifyP1InRm();
+          await p2WaitingMutexPromise;
+        }
+        return origRm(target, opts);
+      });
+
+      let p2MutexSeen = false;
+      const mkdirSpy = vi.spyOn(fs, "mkdir").mockImplementation(async (target, opts) => {
+        try {
+          return await origMkdir(target, opts);
+        } catch (err) {
+          if (!p2MutexSeen && target === mutexDir && err?.code === "EEXIST") {
+            p2MutexSeen = true;
+            notifyP2WaitingMutex();
+          }
+          throw err;
+        }
+      });
+
+      let p3Promise = null;
+      let statEnoentHooked = false;
+      const statSpy = vi.spyOn(fs, "stat").mockImplementation(async (target, opts) => {
+        try {
+          return await origStat(target, opts);
+        } catch (err) {
+          if (!statEnoentHooked && target === lockFile && err?.code === "ENOENT") {
+            statEnoentHooked = true;
+            p3Promise = acquireLock(lockFile, { staleAfterMs: 60_000 });
+            await Promise.race([p3Promise, new Promise((r) => setTimeout(r, 50))]);
+          }
+          throw err;
+        }
+      });
+
+      const rel1Promise = rel1();
+      await p1InRmPromise;
+
+      const p2Promise = acquireLock(lockFile, { staleAfterMs: 60_000 });
+      await rel1Promise;
+
+      const rel2 = await p2Promise;
+      if (!p3Promise) {
+        p3Promise = acquireLock(lockFile, { staleAfterMs: 60_000 });
+      }
+      const rel3 = await p3Promise;
+
+      rmSpy.mockRestore();
+      mkdirSpy.mockRestore();
+      statSpy.mockRestore();
+
+      expect([rel2, rel3].filter(Boolean)).toHaveLength(1);
+      await rel2?.();
+      await rel3?.();
+
+      // Scenario 2: External ENOENT between writeLockExclusiveLocal(EEXIST) and isStale() must not tombstone-rename a concurrent P3 lock
+      await fs.writeFile(
+        lockFile,
+        JSON.stringify({
+          pid: 999_999,
+          token: "external-dead",
+          acquiredAt: new Date().toISOString(),
+        }),
+      );
+
+      let removedOnEexist = false;
+      let p3Promise2 = null;
+      let statEnoentHooked2 = false;
+      let staleRenameCount = 0;
+
+      const linkSpy2 = vi.spyOn(fs, "link").mockImplementation(async (existingPath, newPath) => {
+        try {
+          return await origLink(existingPath, newPath);
+        } catch (err) {
+          if (!removedOnEexist && newPath === lockFile && err?.code === "EEXIST") {
+            removedOnEexist = true;
+            await origRm(lockFile, { force: true });
+          }
+          throw err;
+        }
+      });
+
+      const statSpy2 = vi.spyOn(fs, "stat").mockImplementation(async (target, opts) => {
+        try {
+          return await origStat(target, opts);
+        } catch (err) {
+          if (!statEnoentHooked2 && target === lockFile && err?.code === "ENOENT") {
+            statEnoentHooked2 = true;
+            p3Promise2 = acquireLock(lockFile, { staleAfterMs: 60_000 });
+            await Promise.race([p3Promise2, new Promise((r) => setTimeout(r, 50))]);
+          }
+          throw err;
+        }
+      });
+
+      const renameSpy = vi.spyOn(fs, "rename").mockImplementation(async (src, dst) => {
+        if (src === lockFile && String(dst).includes(".stale.")) {
+          staleRenameCount++;
+        }
+        return origRename(src, dst);
+      });
+
+      const rel2b = await acquireLock(lockFile, { staleAfterMs: 60_000 });
+      const rel3b = await p3Promise2;
+
+      linkSpy2.mockRestore();
+      statSpy2.mockRestore();
+      renameSpy.mockRestore();
+
+      expect(staleRenameCount).toBe(0);
+      expect([rel2b, rel3b].filter(Boolean)).toHaveLength(1);
+      await rel2b?.();
+      await rel3b?.();
+    } finally {
+      vi.restoreAllMocks();
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("[F-SCL-005] deleteBackup() blocks deletion when PITR slices exist only under sharded paths and protects older anchor when newer backup is oplog:false", async () => {
     // 1. Sharded PITR scopes under shards/rs1/_cluster/_pitr/
     const dir1 = await fs.mkdtemp(path.join(os.tmpdir(), "mv-f-scl-005-sharded-"));

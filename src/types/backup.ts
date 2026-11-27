@@ -10,6 +10,8 @@ export interface BackupContext {
   logger: Logger;
   signal?: AbortSignal;
   tools?: BackupTools;
+  /** Optional lock-fencing assertion checked before critical upload/manifest transitions. */
+  assertLockValid?: () => void;
 }
 
 export type RunBackupResult = BackupManifest;

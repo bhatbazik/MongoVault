@@ -2,25 +2,28 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { type Transform, Writable } from "node:stream";
-import { createGunzip } from "node:zlib";
+import { createGunzip, createGzip } from "node:zlib";
 import { MongoClient } from "mongodb";
 import { linkedController, settleAll } from "./abort.js";
+import { ArchiveNamespaceFilter } from "./archive-stream.js";
 import { isClusterScope, readManifest, resolveBackup, resolveKeyRing, scopeOf } from "./catalog.js";
 import { createDecryptor, verifyManifest } from "./crypto.js";
 import { DigestStream } from "./digest.js";
-import { MongoOplogTargetClient, OplogApplier } from "./oplog-applier.js";
+import { MongoOplogTargetClient, OplogApplier, matchesNamespacePattern } from "./oplog-applier.js";
 import {
   downloadAndExtractOplogSlice,
   filterOplogSliceFile,
   formatOplogTimestamp,
   incrementOplogTimestamp,
+  parseOplogTimestamp,
   resolvePitrPlan,
   streamOplogSlice,
 } from "./oplog.js";
 import { runStreamPipeline } from "./stream.js";
-import { mongorestore } from "./tools.js";
+import { mongorestore, validateRestoreNamespaceOptions } from "./tools.js";
 import type { BackupManifest, ShardedClusterMeta } from "./types/catalog.js";
 import type { AppConfig } from "./types/config.js";
+import type { OplogTimestamp } from "./types/oplog.js";
 import type {
   DescribeBackupResult,
   RestoreContext,
@@ -31,11 +34,19 @@ import type {
 
 /**
  * System namespaces excluded during full-cluster logical restores
- * so target cluster metadata, sessions, active transaction tables, and FCV are never clobbered.
+ * so target cluster metadata, sessions, active transaction tables, pre-images,
+ * shard/balancer history, internal signing keys, and FCV are never clobbered.
+ *
+ * Note on `admin.system.users` and `admin.system.roles` (R1 / PBM parity):
+ * `mongorestore` skips `admin.system.users` and `admin.system.roles` by default unless
+ * `--restoreDbUsersAndRoles` is passed (which MongoVault never passes), and `local.*`
+ * is skipped natively, so no user/role temporary-collection swap is performed.
  */
 export const CLUSTER_SYSTEM_NS_EXCLUDE = [
   "admin.system.version",
+  "admin.system.keys",
   "config.system.sessions",
+  "config.system.preimages",
   "config.transactions",
   "config.rangeDeletions",
   "config.shards",
@@ -43,14 +54,222 @@ export const CLUSTER_SYSTEM_NS_EXCLUDE = [
   "config.locks",
   "config.lockpings",
   "config.mongos",
+  "config.actionlog",
+  "config.changelog",
+  "config.migrations",
   "config.cache.*",
   "config.shard.catalog.*",
 ];
+
+const PROTECTED_SYSTEM_DBS = new Set(["admin", "local", "config"]);
 
 export class IntegrityError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "IntegrityError";
+  }
+}
+
+function assertManifestIntegrity(
+  config: AppConfig,
+  key: string,
+  manifest: BackupManifest | null,
+): void {
+  if (config.requireEncryption && (!manifest || !manifest.encryption)) {
+    throw new IntegrityError(
+      `REQUIRE_ENCRYPTION is enabled, but backup ${key} lacks an encrypted manifest`,
+    );
+  }
+  if (!manifest) return;
+
+  const keyRing = resolveKeyRing(config);
+  const isSigned = Boolean(manifest.signature?.hmac || manifest.encryption?.manifestHmac);
+  const mustVerify =
+    isSigned ||
+    Boolean(manifest.encryption) ||
+    keyRing.length > 0 ||
+    Boolean(config.requireEncryption);
+
+  if (mustVerify) {
+    if ((isSigned || manifest.encryption || config.requireEncryption) && keyRing.length === 0) {
+      throw new IntegrityError(
+        `Backup manifest for ${key} requires HMAC verification, but ENCRYPTION_KEY / key ring is not configured`,
+      );
+    }
+    try {
+      verifyManifest(keyRing, manifest, {
+        requireSigned: Boolean(config.requireEncryption || manifest.encryption),
+      });
+    } catch (error) {
+      throw new IntegrityError(error instanceof Error ? error.message : String(error));
+    }
+  }
+}
+
+function decrementOplogTimestamp(ts: OplogTimestamp): OplogTimestamp | null {
+  const t = ts.t >>> 0;
+  const i = ts.i >>> 0;
+  if (i > 0) {
+    return { t, i: i - 1 };
+  }
+  if (t > 0) {
+    return { t: t - 1, i: 0xffffffff };
+  }
+  return null;
+}
+
+function expandTimeseriesNamespacePatterns(pattern?: string): string | undefined {
+  if (!pattern) return undefined;
+  const parts = pattern
+    .split(",")
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0);
+  if (parts.length === 0) return undefined;
+  const out = new Set<string>();
+  for (const part of parts) {
+    out.add(part);
+    const dotIdx = part.indexOf(".");
+    if (dotIdx > 0 && dotIdx < part.length - 1) {
+      const db = part.slice(0, dotIdx);
+      const coll = part.slice(dotIdx + 1);
+      if (coll !== "*" && !coll.startsWith("system.") && !coll.startsWith("$")) {
+        out.add(`${db}.system.buckets.${coll}`);
+      }
+    }
+  }
+  return [...out].join(",");
+}
+
+function abortErrorFromSignal(signal?: AbortSignal, fallbackMessage = "Operation aborted"): Error {
+  const reason = signal?.reason;
+  if (reason instanceof Error) return reason;
+  const err = new Error(reason ? String(reason) : fallbackMessage);
+  err.name = "AbortError";
+  return err;
+}
+
+async function connectMongoWithSignal(client: MongoClient, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) {
+    void client.close().catch(() => {});
+    throw abortErrorFromSignal(signal);
+  }
+  if (!signal) {
+    await client.connect();
+    return;
+  }
+  let onAbort: (() => void) | undefined;
+  try {
+    await Promise.race([
+      client.connect(),
+      new Promise<never>((_resolve, reject) => {
+        onAbort = () => {
+          void client.close().catch(() => {});
+          reject(abortErrorFromSignal(signal));
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+      }),
+    ]);
+  } finally {
+    if (onAbort) {
+      signal.removeEventListener("abort", onAbort);
+    }
+  }
+}
+
+function ignoreNamespaceNotFound(err: unknown): void {
+  if (!err || typeof err !== "object") throw err;
+  const code = (err as { code?: unknown }).code;
+  const msg = String((err as { message?: unknown }).message ?? "");
+  if (code === 26 || /ns not found/i.test(msg)) {
+    return;
+  }
+  throw err;
+}
+
+async function dropTargetNamespacesBeforePitr(
+  client: MongoClient,
+  opts: {
+    source: string;
+    target: string;
+    isRenamedDb: boolean;
+    nsInclude?: string;
+    nsExclude?: string;
+  },
+): Promise<void> {
+  const { source, target, isRenamedDb, nsInclude, nsExclude } = opts;
+  const targetIsCluster = isClusterScope(target);
+
+  if (nsInclude === undefined && nsExclude === undefined) {
+    if (targetIsCluster) {
+      const res = (await client.db("admin").command({ listDatabases: 1, nameOnly: true })) as {
+        databases?: Array<{ name?: string }>;
+      };
+      for (const entry of res.databases ?? []) {
+        const dbName = entry.name;
+        if (!dbName || PROTECTED_SYSTEM_DBS.has(dbName)) continue;
+        await client.db(dbName).dropDatabase();
+      }
+      return;
+    }
+    if (!PROTECTED_SYSTEM_DBS.has(target)) {
+      await client.db(target).dropDatabase();
+    }
+    return;
+  }
+
+  const expandedInclude = expandTimeseriesNamespacePatterns(nsInclude);
+  const expandedExclude = expandTimeseriesNamespacePatterns(nsExclude);
+  if (nsInclude !== undefined && !expandedInclude) {
+    throw new Error("nsInclude must contain at least one non-empty namespace pattern");
+  }
+  if (nsExclude !== undefined && !expandedExclude) {
+    throw new Error("nsExclude must contain at least one non-empty namespace pattern");
+  }
+
+  let candidateDbs: string[];
+  if (!targetIsCluster) {
+    candidateDbs = PROTECTED_SYSTEM_DBS.has(target) ? [] : [target];
+  } else {
+    const res = (await client.db("admin").command({ listDatabases: 1, nameOnly: true })) as {
+      databases?: Array<{ name?: string }>;
+    };
+    candidateDbs = (res.databases ?? [])
+      .map((d) => d.name)
+      .filter((n): n is string => Boolean(n) && !PROTECTED_SYSTEM_DBS.has(n!));
+  }
+
+  for (const dbName of candidateDbs) {
+    if (PROTECTED_SYSTEM_DBS.has(dbName)) continue;
+    const matchDb = isRenamedDb ? source : dbName;
+    if (
+      !expandedExclude &&
+      (!expandedInclude || matchesNamespacePattern(`${matchDb}.*`, expandedInclude))
+    ) {
+      await client.db(dbName).dropDatabase();
+      continue;
+    }
+
+    const db = client.db(dbName);
+    const colls = await db.listCollections({}, { nameOnly: true }).toArray();
+    for (const coll of colls) {
+      const collName = coll.name;
+      if (!collName) continue;
+      if (
+        collName.startsWith("system.") &&
+        collName !== "system.views" &&
+        !collName.startsWith("system.buckets.")
+      ) {
+        continue;
+      }
+      const matchNs = `${matchDb}.${collName}`;
+      if (expandedInclude && !matchesNamespacePattern(matchNs, expandedInclude)) {
+        continue;
+      }
+      if (expandedExclude && matchesNamespacePattern(matchNs, expandedExclude)) {
+        continue;
+      }
+      await db.collection(collName).drop().catch(ignoreNamespaceNotFound);
+    }
   }
 }
 
@@ -60,9 +279,13 @@ export async function describeBackup(
 ): Promise<DescribeBackupResult> {
   const key = await resolveBackup(storage, scopeOf(config), ref);
   const manifest = await readManifest(storage, key);
-  const object = manifest ? null : await storage.head(key);
+  const hasHead = typeof storage.head === "function";
+  const object = hasHead ? await storage.head(key) : null;
   if (!manifest && !object) {
     throw new Error(`Backup not found: ${key}`);
+  }
+  if (manifest && hasHead && !object) {
+    throw new IntegrityError(`Backup archive object not found for ${key}`);
   }
   if (manifest?.key && manifest.key !== key) {
     throw new IntegrityError(
@@ -71,25 +294,7 @@ export async function describeBackup(
   }
   const checksum = manifest?.sha256 ?? object?.metadata?.sha256 ?? null;
 
-  const keyRing = resolveKeyRing(config);
-  const isSigned = Boolean(manifest?.signature?.hmac || manifest?.encryption?.manifestHmac);
-
-  if (isSigned && manifest) {
-    if (keyRing.length === 0) {
-      throw new Error(
-        `Backup manifest for ${key} is signed with HMAC, but ENCRYPTION_KEY / key ring is not configured`,
-      );
-    }
-    try {
-      verifyManifest(keyRing, manifest);
-    } catch (error) {
-      throw new IntegrityError((error as Error).message);
-    }
-  } else if (manifest?.encryption) {
-    if (keyRing.length === 0) {
-      throw new Error(`${key} is encrypted, but ENCRYPTION_KEY is not set`);
-    }
-  }
+  assertManifestIntegrity(config, key, manifest);
   return { key, manifest, checksum };
 }
 
@@ -110,31 +315,20 @@ export async function verifyArchiveObject(
 ): Promise<VerifyBackupResult> {
   const { config, storage, logger, signal } = ctx;
   const manifest = await readManifest(storage, key);
-  const object = manifest ? null : await storage.head(key);
+  const hasHead = typeof storage.head === "function";
+  const object = hasHead ? await storage.head(key) : null;
   if (!manifest && !object) {
     throw new IntegrityError(`Backup not found: ${key}`);
+  }
+  if (manifest && hasHead && !object) {
+    throw new IntegrityError(`Backup archive object not found for ${key}`);
   }
   if (manifest?.key && manifest.key !== key) {
     throw new IntegrityError(
       `Manifest key mismatch for ${key}: manifest belongs to ${manifest.key}`,
     );
   }
-  const keyRing = resolveKeyRing(config);
-  const isSigned = Boolean(manifest?.signature?.hmac || manifest?.encryption?.manifestHmac);
-  if (isSigned && manifest) {
-    if (keyRing.length === 0) {
-      throw new IntegrityError(
-        `Backup manifest for ${key} is signed with HMAC, but ENCRYPTION_KEY is not configured`,
-      );
-    }
-    try {
-      verifyManifest(keyRing, manifest);
-    } catch (error) {
-      throw new IntegrityError((error as Error).message);
-    }
-  } else if (manifest?.encryption && keyRing.length === 0) {
-    throw new IntegrityError(`${key} is encrypted, but ENCRYPTION_KEY is not set`);
-  }
+  assertManifestIntegrity(config, key, manifest);
 
   const checksum = manifest?.sha256 ?? object?.metadata?.sha256 ?? null;
   if (!checksum) {
@@ -236,8 +430,27 @@ async function verifyShardedClusterBackup(
     { key, childObjects: keysToVerify.size },
     "Verifying sharded cluster child archives and bridging slices",
   );
+  const verifiedSizes = new Map<string, number>();
   for (const childKey of keysToVerify) {
-    await verifyArchiveObject(ctx, childKey);
+    const childResult = await verifyArchiveObject(ctx, childKey);
+    verifiedSizes.set(childKey, childResult.size);
+  }
+
+  if (manifest) {
+    let childBackupSizeSum = 0;
+    if (clusterMeta.configsvr?.backupKey) {
+      childBackupSizeSum += verifiedSizes.get(clusterMeta.configsvr.backupKey) ?? 0;
+    }
+    for (const shard of Object.values(clusterMeta.shards ?? {})) {
+      if (shard.backupKey) {
+        childBackupSizeSum += verifiedSizes.get(shard.backupKey) ?? 0;
+      }
+    }
+    if (manifest.size !== digest.bytes && manifest.size !== childBackupSizeSum) {
+      throw new IntegrityError(
+        `Size mismatch for ${key}: expected ${manifest.size}, got ${digest.bytes} (or child backup sum ${childBackupSizeSum})`,
+      );
+    }
   }
 
   logger.info(
@@ -295,7 +508,9 @@ export async function verifyBackup(
 
 export async function restoreBackup(
   ctx: RestoreContext,
-  {
+  options: RestoreOptions,
+): Promise<RestoreResult> {
+  const {
     ref = "latest",
     uri,
     database,
@@ -307,8 +522,10 @@ export async function restoreBackup(
     oplogLimit,
     pitr,
     parallelCollections,
-  }: RestoreOptions,
-): Promise<RestoreResult> {
+  } = options;
+  const { nsFrom, nsTo } = options as RestoreOptions & { nsFrom?: string; nsTo?: string };
+  validateRestoreNamespaceOptions({ nsInclude, nsExclude, nsFrom, nsTo });
+
   if (pitr) {
     return restorePointInTime(ctx, {
       pitr,
@@ -343,24 +560,29 @@ export async function restoreBackup(
     ? false
     : (oplogReplay ?? (Boolean(oplogLimit) || Boolean(manifest?.oplog)));
 
-  if (!checksum) log.warn("Backup has no checksum; restoring without an integrity check");
+  if (!checksum) {
+    if (drop) {
+      throw new IntegrityError(
+        `Refusing destructive restore (--drop) for ${key}: backup has no manifest or checksum to verify against`,
+      );
+    }
+    log.warn("Backup has no checksum; restoring without an integrity check");
+  }
 
   if (preVerify) {
     log.info(
-      { ref, drop },
+      { key, drop },
       "Pre-verifying backup archive integrity and checksum before dropping collections",
     );
-    await verifyBackup(ctx, ref);
+    await verifyBackup(ctx, key);
   }
 
   const effectiveNsInclude =
     nsInclude ?? (isFilteredCluster ? `${target}.*` : isRenamedDb ? `${source}.*` : undefined);
   // mongorestore rejects --nsExclude when --oplogReplay is enabled ("cannot use --oplogReplay with excludes specified").
-  // Pass systemNsExclude whenever oplogReplay is disabled; when oplogReplay is active, mongorestore handles internal collections natively.
-  const systemNsExclude =
-    isCluster && !hasNamespaceFilter && drop && !shouldReplayOplog
-      ? CLUSTER_SYSTEM_NS_EXCLUDE
-      : undefined;
+  // When oplogReplay is active on full-cluster restores, strip CLUSTER_SYSTEM_NS_EXCLUDE via
+  // ArchiveNamespaceFilter before mongorestore; when oplogReplay is disabled, pass systemNsExclude.
+  const systemNsExclude = isCluster && !shouldReplayOplog ? CLUSTER_SYSTEM_NS_EXCLUDE : undefined;
 
   const controller = linkedController(signal);
   try {
@@ -387,7 +609,21 @@ export async function restoreBackup(
     log.info({ source, target, drop }, "Streaming restore pipeline from storage (zero-disk)");
     const digest = new DigestStream();
     const downloadStream = await storage.download(key, { signal: controller.signal });
-    const stages = [downloadStream, digest, ...decryptStage(config, manifest), restore.stdin];
+    const archiveFilterStages: Transform[] =
+      isCluster && shouldReplayOplog
+        ? [
+            createGunzip(),
+            new ArchiveNamespaceFilter(CLUSTER_SYSTEM_NS_EXCLUDE, { passthroughNonArchive: true }),
+            createGzip(),
+          ]
+        : [];
+    const stages = [
+      downloadStream,
+      digest,
+      ...decryptStage(config, manifest),
+      ...archiveFilterStages,
+      restore.stdin,
+    ];
 
     const [summary] = await settleAll(controller, [
       restore.done,
@@ -418,7 +654,9 @@ export async function restoreBackup(
 
 export async function restorePointInTime(
   ctx: RestoreContext,
-  {
+  options: RestoreOptions,
+): Promise<RestoreResult> {
+  const {
     pitr,
     uri,
     database,
@@ -427,8 +665,10 @@ export async function restorePointInTime(
     drop = false,
     preVerify = drop,
     parallelCollections,
-  }: RestoreOptions,
-): Promise<RestoreResult> {
+  } = options;
+  const { nsFrom, nsTo } = options as RestoreOptions & { nsFrom?: string; nsTo?: string };
+  validateRestoreNamespaceOptions({ nsInclude, nsExclude, nsFrom, nsTo });
+
   const { config, storage, logger, signal, tools } = ctx;
   const initialIsFiltered =
     (Boolean(database) &&
@@ -478,19 +718,51 @@ export async function restorePointInTime(
 
   const replayedBaseOplog = Boolean(plan.baseManifest?.oplog) && !hasNamespaceFilter;
 
-  // Pre-verify ALL planned PITR oplog slices BEFORE Stage 1 executes any destructive --drop
-  // so a corrupted, missing, or undecryptable slice never leaves the target database torn.
-  if (preVerify && plan.slices.length > 0 && typeof storage.download === "function") {
-    logger.info(
-      { slicesCount: plan.slices.length, drop },
-      "Pre-verifying all planned PITR oplog slices before base restore",
-    );
-    for (const slice of plan.slices) {
-      await verifyArchiveObject(ctx, slice.key);
+  // Pre-verify ALL planned PITR oplog slices AND the base backup BEFORE any destructive --drop
+  // so a corrupted, missing, or undecryptable artifact never leaves the target database torn.
+  if (preVerify) {
+    if (plan.slices.length > 0 && typeof storage.download === "function") {
+      logger.info(
+        { slicesCount: plan.slices.length, drop },
+        "Pre-verifying all planned PITR oplog slices before base restore",
+      );
+      for (const slice of plan.slices) {
+        await verifyArchiveObject(ctx, slice.key);
+      }
+    }
+    if (typeof storage.download === "function") {
+      await verifyBackup(ctx, plan.baseBackup.key);
+    }
+  } else if (drop) {
+    const baseDesc = await describeBackup(ctx, plan.baseBackup.key);
+    if (!baseDesc.checksum) {
+      throw new IntegrityError(
+        `Refusing destructive PITR restore (--drop) for ${plan.baseBackup.key}: backup has no manifest or checksum to verify against`,
+      );
     }
   }
 
-  // Stage 1: Restore base backup
+  // Drop target non-system namespaces/databases created after the base snapshot before Stage 1
+  // so post-backup collections do not survive PITR with --drop.
+  if (drop && (!tools?.mongorestore || ctx.createMongoClient)) {
+    const dropController = linkedController(signal);
+    const dropClient = (ctx.createMongoClient ?? ((u) => new MongoClient(u)))(uri);
+    try {
+      await connectMongoWithSignal(dropClient, dropController.signal);
+      await dropTargetNamespacesBeforePitr(dropClient, {
+        source,
+        target,
+        isRenamedDb,
+        nsInclude,
+        nsExclude,
+      });
+    } finally {
+      dropController.dispose();
+      await dropClient.close().catch(() => {});
+    }
+  }
+
+  // Stage 1: Restore base backup (already pre-verified above when preVerify is true)
   const baseResult = await restoreBackup(ctx, {
     ref: plan.baseBackup.key,
     uri,
@@ -498,13 +770,26 @@ export async function restorePointInTime(
     nsInclude,
     nsExclude,
     drop,
-    preVerify,
+    preVerify: false,
     oplogReplay: replayedBaseOplog,
-    oplogLimit: plan.slices.length === 0 && replayedBaseOplog ? exclusiveLimit : undefined,
+    oplogLimit: replayedBaseOplog ? exclusiveLimit : undefined,
     parallelCollections,
   });
 
   // Stage 2: Replay continuous oplog slices up to plan.targetTs
+  const baseStartTs = plan.baseManifest?.oplogWindow?.startTs
+    ? parseOplogTimestamp(plan.baseManifest.oplogWindow.startTs)
+    : null;
+  const stage2StartTs = !replayedBaseOplog && baseStartTs ? baseStartTs : undefined;
+  const stage2StartExclusiveTs = replayedBaseOplog
+    ? plan.baseEndTs
+    : baseStartTs
+      ? (decrementOplogTimestamp(baseStartTs) ?? undefined)
+      : plan.baseEndTs;
+
+  const expandedNsInclude = expandTimeseriesNamespacePatterns(nsInclude);
+  const expandedNsExclude = expandTimeseriesNamespacePatterns(nsExclude);
+
   const controller = linkedController(signal);
   let replayedEntries = 0;
   let oplogStats: RestoreResult["oplogStats"];
@@ -522,11 +807,12 @@ export async function restorePointInTime(
             sliceFile,
           );
           const { keptEntries } = await filterOplogSliceFile(sliceFile, filteredFile, {
-            startExclusiveTs: replayedBaseOplog ? plan.baseEndTs : undefined,
+            startTs: stage2StartTs,
+            startExclusiveTs: stage2StartExclusiveTs,
             targetTs: plan.targetTs,
             database: isFilteredCluster ? target : undefined,
-            nsInclude,
-            nsExclude,
+            nsInclude: expandedNsInclude,
+            nsExclude: expandedNsExclude,
           });
           if (keptEntries === 0) {
             logger.debug({ sliceKey: slice.key }, "Skipping oplog slice with 0 matching entries");
@@ -561,30 +847,33 @@ export async function restorePointInTime(
       }
     } else if (plan.slices.length > 0) {
       // Production streaming OplogApplier (0 temp disk files, cross-slice txns, index DDL, rename cloning)
-      const client = new MongoClient(uri);
-      await client.connect();
-      const applier = new OplogApplier({
-        target: new MongoOplogTargetClient(client),
-        workDir: config.workDir,
-        logger,
-        startExclusiveTs: replayedBaseOplog ? plan.baseEndTs : undefined,
-        endTs: plan.targetTs,
-        filter: {
-          database: isFilteredCluster ? target : undefined,
-          nsInclude,
-          nsExclude,
-          clone: isRenamedDb ? { fromDb: source, toDb: target } : undefined,
-        },
-        backupType: "logical",
-      });
+      const client = (ctx.createMongoClient ?? ((u) => new MongoClient(u)))(uri);
+      let applier: OplogApplier | null = null;
 
       try {
+        await connectMongoWithSignal(client, controller.signal);
+        applier = new OplogApplier({
+          target: new MongoOplogTargetClient(client),
+          workDir: config.workDir,
+          logger,
+          startTs: stage2StartTs,
+          startExclusiveTs: stage2StartExclusiveTs,
+          endTs: plan.targetTs,
+          filter: {
+            database: isFilteredCluster ? target : undefined,
+            nsInclude: expandedNsInclude,
+            nsExclude: expandedNsExclude,
+            clone: isRenamedDb ? { fromDb: source, toDb: target } : undefined,
+          },
+          backupType: "logical",
+        });
+
         for (const slice of plan.slices) {
           const prevApplied = applier.getStats().appliedEntries;
           await streamOplogSlice(
             { config, storage, signal: controller.signal },
             slice.key,
-            (stream) => applier.applyStream(stream, controller.signal),
+            (stream) => applier!.applyStream(stream, controller.signal),
           );
           const appliedInSlice = applier.getStats().appliedEntries - prevApplied;
           logger.info(
@@ -614,7 +903,7 @@ export async function restorePointInTime(
           "Completed PITR oplog replay",
         );
       } finally {
-        await applier.dispose();
+        await applier?.dispose();
         await client.close().catch(() => {});
       }
     }
