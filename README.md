@@ -168,7 +168,7 @@ When a restore is requested:
 - **Authenticated Manifests & Key Rotation:** Manifests signed with HMAC-SHA256. Historical archives encrypted under older keys remain restorable using `ENCRYPTION_KEY_RING`.
 - **Ransomware Immutability (S3 Object Lock WORM):** Supports AWS S3 Object Lock in `GOVERNANCE` or `COMPLIANCE` modes and Legal Hold.
 - **Grandfather-Father-Son (GFS) Retention:** Timezone-aware retention buckets (`keepLast`, `keepDaily`, `keepWeekly`, `keepMonthly`) with safety gates preventing deletion of base backups anchoring active PITR chains.
-- **Automated Restore Drills:** Scheduled validation that restores backups into isolated ephemeral databases (`_drill_<db>_<timestamp>`), verifies document counts, and reports oplog variances.
+- **Automated Restore Drills:** Scheduled validation that restores backups into isolated ephemeral databases (`<database>_drill_<timestamp>`), verifies document counts, and reports oplog variances.
 - **Hybrid Concurrency Locking:** Local atomic PID lockfiles (`flag: "wx"`, stale takeover via atomic rename) combined with distributed S3 conditional PUT leases (`IfNoneMatch: "*"` / `IfMatch: etag`).
 - **Observability:** Prometheus metrics (`/metrics`), Kubernetes probes (`/healthz`, `/ready`), and SMTP email alerting via Nodemailer.
 
@@ -266,7 +266,7 @@ src/
 ├── retention.ts          # Grandfather-Father-Son retention planner and pruner
 ├── drill.ts              # Automated restore drill runner and document counter
 ├── metrics.ts            # Prometheus registry and HTTP server (/healthz, /ready)
-├── notify.ts             # Notification dispatcher (Email, Slack, Webhook, Ping)
+├── notify.ts             # Email notification dispatcher (Nodemailer SMTP)
 ├── mongo.ts              # Native MongoDB connection and cluster inspection
 ├── tools.ts              # Safe subprocess executor for mongodump / mongorestore
 ├── tar.ts                # POSIX UStar tar streaming generator and extractor
@@ -654,7 +654,7 @@ The `physical` engine performs hot physical copies of raw WiredTiger storage eng
 5. After all `.wt` data files finish streaming, MongoVault queries majority `lastCommittedOpTime` and calls `$backupCursorExtend` to fetch and stream only the cursor-pinned journal files covering up to the majority timestamp. An asynchronous keep-alive timer pings `$backupCursor` every 45 seconds and aborts the backup immediately if the cursor is lost.
 6. **Physical Restore & Small-Disk 1x Mode:** Before touching disk, `restorePhysicalBackup` checks for a non-empty `mongod.lock` (refusing to overwrite a live `mongod`), validates `major.minor` version compatibility against local `mongod`, and inspects free space via `fs.statfs()`:
    - **>= 1.1× free space:** Extracts to a hidden staging directory, verifies SHA-256 & byte size, moves all existing entries (including `--directoryperdb` / `--wiredTigerDirectoryForIndexes` subdirectories) into a rollback directory, and swaps atomically.
-   - **Small-disk mode (`< 1.1×` free, but `free + existing >= 1.1×`):** Runs zero-disk streaming pre-verification FIRST, then clears old data files and extracts directly into `targetDbPath` using 1× disk space.
+   - **Small-disk mode (`< 1.1×` free, but `free + existing >= 1.1×`, requires explicit `allowDirectMode: true` opt-in):** Runs zero-disk streaming pre-verification FIRST, then clears old data files and extracts directly into `targetDbPath` using 1× disk space.
    - **Insufficient disk space:** Fails fast before modifying any files.
 7. **Multi-Step WiredTiger & Replica Set Recovery (`PhysicalRecoveryCoordinator`):** Preserves `WiredTiger.backup` (removing only `mongod.lock`, `WiredTiger.lock`, `ongoingBackup.lock`) and boots ephemeral local `mongod` steps:
    - For `$backupCursor` snapshots: writes `local.replset.minvalid` + `local.replset.oplogTruncateAfterPoint`, then runs `recoverFromOplogAsStandalone=true` + `takeUnstableCheckpointOnShutdown=true` to bring WiredTiger to the exact consistent point.
@@ -942,7 +942,7 @@ MongoVault distinguishes three distinct layers of data integrity protection:
 
 1. **Per-Frame AEAD Authentication (Inline Streaming Protection):**
    - In encrypted mode (`aes-256-gcm-chunked`), data is divided into isolated 64 KiB frames.
-   - Each frame includes a 16-byte Poly1305/GCM authentication tag and binds the 5-byte frame index + `isFinal` flag as Additional Authenticated Data (AAD).
+   - Each frame includes a 16-byte GCM authentication tag and binds the 5-byte frame index + `isFinal` flag as Additional Authenticated Data (AAD).
    - The decryptor validates the authentication tag of every frame **before** emitting any plaintext bytes to `mongorestore`. If a frame has been tampered with or truncated, the stream halts immediately and throws an authentication error.
 
 2. **Whole-Archive Checksum Verification (Upfront vs. Streaming):**
@@ -1698,74 +1698,74 @@ node dist/index.js restore \
 
 Configuration settings are validated at startup via Zod (`src/config.ts`).
 
-| Variable                               |  Type   |       Default        | Required? | Description & Implications                                                                    |
-| :------------------------------------- | :-----: | :------------------: | :-------: | :-------------------------------------------------------------------------------------------- |
-| **MongoDB Settings**                   |         |                      |           |                                                                                               |
-| `MONGODB_URI`                          | String  |        _None_        |  **Yes**  | Standard MongoDB connection URI. Supports standalone, replica sets, and `mongos`.             |
-| `MONGODB_DATABASE`                     | String  |        `"*"`         |    No     | Target database. Set to `*` or `all` for full cluster backup (required for oplog/PITR).       |
-| `MONGODB_EXCLUDE_COLLECTIONS`          | String  |         `""`         |    No     | Comma-separated collections to exclude. Cannot be used with full cluster backup (`*`).        |
-| `MONGODB_OPLOG`                        | Boolean |       `false`        |    No     | Capture point-in-time oplog during logical dump. Requires `MONGODB_DATABASE=*`.               |
-| `MONGODB_PARALLEL_COLLECTIONS`         | Number  |         `2`          |    No     | Concurrently dumped collections (`1`–`32`). Lower to `1`–`2` for memory-constrained hosts.    |
-| `MONGODB_READ_PREFERENCE`              | String  | `secondaryPreferred` |    No     | Read preference: `primary`, `primaryPreferred`, `secondary`, `secondaryPreferred`, `nearest`. |
-| **Backup Engines & Sharding**          |         |                      |           |                                                                                               |
-| `BACKUP_ENGINE`                        | String  |      `logical`       |    No     | Default engine: `logical` or `physical`.                                                      |
-| `PHYSICAL_DB_PATH`                     |  Path   |        _None_        |   Cond.   | Local WiredTiger filesystem path. Required when `BACKUP_ENGINE=physical`.                     |
-| `PHYSICAL_ENCRYPTION_KEY_FILE`         |  Path   |        _None_        |    No     | WiredTiger Encryption-at-Rest keyfile passed to recovery `mongod` during physical restore.    |
-| `PHYSICAL_DIRECTORY_PER_DB`            | Boolean |       `false`        |    No     | Enables `--directoryperdb` on ephemeral recovery `mongod` (auto-detected from manifest too).  |
-| `PHYSICAL_ALLOW_FSYNC_LOCK`            | Boolean |       `false`        |    No     | Opt-in to write-blocking `fsyncLock` fallback when `$backupCursor` is unavailable.            |
-| `PHYSICAL_ALLOW_PRIMARY_FSYNC_LOCK`    | Boolean |       `false`        |    No     | Allow `fsyncLock` on a multi-node replica set PRIMARY (requires `PHYSICAL_ALLOW_FSYNC_LOCK`). |
-| `PHYSICAL_FSYNC_LOCK_TIMEOUT_MS`       | Number  |       `300000`       |    No     | Watchdog timeout in milliseconds before automatically releasing an active `fsyncLock`.        |
-| `SHARDING_ENABLED`                     | Boolean |       `false`        |    No     | Coordinates distributed backup/restore across `mongos`, `configsvr`, and shard replica sets.  |
-| `SHARDING_CONFIGSVR_URI`               | String  |        _None_        |    No     | Optional dedicated Config Server connection URI.                                              |
-| **Point-in-Time Recovery (PITR)**      |         |                      |           |                                                                                               |
-| `PITR_ENABLED`                         | Boolean |       `false`        |    No     | Runs continuous oplog slicer daemon. Requires replica set and `MONGODB_DATABASE=*`.           |
-| `PITR_FLUSH_INTERVAL_SECONDS`          | Number  |         `60`         |    No     | Interval between oplog slice flushes (`5`–`3600` seconds). Governs recovery point objective.  |
-| `PITR_MAX_SLICE_MB`                    | Number  |         `16`         |    No     | Maximum uncompressed BSON size per oplog slice (`1`–`256` MiB).                               |
-| **Storage Destination**                |         |                      |           |                                                                                               |
-| `STORAGE_TYPE`                         | String  |         `s3`         |    No     | Storage backend: `s3` or `filesystem`.                                                        |
-| `STORAGE_PATH`                         |  Path   |        _None_        |   Cond.   | Directory path when `STORAGE_TYPE=filesystem`. Required if filesystem storage is used.        |
-| `S3_BUCKET`                            | String  |  `mongodb-backups`   |   Cond.   | S3 bucket name. Required when `STORAGE_TYPE=s3`.                                              |
-| `S3_ACCESS_KEY_ID`                     | String  |         `""`         |   Cond.   | AWS Access Key ID. Required when `STORAGE_TYPE=s3`.                                           |
-| `S3_SECRET_ACCESS_KEY`                 | String  |         `""`         |   Cond.   | AWS Secret Access Key. Required when `STORAGE_TYPE=s3`.                                       |
-| `S3_REGION`                            | String  |     `ap-south-1`     |    No     | AWS region. Falls back to `AWS_REGION` or `ap-south-1`.                                       |
-| `S3_ENDPOINT`                          |   URL   |        _None_        |    No     | Custom S3 endpoint URL (e.g. LocalStack, MinIO, AWS VPC Endpoint).                            |
-| `S3_FORCE_PATH_STYLE`                  | Boolean |       `false`        |    No     | Forces path-style addressing (`http://endpoint/bucket`). Required for LocalStack/MinIO.       |
-| `S3_PREFIX`                            | String  |     `"mongodb"`      |    No     | Key prefix inside the bucket.                                                                 |
-| `S3_PART_SIZE_MB`                      | Number  |         `32`         |    No     | S3 multipart upload part size (`5`–`512` MiB). Controls buffer memory and max archive size.   |
-| `S3_QUEUE_SIZE`                        | Number  |         `2`          |    No     | Concurrent multipart upload streams (`1`–`16`).                                               |
-| **S3 Object Lock (WORM Immutability)** |         |                      |           |                                                                                               |
-| `S3_OBJECT_LOCK_ENABLED`               | Boolean |       `false`        |    No     | Applies S3 Object Lock retention headers to uploaded archives.                                |
-| `S3_OBJECT_LOCK_MODE`                  | String  |     `GOVERNANCE`     |    No     | Lock mode: `GOVERNANCE` (bypassable with IAM permissions) or `COMPLIANCE` (unconditional).    |
-| `S3_OBJECT_LOCK_RETENTION_DAYS`        | Number  |         `30`         |    No     | Number of days to enforce WORM retention (`1`–`36500`).                                       |
-| `S3_OBJECT_LOCK_LEGAL_HOLD`            | Boolean |       `false`        |    No     | Applies S3 Legal Hold status (`ON`) to uploaded objects.                                      |
-| **Client-Side Encryption**             |         |                      |           |                                                                                               |
-| `ENCRYPTION_KEY`                       | String  |        _None_        |    No     | 32-byte master key (Base64 or Hex). Enables AES-256-GCM chunked envelope encryption.          |
-| `ENCRYPTION_KEY_RING`                  | String  |        _None_        |    No     | Comma-separated list of historical 32-byte keys for decrypting older rotated backups.         |
-| `REQUIRE_ENCRYPTION`                   | Boolean |       `false`        |    No     | Fail closed if `ENCRYPTION_KEY` is missing; recommended for production deployments.           |
-| **Schedule & Execution**               |         |                      |           |                                                                                               |
-| `BACKUP_CRON`                          | String  |    `"0 2 * * *"`     |    No     | Standard 5-field cron expression for automated backups (default: 02:00 daily).                |
-| `BACKUP_TIMEZONE`                      | String  |       `"UTC"`        |    No     | IANA timezone identifier for cron schedules and retention date bucketing.                     |
-| `BACKUP_TIMEOUT_MINUTES`               | Number  |        `180`         |    No     | Maximum execution duration before timing out and aborting backup (minutes).                   |
-| `BACKUP_ON_START`                      | Boolean |       `false`        |    No     | Triggers an immediate backup run upon daemon startup.                                         |
-| `WORK_DIR`                             |  Path   |    `os.tmpdir()`     |    No     | Local directory for PID lockfiles, `0o600` URI configs, and >8 MiB single-txn spill files.    |
-| **Retention Policy (GFS)**             |         |                      |           |                                                                                               |
-| `RETENTION_KEEP_LAST`                  | Number  |        _None_        |    No     | Keep the $N$ most recent complete backups unconditionally.                                    |
-| `RETENTION_KEEP_DAILY`                 | Number  |        _None_        |    No     | Keep 1 backup per day for $N$ days.                                                           |
-| `RETENTION_KEEP_WEEKLY`                | Number  |        _None_        |    No     | Keep 1 backup per ISO week for $N$ weeks.                                                     |
-| `RETENTION_KEEP_MONTHLY`               | Number  |        _None_        |    No     | Keep 1 backup per calendar month for $N$ months.                                              |
-| **Automated Restore Drills**           |         |                      |           |                                                                                               |
-| `DRILL_MONGODB_URI`                    | String  |        _None_        |    No     | Isolated staging MongoDB connection URI. Must NOT match `MONGODB_URI`.                        |
-| `DRILL_CRON`                           | String  |        _None_        |   Cond.   | Cron expression for restore drills. Requires `DRILL_MONGODB_URI`.                             |
-| **Notifications & Observability**      |         |                      |           |                                                                                               |
-| `NOTIFY_ON_SUCCESS`                    | Boolean |        `true`        |    No     | Dispatch email notifications on successful backup runs as well as failures.                   |
-| `SMTP_HOST`                            | String  |        _None_        |    No     | SMTP mail server hostname. Requires `SMTP_FROM` and `SMTP_TO`.                                |
-| `SMTP_PORT`                            | Number  |        `587`         |    No     | SMTP server port.                                                                             |
-| `SMTP_SECURE`                          | Boolean |       `false`        |    No     | Enable TLS/SSL connection for SMTP.                                                           |
-| `SMTP_USER` / `SMTP_PASSWORD`          | String  |        _None_        |    No     | SMTP authentication credentials.                                                              |
-| `SMTP_FROM`                            | String  |        _None_        |   Cond.   | Email sender address. Required if `SMTP_HOST` is set.                                         |
-| `SMTP_TO`                              | String  |        _None_        |   Cond.   | Comma-separated recipient email addresses. Required if `SMTP_HOST` is set.                    |
-| `HTTP_PORT`                            | Number  |        `8080`        |    No     | Port for `/healthz`, `/ready`, and `/metrics`. Set to `0` to disable HTTP server.             |
-| `LOG_LEVEL`                            | String  |       `"info"`       |    No     | Logger level: `fatal`, `error`, `warn`, `info`, `debug`, `trace`.                             |
+| Variable                               |  Type   |            Default             | Required? | Description & Implications                                                                    |
+| :------------------------------------- | :-----: | :----------------------------: | :-------: | :-------------------------------------------------------------------------------------------- |
+| **MongoDB Settings**                   |         |                                |           |                                                                                               |
+| `MONGODB_URI`                          | String  |             _None_             |  **Yes**  | Standard MongoDB connection URI. Supports standalone, replica sets, and `mongos`.             |
+| `MONGODB_DATABASE`                     | String  |             `"*"`              |    No     | Target database. Set to `*` or `all` for full cluster backup (required for oplog/PITR).       |
+| `MONGODB_EXCLUDE_COLLECTIONS`          | String  |              `""`              |    No     | Comma-separated collections to exclude. Cannot be used with full cluster backup (`*`).        |
+| `MONGODB_OPLOG`                        | Boolean |            `false`             |    No     | Capture point-in-time oplog during logical dump. Requires `MONGODB_DATABASE=*`.               |
+| `MONGODB_PARALLEL_COLLECTIONS`         | Number  |              `2`               |    No     | Concurrently dumped collections (`1`–`32`). Lower to `1`–`2` for memory-constrained hosts.    |
+| `MONGODB_READ_PREFERENCE`              | String  |      `secondaryPreferred`      |    No     | Read preference: `primary`, `primaryPreferred`, `secondary`, `secondaryPreferred`, `nearest`. |
+| **Backup Engines & Sharding**          |         |                                |           |                                                                                               |
+| `BACKUP_ENGINE`                        | String  |           `logical`            |    No     | Default engine: `logical` or `physical`.                                                      |
+| `PHYSICAL_DB_PATH`                     |  Path   |             _None_             |   Cond.   | Local WiredTiger filesystem path. Required when `BACKUP_ENGINE=physical`.                     |
+| `PHYSICAL_ENCRYPTION_KEY_FILE`         |  Path   |             _None_             |    No     | WiredTiger Encryption-at-Rest keyfile passed to recovery `mongod` during physical restore.    |
+| `PHYSICAL_DIRECTORY_PER_DB`            | Boolean |            `false`             |    No     | Enables `--directoryperdb` on ephemeral recovery `mongod` (auto-detected from manifest too).  |
+| `PHYSICAL_ALLOW_FSYNC_LOCK`            | Boolean |            `false`             |    No     | Opt-in to write-blocking `fsyncLock` fallback when `$backupCursor` is unavailable.            |
+| `PHYSICAL_ALLOW_PRIMARY_FSYNC_LOCK`    | Boolean |            `false`             |    No     | Allow `fsyncLock` on a multi-node replica set PRIMARY (requires `PHYSICAL_ALLOW_FSYNC_LOCK`). |
+| `PHYSICAL_FSYNC_LOCK_TIMEOUT_MS`       | Number  |            `300000`            |    No     | Watchdog timeout in milliseconds before automatically releasing an active `fsyncLock`.        |
+| `SHARDING_ENABLED`                     | Boolean |            `false`             |    No     | Coordinates distributed backup/restore across `mongos`, `configsvr`, and shard replica sets.  |
+| `SHARDING_CONFIGSVR_URI`               | String  |             _None_             |    No     | Optional dedicated Config Server connection URI.                                              |
+| **Point-in-Time Recovery (PITR)**      |         |                                |           |                                                                                               |
+| `PITR_ENABLED`                         | Boolean |            `false`             |    No     | Runs continuous oplog slicer daemon. Requires replica set and `MONGODB_DATABASE=*`.           |
+| `PITR_FLUSH_INTERVAL_SECONDS`          | Number  |              `60`              |    No     | Interval between oplog slice flushes (`5`–`3600` seconds). Governs recovery point objective.  |
+| `PITR_MAX_SLICE_MB`                    | Number  |              `16`              |    No     | Maximum uncompressed BSON size per oplog slice (`1`–`256` MiB).                               |
+| **Storage Destination**                |         |                                |           |                                                                                               |
+| `STORAGE_TYPE`                         | String  |              `s3`              |    No     | Storage backend: `s3` or `filesystem`.                                                        |
+| `STORAGE_PATH`                         |  Path   |             _None_             |   Cond.   | Directory path when `STORAGE_TYPE=filesystem`. Required if filesystem storage is used.        |
+| `S3_BUCKET`                            | String  |       `mongodb-backups`        |   Cond.   | S3 bucket name. Required when `STORAGE_TYPE=s3`.                                              |
+| `S3_ACCESS_KEY_ID`                     | String  |              `""`              |   Cond.   | AWS Access Key ID. Required when `STORAGE_TYPE=s3`.                                           |
+| `S3_SECRET_ACCESS_KEY`                 | String  |              `""`              |   Cond.   | AWS Secret Access Key. Required when `STORAGE_TYPE=s3`.                                       |
+| `S3_REGION`                            | String  |          `ap-south-1`          |    No     | AWS region. Falls back to `AWS_REGION` or `ap-south-1`.                                       |
+| `S3_ENDPOINT`                          |   URL   |             _None_             |    No     | Custom S3 endpoint URL (e.g. LocalStack, MinIO, AWS VPC Endpoint).                            |
+| `S3_FORCE_PATH_STYLE`                  | Boolean |            `false`             |    No     | Forces path-style addressing (`http://endpoint/bucket`). Required for LocalStack/MinIO.       |
+| `S3_PREFIX`                            | String  |          `"mongodb"`           |    No     | Key prefix inside the bucket.                                                                 |
+| `S3_PART_SIZE_MB`                      | Number  |              `32`              |    No     | S3 multipart upload part size (`5`–`512` MiB). Controls buffer memory and max archive size.   |
+| `S3_QUEUE_SIZE`                        | Number  |              `2`               |    No     | Concurrent multipart upload streams (`1`–`16`).                                               |
+| **S3 Object Lock (WORM Immutability)** |         |                                |           |                                                                                               |
+| `S3_OBJECT_LOCK_ENABLED`               | Boolean |            `false`             |    No     | Applies S3 Object Lock retention headers to uploaded archives.                                |
+| `S3_OBJECT_LOCK_MODE`                  | String  |          `GOVERNANCE`          |    No     | Lock mode: `GOVERNANCE` (bypassable with IAM permissions) or `COMPLIANCE` (unconditional).    |
+| `S3_OBJECT_LOCK_RETENTION_DAYS`        | Number  |              `30`              |    No     | Number of days to enforce WORM retention (positive integer).                                  |
+| `S3_OBJECT_LOCK_LEGAL_HOLD`            | Boolean |            `false`             |    No     | Applies S3 Legal Hold status (`ON`) to uploaded objects.                                      |
+| **Client-Side Encryption**             |         |                                |           |                                                                                               |
+| `ENCRYPTION_KEY`                       | String  |             _None_             |    No     | 32-byte master key (Base64 or Hex). Enables AES-256-GCM chunked envelope encryption.          |
+| `ENCRYPTION_KEY_RING`                  | String  |             _None_             |    No     | Comma-separated list of historical 32-byte keys for decrypting older rotated backups.         |
+| `REQUIRE_ENCRYPTION`                   | Boolean |            `false`             |    No     | Fail closed if `ENCRYPTION_KEY` is missing; recommended for production deployments.           |
+| **Schedule & Execution**               |         |                                |           |                                                                                               |
+| `BACKUP_CRON`                          | String  |         `"0 2 * * *"`          |    No     | Standard 5-field cron expression for automated backups (default: 02:00 daily).                |
+| `BACKUP_TIMEZONE`                      | String  |            `"UTC"`             |    No     | IANA timezone identifier for cron schedules and retention date bucketing.                     |
+| `BACKUP_TIMEOUT_MINUTES`               | Number  |             `180`              |    No     | Maximum execution duration before timing out and aborting backup (minutes).                   |
+| `BACKUP_ON_START`                      | Boolean |            `false`             |    No     | Triggers an immediate backup run upon daemon startup.                                         |
+| `WORK_DIR`                             |  Path   | `<os.tmpdir()>/mongodb-backup` |    No     | Local directory for PID lockfiles, `0o600` URI configs, and >8 MiB single-txn spill files.    |
+| **Retention Policy (GFS)**             |         |                                |           |                                                                                               |
+| `RETENTION_KEEP_LAST`                  | Number  |             _None_             |    No     | Keep the $N$ most recent complete backups unconditionally.                                    |
+| `RETENTION_KEEP_DAILY`                 | Number  |             _None_             |    No     | Keep 1 backup per day for $N$ days.                                                           |
+| `RETENTION_KEEP_WEEKLY`                | Number  |             _None_             |    No     | Keep 1 backup per ISO week for $N$ weeks.                                                     |
+| `RETENTION_KEEP_MONTHLY`               | Number  |             _None_             |    No     | Keep 1 backup per calendar month for $N$ months.                                              |
+| **Automated Restore Drills**           |         |                                |           |                                                                                               |
+| `DRILL_MONGODB_URI`                    | String  |             _None_             |    No     | Isolated staging MongoDB connection URI. Must NOT match `MONGODB_URI`.                        |
+| `DRILL_CRON`                           | String  |             _None_             |   Cond.   | Cron expression for restore drills. Requires `DRILL_MONGODB_URI`.                             |
+| **Notifications & Observability**      |         |                                |           |                                                                                               |
+| `NOTIFY_ON_SUCCESS`                    | Boolean |             `true`             |    No     | Dispatch email notifications on successful backup runs as well as failures.                   |
+| `SMTP_HOST`                            | String  |             _None_             |    No     | SMTP mail server hostname. Requires `SMTP_FROM` and `SMTP_TO`.                                |
+| `SMTP_PORT`                            | Number  |             `587`              |    No     | SMTP server port.                                                                             |
+| `SMTP_SECURE`                          | Boolean |            `false`             |    No     | Enable TLS/SSL connection for SMTP.                                                           |
+| `SMTP_USER` / `SMTP_PASSWORD`          | String  |             _None_             |    No     | SMTP authentication credentials.                                                              |
+| `SMTP_FROM`                            | String  |             _None_             |   Cond.   | Email sender address. Required if `SMTP_HOST` is set.                                         |
+| `SMTP_TO`                              | String  |             _None_             |   Cond.   | Comma-separated recipient email addresses. Required if `SMTP_HOST` is set.                    |
+| `HTTP_PORT`                            | Number  |             `8080`             |    No     | Port for `/healthz`, `/ready`, and `/metrics`. Set to `0` to disable HTTP server.             |
+| `LOG_LEVEL`                            | String  |            `"info"`            |    No     | Logger level: `fatal`, `error`, `warn`, `info`, `debug`, `trace`.                             |
 
 ---
 
@@ -1786,13 +1786,13 @@ $$\text{Buffer Memory} \approx (32\text{ MiB} \times 2) + 1\text{ MiB} \approx 6
 
 AWS S3 enforces a hard limit of **10,000 parts** per multipart upload:
 
-| `S3_PART_SIZE_MB`  | In-Flight Upload Buffer | Maximum Single Archive Size Limit | Recommended Database Size |
-| :----------------: | :---------------------: | :-------------------------------: | :-----------------------: |
-|    `5` (S3 Min)    |         ~11 MiB         |               50 GB               |          < 40 GB          |
-| **`32` (Default)** |       **~65 MiB**       |            **320 GB**             |     **Up to 250 GB**      |
-|        `64`        |        ~129 MiB         |              640 GB               |       Up to 500 GB        |
-|       `128`        |        ~257 MiB         |              1.28 TB              |        Up to 1 TB         |
-|       `512`        |        ~1.0 GiB         |     5.0 TB (S3 Object Limit)      |      Multi-Terabyte       |
+| `S3_PART_SIZE_MB`  | In-Flight Upload Buffer  | Maximum Single Archive Size Limit | Recommended Database Size |
+| :----------------: | :----------------------: | :-------------------------------: | :-----------------------: |
+|    `5` (S3 Min)    |         ~11 MiB          |               50 GB               |          < 40 GB          |
+| **`32` (Default)** |       **~65 MiB**        |            **320 GB**             |     **Up to 250 GB**      |
+|        `64`        |         ~129 MiB         |              640 GB               |       Up to 500 GB        |
+|       `128`        | ~129 MiB (`queueSize=1`) |              1.28 TB              |        Up to 1 TB         |
+|       `512`        | ~513 MiB (`queueSize=1`) |     5.0 TB (S3 Object Limit)      |      Multi-Terabyte       |
 
 ---
 
