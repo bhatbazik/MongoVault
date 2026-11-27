@@ -1,7 +1,7 @@
 # MongoVault
 
 [![CI](https://github.com/bhatbazik/MongoVault/actions/workflows/ci.yml/badge.svg)](https://github.com/bhatbazik/MongoVault/actions/workflows/ci.yml)
-[![Node](https://img.shields.io/badge/node-%3E%3D20.0.0-blue.svg)](https://nodejs.org)
+[![Node](https://img.shields.io/badge/node-%3E%3D22.22.1-blue.svg)](https://nodejs.org)
 [![TypeScript](https://img.shields.io/badge/TypeScript-6.0-3178C6.svg)](https://www.typescriptlang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -44,7 +44,7 @@
   - [5.7 Retention Policy Engine (Grandfather-Father-Son)](#57-retention-policy-engine-grandfather-father-son)
   - [5.8 Automated Restore Drills and Verification](#58-automated-restore-drills-and-verification)
   - [5.9 Observability, Health Probes and Prometheus Metrics](#59-observability-health-probes-and-prometheus-metrics)
-  - [5.10 Notification Dispatcher](#510-notification-dispatcher)
+  - [5.10 Email Notification Dispatcher](#510-email-notification-dispatcher)
 - [Part 6 — Point-in-Time Recovery (PITR)](#part-6--point-in-time-recovery-pitr)
   - [Why Ordinary Backups Are Insufficient](#why-ordinary-backups-are-insufficient)
   - [MongoDB Oplog Mechanics](#mongodb-oplog-mechanics)
@@ -73,8 +73,10 @@
 - [Part 10 — Configuration Reference](#part-10--configuration-reference)
 - [Part 11 — Operational Considerations](#part-11--operational-considerations)
   - [Memory Footprint and S3 Multipart Sizing](#memory-footprint-and-s3-multipart-sizing)
-  - [Physical Backup Host Locality](#physical-backup-host-locality)
+  - [Physical Backup Host Locality & `fsyncLock` Safety](#physical-backup-host-locality--fsynclock-safety)
+  - [Isolated-Target Restore Policy](#isolated-target-restore-policy)
   - [Sharded Cluster Operational Limits](#sharded-cluster-operational-limits)
+  - [Production Hardening Baseline](#production-hardening-baseline)
   - [Recovery Objectives (RPO and RTO)](#recovery-objectives-rpo-and-rto)
 - [Part 12 — Project Structure and Development](#part-12--project-structure-and-development)
   - [Source Code Organization](#source-code-organization)
@@ -211,7 +213,7 @@ flowchart TD
         MongoDB[(MongoDB Cluster\nPrimary / Secondary)]
         Storage[(Storage Target\nAWS S3 / Filesystem)]
         Prometheus["Prometheus / Monitoring"]
-        Alerts["Notification Channels\n(Slack, Webhook, SMTP, Ping)"]
+        Alerts["SMTP Email Notifications\n(Nodemailer)"]
     end
 
     CLI --> Config
@@ -432,7 +434,7 @@ The following chronological sequence occurs when executing a backup (`mongodb-ba
     - The ephemeral URI YAML file is unlinked.
     - If `RETENTION_KEEP_*` policies are set, `prune()` evaluates retention buckets and executes batched deletions.
     - Prometheus metrics are recorded (`mongodb_backup_runs_total`, `mongodb_backup_size_bytes`).
-    - Notifications are dispatched to configured channels (Slack, Email, Webhook, Heartbeat).
+    - Email notifications are dispatched via SMTP (if configured).
     - Local and distributed locks are released.
 
 ---
@@ -488,7 +490,7 @@ sequenceDiagram
         CLI->>S3: Evaluate GFS retention & prune expired backups
     end
 
-    CLI->>Notif: Record metrics & dispatch alerts (Slack/Email/Ping)
+    CLI->>Notif: Record metrics & dispatch SMTP email alerts
     CLI->>Lock: Release hybrid lock (local file + S3 delete)
     CLI-->>Op: Backup Completed Successfully
 ```
@@ -1413,7 +1415,7 @@ For disaster-safe production restores:
 
 ### Prerequisites
 
-- **Node.js:** `>= 20.0.0`
+- **Node.js:** `>= 22.22.1` (tested on Node 24.x and 26.x)
 - **MongoDB Database Tools:** `mongodump` and `mongorestore` must be installed and present in your system `PATH` for logical backups and oplog replay.
 
 To install database tools on Debian/Ubuntu:
@@ -1446,7 +1448,7 @@ npm link
 
 ### Quickstart with Docker Compose
 
-The repository includes a ready-to-run `docker-compose.yml` spinning up MongoDB 7.0, LocalStack (emulating AWS S3), and the MongoVault daemon:
+The repository includes a ready-to-run `docker-compose.yml` spinning up MongoDB 9.0, LocalStack (emulating AWS S3), and the MongoVault daemon:
 
 ```bash
 docker compose up -d
@@ -1465,7 +1467,15 @@ curl http://localhost:8080/metrics
 
 All commands support `--json` for machine-readable automation and `-h` / `--help` for syntax help.
 
-#### 1. System Health & Diagnostics
+#### 1. Interactive Dashboard, System Health & Diagnostics
+
+##### `tui` / `ui`
+
+Launches the interactive live terminal dashboard displaying cluster topology, storage health, recent backups, PITR timeline contiguity, and preflight checks.
+
+```bash
+node dist/index.js tui
+```
 
 ##### `status`
 
@@ -1626,10 +1636,14 @@ node dist/index.js delete --key <key> --force
 
 ##### `drill`
 
-Executes an immediate automated restore drill against `DRILL_MONGODB_URI`, verifies document counts against the manifest, and drops the staging database.
+Executes an immediate automated restore drill against `DRILL_MONGODB_URI`, verifies collection counts, schemas, indexes, validators, views, and read/write probes, and drops the staging database.
 
 ```bash
+# Drill the latest base backup
 node dist/index.js drill
+
+# Drill a Point-in-Time Recovery target
+node dist/index.js drill --pitr latest
 ```
 
 ##### `key:generate`
@@ -1698,6 +1712,9 @@ Configuration settings are validated at startup via Zod (`src/config.ts`).
 | `PHYSICAL_DB_PATH`                     |  Path   |        _None_        |   Cond.   | Local WiredTiger filesystem path. Required when `BACKUP_ENGINE=physical`.                     |
 | `PHYSICAL_ENCRYPTION_KEY_FILE`         |  Path   |        _None_        |    No     | WiredTiger Encryption-at-Rest keyfile passed to recovery `mongod` during physical restore.    |
 | `PHYSICAL_DIRECTORY_PER_DB`            | Boolean |       `false`        |    No     | Enables `--directoryperdb` on ephemeral recovery `mongod` (auto-detected from manifest too).  |
+| `PHYSICAL_ALLOW_FSYNC_LOCK`            | Boolean |       `false`        |    No     | Opt-in to write-blocking `fsyncLock` fallback when `$backupCursor` is unavailable.            |
+| `PHYSICAL_ALLOW_PRIMARY_FSYNC_LOCK`    | Boolean |       `false`        |    No     | Allow `fsyncLock` on a multi-node replica set PRIMARY (requires `PHYSICAL_ALLOW_FSYNC_LOCK`). |
+| `PHYSICAL_FSYNC_LOCK_TIMEOUT_MS`       | Number  |       `300000`       |    No     | Watchdog timeout in milliseconds before automatically releasing an active `fsyncLock`.        |
 | `SHARDING_ENABLED`                     | Boolean |       `false`        |    No     | Coordinates distributed backup/restore across `mongos`, `configsvr`, and shard replica sets.  |
 | `SHARDING_CONFIGSVR_URI`               | String  |        _None_        |    No     | Optional dedicated Config Server connection URI.                                              |
 | **Point-in-Time Recovery (PITR)**      |         |                      |           |                                                                                               |
@@ -1724,6 +1741,7 @@ Configuration settings are validated at startup via Zod (`src/config.ts`).
 | **Client-Side Encryption**             |         |                      |           |                                                                                               |
 | `ENCRYPTION_KEY`                       | String  |        _None_        |    No     | 32-byte master key (Base64 or Hex). Enables AES-256-GCM chunked envelope encryption.          |
 | `ENCRYPTION_KEY_RING`                  | String  |        _None_        |    No     | Comma-separated list of historical 32-byte keys for decrypting older rotated backups.         |
+| `REQUIRE_ENCRYPTION`                   | Boolean |       `false`        |    No     | Fail closed if `ENCRYPTION_KEY` is missing; recommended for production deployments.           |
 | **Schedule & Execution**               |         |                      |           |                                                                                               |
 | `BACKUP_CRON`                          | String  |    `"0 2 * * *"`     |    No     | Standard 5-field cron expression for automated backups (default: 02:00 daily).                |
 | `BACKUP_TIMEZONE`                      | String  |       `"UTC"`        |    No     | IANA timezone identifier for cron schedules and retention date bucketing.                     |
@@ -1860,6 +1878,7 @@ src/
 │   ├── drill.ts          # Restore drill handler
 │   ├── oplog.ts          # PITR slice/tail/prune handlers
 │   ├── diagnostic.ts     # System diagnostic bundle exporter
+│   ├── command-lock.ts   # Shared CLI hybrid lock & termination signal guard
 │   └── daemon.ts         # Long-running scheduler daemon handler
 ├── types/                # TypeScript interface definitions
 │   ├── config.ts         # Zod schemas and configuration contracts
@@ -1885,7 +1904,7 @@ src/
 ├── retention.ts          # Grandfather-Father-Son retention planner
 ├── drill.ts              # Automated restore drill runner
 ├── metrics.ts            # Prometheus metrics and HTTP server
-├── notify.ts             # Slack, Webhook, and SMTP notification channels
+├── notify.ts             # SMTP email notification dispatcher (Nodemailer)
 ├── tools.ts              # Subprocess spawner (mongodump/mongorestore)
 └── tar.ts                # POSIX UStar tar streaming generator & extractor
 ```
@@ -1930,17 +1949,17 @@ npm run check
 
 ### Testing and Verification
 
-MongoVault maintains both a fast unit/chaos test suite (`tests/*.test.js`) and a real MongoDB End-to-End integration suite (`tests/e2e/engines.e2e.test.js`) tested in CI across **MongoDB 7.0, 8.0, and 9.0** and **Node.js 24.x & 26.x**:
+MongoVault maintains both a fast unit/chaos/hardening test suite (`tests/*.test.js`) and a real MongoDB End-to-End integration suite (`tests/e2e/*.e2e.test.js`) tested in CI across **MongoDB 7.0, 8.0, and 9.0** and **Node.js 24.x & 26.x**:
 
-- **Unit & Fault-Injection Tests (`npm test`):**
+- **Unit, Hardening & Fault-Injection Tests (`npm test`):**
+  - `tests/hardening-*.test.js`: Regression and contract suites covering storage/crypto/locks (`hardening-scl`), logical (`hardening-logical`), physical (`hardening-physical`), PITR (`hardening-pitr`), sharding (`hardening-sharding`), ops/drill/status (`hardening-ops`), and CLI/config/daemon (`hardening-cli`).
   - `tests/chaos.test.js`: Fail-closed `OplogApplier` enforcement, precursor `prevOpTime` transaction bundling, stage-by-stage crash matrix (manifest write failure, oplog upload failure, mid-backup shard failure + orphan cleanup), S3 Range ETag mismatch, rollover gap alerts, and `REQUIRE_ENCRYPTION` enforcement.
   - `tests/physical-full.test.js` & `tests/physical.test.js`: Opt-in `fsyncLock` refusal, multi-node primary refusal, `FsyncUnlockError` propagation, fresh-client unlock retries, watchdog abort/unlock, and 3-step `PhysicalRecoveryCoordinator`.
   - `tests/archive-stream.test.js`, `tests/oplog-applier.test.js`, `tests/correctness.test.js`, `tests/tui.test.js`, `tests/crypto.test.js`, `tests/pipeline.test.js`, `tests/pitr.test.js`, `tests/lock.test.js`, `tests/retention.test.js`, `tests/sharding.test.js`, `tests/selective-restore.test.js`, `tests/drill.test.js`, `tests/status.test.js`, `tests/check.test.js`.
 - **Live MongoDB E2E Tests (`npm run test:e2e`):**
-  - **Logical Engine + PITR:** Encrypted full-cluster backup with `ArchiveOplogTap`, schema/validator/view drill verification, multi-document ACID + aborted transactions, index/DDL replay, DB-rename PITR, and interrupted restore recovery.
-  - **Physical Engine + Recovery + PITR:** Encrypted physical hot backup, live `mongod.lock` guard, full `PhysicalRecoveryCoordinator` with streaming physical PITR, index build in standalone mode, `local.system.replset` cleanup, and clean `mongod` boot verification.
-  - **Sharded Cluster Engine + PITR:** Real CSRS + 2 shards + `mongos`, encrypted `.cluster.enc` backup, recursive `verifyBackup`, real cross-shard distributed ACID transaction, programmatic `CsrsRestorer`, MongoDB 9.0 authoritative shard catalog sync, and sharded PITR before/after commit.
-  - **Sharded Cluster Concurrent Stress:** Continuous cross-shard 2PC balance transfers, intentionally aborted cross-shard transactions, and concurrent DDL executed _while_ the base sharded backup runs, proving exact monetary conservation (`sum(balances) === constant`) and zero partial/leaked transactions upon restore.
+  - `tests/e2e/engines.e2e.test.js` & `tests/e2e/storage-crypto-lock.e2e.test.js`: Core engine, S3 mock, envelope encryption, and multi-process lock E2E verification.
+  - `tests/e2e/logical-pitr-ops.e2e.test.js`: Encrypted full-cluster backup with `ArchiveOplogTap`, schema/validator/view drill verification, multi-document ACID + aborted transactions, index/DDL replay, DB-rename PITR, and interrupted restore recovery.
+  - `tests/e2e/physical-sharded-chaos.e2e.test.js`: Encrypted physical hot backup, live `mongod.lock` guard, `PhysicalRecoveryCoordinator` with streaming physical PITR, real CSRS + 2 shards + `mongos` sharded backup/restore, MongoDB 9.0 authoritative shard catalog sync, and concurrent cross-shard 2PC chaos stress.
 
 To run the test suites:
 
