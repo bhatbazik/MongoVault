@@ -196,7 +196,8 @@ export async function runCli(
 
   const logger = createLogger({
     level: config.logLevel,
-    pretty: process.stdout.isTTY && !parsedValues.json,
+    pretty: Boolean(process.stderr.isTTY && !parsedValues.json && command !== "daemon"),
+    destination: parsedValues.json || command !== "daemon" ? "stderr" : "stdout",
   });
   const storage = createStorage(config.storage);
   const notifier = createNotifier(config, logger);

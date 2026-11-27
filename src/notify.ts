@@ -7,6 +7,10 @@ import type { EmailOptions, NotificationFailureContext, Notifier } from "./types
 
 const SMTP_TIMEOUT_MS = 15_000;
 
+function sanitizeSecrets(text: string): string {
+  return text.replace(/mongodb(?:\+srv)?:\/\/([^:@\s]+):([^@\s]+)@/gi, "mongodb://$1:***@");
+}
+
 /**
  * Formats notification email subjects and body summaries.
  */
@@ -38,8 +42,8 @@ export class NotificationMessageBuilder {
     return [
       `Event: ${event}`,
       `Database: ${database || this.defaultDatabase}`,
-      `Error: ${error.message}`,
-      error.stack ? `\nStack:\n${error.stack}` : "",
+      `Error: ${sanitizeSecrets(error.message)}`,
+      error.stack ? `\nStack:\n${sanitizeSecrets(error.stack)}` : "",
     ].join("\n");
   }
 }
@@ -79,16 +83,32 @@ export class EmailNotifier implements Notifier {
 
   async sendEmail({ subject, text }: EmailOptions): Promise<void> {
     if (!this.mailer || !this.emailConfig) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      await this.mailer.sendMail({
-        from: this.emailConfig.from,
-        to: this.emailConfig.to.join(", "),
-        subject,
-        text,
-      });
+      await Promise.race([
+        this.mailer.sendMail({
+          from: this.emailConfig.from,
+          to: this.emailConfig.to.join(", "),
+          subject,
+          text,
+        }),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`SMTP sendMail timed out after ${SMTP_TIMEOUT_MS * 2}ms`)),
+            SMTP_TIMEOUT_MS * 2,
+          );
+          timer.unref?.();
+        }),
+      ]);
     } catch (error) {
       this.logger?.error({ err: error }, "Failed to send email notification");
+    } finally {
+      if (timer) clearTimeout(timer);
     }
+  }
+
+  close(): void {
+    this.mailer?.close?.();
   }
 
   async notifySuccess(

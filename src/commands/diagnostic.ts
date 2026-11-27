@@ -9,7 +9,9 @@ export class DiagnosticCommand implements CommandHandler {
       const bundle = await generateDiagnosticBundle({ config, storage });
       const jsonOutput = JSON.stringify(bundle, null, 2);
       if (values.output) {
-        await fs.writeFile(values.output, jsonOutput, "utf8");
+        const tmpPath = `${values.output}.tmp-${process.pid}-${Date.now()}`;
+        await fs.writeFile(tmpPath, jsonOutput, "utf8");
+        await fs.rename(tmpPath, values.output);
         console.log(`Diagnostic bundle written to ${values.output}`);
       } else {
         console.log(jsonOutput);

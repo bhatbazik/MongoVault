@@ -1,3 +1,4 @@
+import { acquireCommandLock } from "./command-lock.js";
 import { prune } from "../retention.js";
 import {
   badge,
@@ -12,6 +13,10 @@ import type { CliCommandContext, CommandHandler } from "./types.js";
 export class PruneCommand implements CommandHandler {
   async execute(ctx: CliCommandContext): Promise<void> {
     const { config, storage, logger, values } = ctx;
+    const lock = values["dry-run"]
+      ? null
+      : await acquireCommandLock(ctx, "backup", "Prune Lock Busy");
+    let failed = false;
     try {
       const result = await prune({ config, storage, logger }, { dryRun: values["dry-run"] });
       if (values.json) {
@@ -44,7 +49,10 @@ export class PruneCommand implements CommandHandler {
       );
     } catch (error) {
       logger.error({ err: error }, "Prune failed");
-      process.exit(1);
+      failed = true;
+    } finally {
+      await lock?.release();
     }
+    if (failed) process.exit(1);
   }
 }

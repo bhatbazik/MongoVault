@@ -1,5 +1,6 @@
 import { scopeOf } from "../catalog.js";
 import { formatBytes } from "../format.js";
+import { abortOnTerminationSignal, acquireCommandLock } from "./command-lock.js";
 import {
   captureOplogSlice,
   formatOplogTimestamp,
@@ -23,6 +24,9 @@ import type { CliCommandContext, CommandHandler } from "./types.js";
 export class OplogSliceCommand implements CommandHandler {
   async execute(ctx: CliCommandContext): Promise<void> {
     const { config, storage, logger, values } = ctx;
+    const lock = await acquireCommandLock(ctx, "oplog", "Oplog Slice Lock Busy");
+    const disposeSignals = abortOnTerminationSignal(lock.controller);
+    let failed = false;
     const spinner = createSpinner("Capturing incremental PITR oplog slice", {
       enabled: !values.json && Boolean(process.stderr.isTTY),
     });
@@ -30,7 +34,12 @@ export class OplogSliceCommand implements CommandHandler {
     try {
       if (config.sharding?.enabled) {
         const { captureShardedOplogSlices } = await import("../sharding.js");
-        const results = await captureShardedOplogSlices({ config, storage, logger });
+        const results = await captureShardedOplogSlices({
+          config,
+          storage,
+          logger,
+          signal: lock.controller.signal,
+        });
         spinner.stop();
         if (values.json) {
           console.log(JSON.stringify(results, null, 2));
@@ -75,7 +84,12 @@ export class OplogSliceCommand implements CommandHandler {
         return;
       }
 
-      const manifest = await captureOplogSlice({ config, storage, logger });
+      const manifest = await captureOplogSlice({
+        config,
+        storage,
+        logger,
+        signal: lock.controller.signal,
+      });
       spinner.stop();
       if (values.json) {
         console.log(JSON.stringify(manifest, null, 2));
@@ -116,8 +130,12 @@ export class OplogSliceCommand implements CommandHandler {
     } catch (error) {
       spinner.fail("Oplog slice capture failed");
       logger.error({ err: error }, "Oplog slice capture failed");
-      process.exit(1);
+      failed = true;
+    } finally {
+      disposeSignals();
+      await lock.release();
     }
+    if (failed) process.exit(1);
   }
 }
 
@@ -126,10 +144,21 @@ export class OplogTailCommand implements CommandHandler {
     const { config, storage, logger, notifier, metrics } = ctx;
     const archiver = startOplogArchiver({ config, storage, logger, notifier, metrics });
     archiver.start();
-    const shutdown = async (signal: string) => {
-      logger.info({ signal }, "Stopping continuous oplog archiver...");
-      await archiver.stop();
-      process.exit(0);
+    const keepalive = setInterval(() => {}, 60_000);
+    let shutdownPromise: Promise<void> | null = null;
+    const shutdown = (signal: string) => {
+      if (shutdownPromise) return shutdownPromise;
+      shutdownPromise = (async () => {
+        logger.info({ signal }, "Stopping continuous oplog archiver...");
+        clearInterval(keepalive);
+        try {
+          await archiver.stop();
+        } catch (err) {
+          logger.error({ err }, "Error while stopping oplog archiver");
+        }
+        process.exit(0);
+      })();
+      return shutdownPromise;
     };
     process.on("SIGINT", () => void shutdown("SIGINT"));
     process.on("SIGTERM", () => void shutdown("SIGTERM"));
@@ -152,13 +181,13 @@ export class OplogListCommand implements CommandHandler {
       }
       const perNode: Record<string, Awaited<ReturnType<typeof listOplogSlices>>> = {
         configsvr: await listOplogSlices(storage, {
-          prefix: `${config.storage.prefix}/configsvr`,
+          prefix: `${basePrefix}configsvr`,
           database: "*",
         }),
       };
       for (const shardId of [...shardIds].sort()) {
         perNode[shardId] = await listOplogSlices(storage, {
-          prefix: `${config.storage.prefix}/shards/${shardId}`,
+          prefix: `${basePrefix}shards/${shardId}`,
           database: "*",
         });
       }
@@ -266,6 +295,11 @@ export class OplogPruneCommand implements CommandHandler {
       );
       process.exit(1);
     }
+    const lock = values["dry-run"]
+      ? null
+      : await acquireCommandLock(ctx, "oplog", "Oplog Prune Lock Busy");
+    const disposeSignals = lock ? abortOnTerminationSignal(lock.controller) : () => {};
+    let failed = false;
     try {
       const result = await pruneOplogSlices(
         { config, storage, logger },
@@ -294,7 +328,11 @@ export class OplogPruneCommand implements CommandHandler {
       }
     } catch (error) {
       logger.error({ err: error }, "Oplog prune failed");
-      process.exit(1);
+      failed = true;
+    } finally {
+      disposeSignals();
+      await lock?.release();
     }
+    if (failed) process.exit(1);
   }
 }

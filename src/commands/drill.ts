@@ -1,5 +1,6 @@
 import { runDrill } from "../drill.js";
 import { formatDuration } from "../format.js";
+import { abortOnTerminationSignal } from "./command-lock.js";
 import {
   badge,
   createSpinner,
@@ -20,9 +21,12 @@ export class DrillCommand implements CommandHandler {
       { enabled: !values.json && Boolean(process.stderr.isTTY) },
     );
 
+    const controller = new AbortController();
+    const disposeSignals = abortOnTerminationSignal(controller);
+    let failed = false;
     try {
       const result = await runDrill(
-        { config, storage, logger },
+        { config, storage, logger, signal: controller.signal },
         values.pitr ? { pitr: values.pitr } : undefined,
       );
       spinner.succeed("Restore drill passed");
@@ -68,7 +72,10 @@ export class DrillCommand implements CommandHandler {
     } catch (error) {
       spinner.fail("Restore drill failed");
       logger.error({ err: error }, "Restore drill failed");
-      process.exit(1);
+      failed = true;
+    } finally {
+      disposeSignals();
     }
+    if (failed) process.exit(1);
   }
 }

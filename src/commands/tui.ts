@@ -1,8 +1,10 @@
+import path from "node:path";
 import readline from "node:readline";
-import { listBackups, scopeOf } from "../catalog.js";
+import { databasePrefix, listBackups, scopeOf } from "../catalog.js";
 import { runPreflightCheck, type PreflightCheckResult } from "../check.js";
 import { EngineRegistry } from "../engines.js";
 import { formatBytes, formatDate, formatDuration } from "../format.js";
+import { acquireHybridLock } from "../lock.js";
 import { formatOplogTimestamp, listOplogSlices } from "../oplog.js";
 import { describeBackup, verifyBackup } from "../restore.js";
 import { formatStatus, getStatus } from "../status.js";
@@ -459,13 +461,18 @@ export class TuiCommand implements CommandHandler {
         : "Refreshing telemetry…";
       draw();
       try {
+        let storageError: string | null = null;
         const [status, backups, slices, checks] = await Promise.all([
           getStatus({ config, storage, logger }),
-          listBackups(storage, scope).catch(() => [] as BackupSummary[]),
-          listOplogSlices(storage, scope).catch(() => [] as OplogSlice[]),
-          includeChecks || state.activeTab === "checks"
-            ? runPreflightCheck({ config, storage })
-            : Promise.resolve(state.checks),
+          listBackups(storage, scope).catch((err) => {
+            storageError = err instanceof Error ? err.message : String(err);
+            return [] as BackupSummary[];
+          }),
+          listOplogSlices(storage, scope).catch((err) => {
+            storageError = storageError ?? (err instanceof Error ? err.message : String(err));
+            return [] as OplogSlice[];
+          }),
+          includeChecks ? runPreflightCheck({ config, storage }) : Promise.resolve(state.checks),
         ]);
         state.status = status;
         state.backups = backups;
@@ -477,7 +484,9 @@ export class TuiCommand implements CommandHandler {
         );
         state.selectedSliceIdx = Math.min(state.selectedSliceIdx, Math.max(0, slices.length - 1));
         state.lastRefreshedAt = new Date();
-        state.toast = { text: "Telemetry refreshed", tone: "success" };
+        state.toast = storageError
+          ? { text: `Storage warning: ${storageError}`, tone: "warn" }
+          : { text: "Telemetry refreshed", tone: "success" };
       } catch (err) {
         state.toast = {
           text: `Refresh failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -536,14 +545,37 @@ export class TuiCommand implements CommandHandler {
       }
     };
 
+    let activeBackupController: AbortController | null = null;
     const runManualBackup = async () => {
       if (operationRunning) return;
       operationRunning = true;
       state.busyMessage = `Running ${config.engine || "logical"} backup…`;
       draw();
+      const controller = new AbortController();
+      activeBackupController = controller;
+      let releaseLock: (() => Promise<void>) | null = null;
       try {
+        releaseLock = await acquireHybridLock({
+          file: path.join(config.workDir, ".backup.lock"),
+          storage,
+          lockKey: `${databasePrefix(scope)}.locks/backup.lock.json`,
+          staleAfterMs: Math.max(config.timeoutMs + 60_000, 120_000),
+          logger,
+          onLost: (err) => {
+            controller.abort(err ?? new Error("Lost backup lock"));
+          },
+        });
+        if (!releaseLock) {
+          state.toast = { text: "Backup skipped: another backup lock is held", tone: "warn" };
+          return;
+        }
         const engine = EngineRegistry.resolveForBackup({ config });
-        const manifest = await engine.backup({ config, storage, logger });
+        const manifest = await engine.backup({
+          config,
+          storage,
+          logger,
+          signal: controller.signal,
+        });
         state.toast = {
           text: `Backup complete: ${manifest.key} (${formatBytes(manifest.size)} in ${formatDuration(manifest.durationMs)})`,
           tone: "success",
@@ -554,6 +586,8 @@ export class TuiCommand implements CommandHandler {
           tone: "error",
         };
       } finally {
+        activeBackupController = null;
+        await releaseLock?.().catch(() => {});
         state.busyMessage = null;
         operationRunning = false;
         await refreshAll(false);
@@ -563,8 +597,10 @@ export class TuiCommand implements CommandHandler {
     // Enter alternate screen buffer & hide cursor
     process.stdout.write("\x1b[?1049h\x1b[?25l");
     readline.emitKeypressEvents(process.stdin);
-    const prevRawMode = process.stdin.isRaw;
-    process.stdin.setRawMode(true);
+    const prevRawMode = process.stdin.isTTY ? process.stdin.isRaw : false;
+    if (process.stdin.isTTY) {
+      process.stdin.setRawMode(true);
+    }
     process.stdin.resume();
 
     await new Promise<void>((resolve) => {
@@ -577,8 +613,14 @@ export class TuiCommand implements CommandHandler {
         if (closed) return;
         closed = true;
         clearInterval(autoRefreshTimer);
+        activeBackupController?.abort(new Error("TUI exiting"));
         process.stdin.off("keypress", onKeypress);
+        process.stdin.off("error", cleanup);
+        process.stdin.off("end", cleanup);
         process.stdout.off("resize", draw);
+        process.off("SIGINT", onTerm);
+        process.off("SIGTERM", onTerm);
+        process.off("SIGHUP", onTerm);
         if (process.stdin.isTTY) {
           process.stdin.setRawMode(Boolean(prevRawMode));
         }
@@ -586,6 +628,7 @@ export class TuiCommand implements CommandHandler {
         process.stdout.write("\x1b[?25h\x1b[?1049l");
         resolve();
       };
+      const onTerm = () => cleanup();
 
       const onKeypress = (_str: string, key: readline.Key) => {
         if (closed) return;
@@ -690,7 +733,12 @@ export class TuiCommand implements CommandHandler {
       };
 
       process.stdin.on("keypress", onKeypress);
+      process.stdin.on("error", cleanup);
+      process.stdin.on("end", cleanup);
       process.stdout.on("resize", draw);
+      process.on("SIGINT", onTerm);
+      process.on("SIGTERM", onTerm);
+      process.on("SIGHUP", onTerm);
 
       draw();
       void refreshAll(false);

@@ -1,3 +1,4 @@
+import { acquireCommandLock } from "./command-lock.js";
 import { deleteBackup } from "../retention.js";
 import { badge, renderBanner, renderErrorBox, renderPanel } from "../tui.js";
 import type { CliCommandContext, CommandHandler } from "./types.js";
@@ -11,6 +12,10 @@ export class DeleteCommand implements CommandHandler {
       );
       process.exit(1);
     }
+    const lock = values["dry-run"]
+      ? null
+      : await acquireCommandLock(ctx, "backup", "Delete Lock Busy");
+    let failed = false;
     try {
       const result = await deleteBackup(
         { config, storage, logger },
@@ -33,7 +38,10 @@ export class DeleteCommand implements CommandHandler {
       }
     } catch (error) {
       logger.error({ err: error }, "Delete failed");
-      process.exit(1);
+      failed = true;
+    } finally {
+      await lock?.release();
     }
+    if (failed) process.exit(1);
   }
 }

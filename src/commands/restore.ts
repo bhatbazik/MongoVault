@@ -1,9 +1,15 @@
 import { EngineRegistry } from "../engines.js";
 import { formatBytes } from "../format.js";
 import {
+  abortOnTerminationSignal,
+  acquireCommandLock,
+  validateCommonFlags,
+} from "./command-lock.js";
+import {
   badge,
   createSpinner,
   renderBanner,
+  renderErrorBox,
   renderKeyValue,
   renderPanel,
   type KeyValueRow,
@@ -13,6 +19,42 @@ import type { CliCommandContext, CommandHandler } from "./types.js";
 export class RestoreCommand implements CommandHandler {
   async execute(ctx: CliCommandContext): Promise<void> {
     const { config, storage, logger, values } = ctx;
+    const flagError = validateCommonFlags(values);
+    if (flagError) {
+      console.error(renderErrorBox("Invalid Restore Flags", new Error(flagError)));
+      process.exit(1);
+    }
+    if (values.pitr && values["oplog-limit"]) {
+      console.error(
+        renderErrorBox(
+          "Invalid Restore Flags",
+          new Error("--pitr and --oplog-limit cannot be used together"),
+        ),
+      );
+      process.exit(1);
+    }
+    const effectiveEngine = values.engine ?? config.engine ?? "logical";
+    if (values["db-path"] && effectiveEngine === "logical") {
+      console.error(
+        renderErrorBox(
+          "Invalid Restore Flags",
+          new Error("--db-path is only supported with --engine physical"),
+        ),
+      );
+      process.exit(1);
+    }
+    if (effectiveEngine === "physical" && (values["ns-include"] || values["ns-exclude"])) {
+      console.error(
+        renderErrorBox(
+          "Invalid Restore Flags",
+          new Error("--ns-include and --ns-exclude are not supported with --engine physical"),
+        ),
+      );
+      process.exit(1);
+    }
+    const lock = await acquireCommandLock(ctx, "backup", "Restore Lock Busy");
+    const disposeSignals = abortOnTerminationSignal(lock.controller);
+    let failed = false;
     const spinner = createSpinner(
       values.pitr ? `Running PITR restore to ${values.pitr}` : "Running restore",
       { enabled: !values.json && Boolean(process.stderr.isTTY) },
@@ -31,6 +73,7 @@ export class RestoreCommand implements CommandHandler {
         config,
         storage,
         logger,
+        signal: lock.controller.signal,
         ref: values.key || "latest",
         uri: values.uri || config.mongo.uri,
         database: values.database,
@@ -129,7 +172,11 @@ export class RestoreCommand implements CommandHandler {
     } catch (error) {
       spinner.fail("Restore failed");
       logger.error({ err: error }, "Restore execution failed");
-      process.exit(1);
+      failed = true;
+    } finally {
+      disposeSignals();
+      await lock.release();
     }
+    if (failed) process.exit(1);
   }
 }

@@ -3,6 +3,7 @@ import { databasePrefix, isClusterScope, scopeOf } from "../catalog.js";
 import { EngineRegistry } from "../engines.js";
 import { formatBytes, formatDuration } from "../format.js";
 import { acquireHybridLock } from "../lock.js";
+import { abortOnTerminationSignal, validateCommonFlags } from "./command-lock.js";
 import {
   badge,
   createSpinner,
@@ -38,6 +39,22 @@ export class BackupCommand implements CommandHandler {
           new Error(
             "MONGODB_EXCLUDE_COLLECTIONS cannot be used with full cluster backup (database: * or all)",
           ),
+        ),
+      );
+      process.exit(1);
+    }
+
+    const flagError = validateCommonFlags(values);
+    if (flagError) {
+      console.error(renderErrorBox("Invalid Backup Flags", new Error(flagError)));
+      process.exit(1);
+    }
+    const effectiveEngine = values.engine ?? config.engine ?? "logical";
+    if (values["db-path"] && effectiveEngine === "logical") {
+      console.error(
+        renderErrorBox(
+          "Invalid Backup Flags",
+          new Error("--db-path is only supported with --engine physical"),
         ),
       );
       process.exit(1);
@@ -88,6 +105,8 @@ export class BackupCommand implements CommandHandler {
       },
     );
 
+    const disposeSignals = abortOnTerminationSignal(controller);
+    let failed = false;
     try {
       const engine = EngineRegistry.resolveForBackup({
         engine: values.engine,
@@ -147,9 +166,12 @@ export class BackupCommand implements CommandHandler {
         error instanceof Error ? error : new Error(String(error)),
       );
       logger.error({ err: error }, "Manual backup execution failed");
-      process.exit(1);
+      failed = true;
     } finally {
+      disposeSignals();
       await releaseLock();
     }
+    // Exit only after the lock has been released (process.exit inside catch skipped finally).
+    if (failed) process.exit(1);
   }
 }

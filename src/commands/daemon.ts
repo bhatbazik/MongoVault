@@ -16,11 +16,24 @@ export class DaemonCommand implements CommandHandler {
 
     scheduler.start();
 
-    const shutdown = async (signal: string) => {
-      logger.info({ signal }, "Received shutdown signal, stopping daemon...");
-      await scheduler.stop();
-      if (httpServer) await httpServer.close();
-      process.exit(0);
+    let shutdownPromise: Promise<void> | null = null;
+    const shutdown = (signal: string) => {
+      if (shutdownPromise) return shutdownPromise;
+      shutdownPromise = (async () => {
+        logger.info({ signal }, "Received shutdown signal, stopping daemon...");
+        try {
+          await scheduler.stop();
+        } catch (err) {
+          logger.error({ err }, "Error while stopping scheduler during daemon shutdown");
+        }
+        try {
+          if (httpServer) await httpServer.close();
+        } catch (err) {
+          logger.error({ err }, "Error while closing HTTP server during daemon shutdown");
+        }
+        process.exit(0);
+      })();
+      return shutdownPromise;
     };
 
     process.on("SIGINT", () => void shutdown("SIGINT"));

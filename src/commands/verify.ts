@@ -1,5 +1,6 @@
 import { formatBytes } from "../format.js";
 import { verifyBackup } from "../restore.js";
+import { abortOnTerminationSignal } from "./command-lock.js";
 import {
   badge,
   createSpinner,
@@ -17,8 +18,14 @@ export class VerifyCommand implements CommandHandler {
       enabled: !values.json && Boolean(process.stderr.isTTY),
     });
 
+    const controller = new AbortController();
+    const disposeSignals = abortOnTerminationSignal(controller);
+    let failed = false;
     try {
-      const result = await verifyBackup({ config, storage, logger }, values.key || "latest");
+      const result = await verifyBackup(
+        { config, storage, logger, signal: controller.signal },
+        values.key || "latest",
+      );
       spinner.succeed("Archive checksum & decryption verified");
 
       if (values.json) {
@@ -44,7 +51,10 @@ export class VerifyCommand implements CommandHandler {
     } catch (error) {
       spinner.fail("Verification failed");
       logger.error({ err: error }, "Verification failed");
-      process.exit(1);
+      failed = true;
+    } finally {
+      disposeSignals();
     }
+    if (failed) process.exit(1);
   }
 }

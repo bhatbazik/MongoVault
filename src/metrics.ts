@@ -151,7 +151,8 @@ export function startHttpServer({
 
   const server = http.createServer(async (req, res) => {
     try {
-      if (req.method === "GET" && (req.url === "/healthz" || req.url === "/ready")) {
+      const pathname = new URL(req.url || "/", "http://localhost").pathname;
+      if (req.method === "GET" && (pathname === "/healthz" || pathname === "/ready")) {
         const state = getState ? getState() : { status: "ok" };
         const isHealthy =
           state.status !== "error" && !("isShuttingDown" in state && Boolean(state.isShuttingDown));
@@ -160,7 +161,7 @@ export function startHttpServer({
         return;
       }
 
-      if (req.method === "GET" && req.url === "/metrics") {
+      if (req.method === "GET" && pathname === "/metrics") {
         const data = await metrics.getMetrics();
         res.writeHead(200, { "Content-Type": metrics.contentType });
         res.end(data);
@@ -171,8 +172,12 @@ export function startHttpServer({
       res.end("Not Found");
     } catch (error) {
       logger.error({ err: error }, "HTTP request handling error");
-      res.writeHead(500, { "Content-Type": "text/plain" });
-      res.end("Internal Server Error");
+      if (!res.headersSent) {
+        res.writeHead(500, { "Content-Type": "text/plain" });
+      }
+      if (!res.writableEnded) {
+        res.end("Internal Server Error");
+      }
     }
   });
 

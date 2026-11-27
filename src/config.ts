@@ -22,7 +22,21 @@ const flag = (fallback: boolean) =>
     .default(fallback ? "true" : "false")
     .transform((value) => value === "true" || value === "1");
 
-const count = z.coerce.number().int().nonnegative().optional();
+const count = z.coerce.number().int().nonnegative().finite().optional();
+
+const mongoUri = z
+  .string()
+  .min(1)
+  .refine((v) => /^mongodb(?:\+srv)?:\/\//i.test(v), {
+    message: "Must be a valid mongodb:// or mongodb+srv:// URI",
+  });
+
+const httpUrl = z
+  .string()
+  .url()
+  .refine((v) => /^https?:\/\//i.test(v), {
+    message: "Must be an http:// or https:// URL",
+  });
 
 const cronExpression = z
   .string()
@@ -42,31 +56,34 @@ const timezone = z.string().refine(
 
 const schema = z
   .object({
-    MONGODB_URI: z.string().min(1),
+    MONGODB_URI: mongoUri,
     MONGODB_DATABASE: z.string().default("*"),
     MONGODB_EXCLUDE_COLLECTIONS: list,
     MONGODB_OPLOG: flag(false),
-    MONGODB_PARALLEL_COLLECTIONS: z.coerce.number().int().min(1).max(32).default(2),
+    MONGODB_PARALLEL_COLLECTIONS: z.coerce.number().int().finite().min(1).max(32).default(2),
     MONGODB_READ_PREFERENCE: z
       .enum(["primary", "primaryPreferred", "secondary", "secondaryPreferred", "nearest"])
       .default("secondaryPreferred"),
 
     STORAGE_TYPE: z.enum(["s3", "filesystem"]).default("s3"),
     STORAGE_PATH: z.string().optional(),
-    S3_BUCKET: z.string().default("mongodb-backups"),
+    S3_BUCKET: z
+      .string()
+      .default("mongodb-backups")
+      .transform((v) => v.trim().replace(/^\/+|\/+$/g, "")),
     S3_ACCESS_KEY_ID: z.string().default(""),
     S3_SECRET_ACCESS_KEY: z.string().default(""),
-    S3_ENDPOINT: z.string().url().optional(),
+    S3_ENDPOINT: httpUrl.optional(),
     S3_REGION: z.string().optional(),
     AWS_REGION: z.string().optional(),
     S3_FORCE_PATH_STYLE: flag(false),
     S3_PREFIX: z.string().default("mongodb"),
-    S3_PART_SIZE_MB: z.coerce.number().int().min(5).max(512).default(32),
-    S3_QUEUE_SIZE: z.coerce.number().int().min(1).max(16).default(2),
+    S3_PART_SIZE_MB: z.coerce.number().int().finite().min(5).max(512).default(32),
+    S3_QUEUE_SIZE: z.coerce.number().int().finite().min(1).max(16).default(2),
 
     S3_OBJECT_LOCK_ENABLED: flag(false),
     S3_OBJECT_LOCK_MODE: z.enum(["GOVERNANCE", "COMPLIANCE"]).default("GOVERNANCE"),
-    S3_OBJECT_LOCK_RETENTION_DAYS: z.coerce.number().int().positive().default(30),
+    S3_OBJECT_LOCK_RETENTION_DAYS: z.coerce.number().int().finite().positive().default(30),
     S3_OBJECT_LOCK_LEGAL_HOLD: flag(false),
 
     BACKUP_ENGINE: z.enum(["logical", "physical"]).default("logical"),
@@ -75,14 +92,14 @@ const schema = z
     PHYSICAL_DIRECTORY_PER_DB: flag(false),
     PHYSICAL_ALLOW_FSYNC_LOCK: flag(false),
     PHYSICAL_ALLOW_PRIMARY_FSYNC_LOCK: flag(false),
-    PHYSICAL_FSYNC_LOCK_TIMEOUT_MS: z.coerce.number().int().positive().optional(),
+    PHYSICAL_FSYNC_LOCK_TIMEOUT_MS: z.coerce.number().int().finite().positive().optional(),
 
     SHARDING_ENABLED: flag(false),
-    SHARDING_CONFIGSVR_URI: z.string().optional(),
+    SHARDING_CONFIGSVR_URI: mongoUri.optional(),
 
     BACKUP_CRON: cronExpression.default("0 2 * * *"),
     BACKUP_TIMEZONE: timezone.default("UTC"),
-    BACKUP_TIMEOUT_MINUTES: z.coerce.number().positive().default(180),
+    BACKUP_TIMEOUT_MINUTES: z.coerce.number().finite().min(0.1).max(10_080).default(180),
     BACKUP_ON_START: flag(false),
     WORK_DIR: z.string().default(path.join(os.tmpdir(), "mongodb-backup")),
 
@@ -91,19 +108,19 @@ const schema = z
     REQUIRE_ENCRYPTION: flag(false),
 
     PITR_ENABLED: flag(false),
-    PITR_FLUSH_INTERVAL_SECONDS: z.coerce.number().int().min(5).max(3600).default(60),
-    PITR_MAX_SLICE_MB: z.coerce.number().int().min(1).max(256).default(16),
+    PITR_FLUSH_INTERVAL_SECONDS: z.coerce.number().int().finite().min(5).max(3600).default(60),
+    PITR_MAX_SLICE_MB: z.coerce.number().int().finite().min(1).max(256).default(16),
 
     RETENTION_KEEP_LAST: count,
     RETENTION_KEEP_DAILY: count,
     RETENTION_KEEP_WEEKLY: count,
     RETENTION_KEEP_MONTHLY: count,
 
-    DRILL_MONGODB_URI: z.string().optional(),
+    DRILL_MONGODB_URI: mongoUri.optional(),
     DRILL_CRON: cronExpression.optional(),
 
     SMTP_HOST: z.string().optional(),
-    SMTP_PORT: z.coerce.number().int().positive().default(587),
+    SMTP_PORT: z.coerce.number().int().finite().min(1).max(65535).default(587),
     SMTP_SECURE: flag(false),
     SMTP_USER: z.string().optional(),
     SMTP_PASSWORD: z.string().optional(),
@@ -112,7 +129,7 @@ const schema = z
 
     NOTIFY_ON_SUCCESS: flag(true),
 
-    HTTP_PORT: z.coerce.number().int().min(0).max(65535).default(8080),
+    HTTP_PORT: z.coerce.number().int().finite().min(0).max(65535).default(8080),
     LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace"]).default("info"),
   })
   .superRefine((env, ctx) => {
@@ -121,6 +138,27 @@ const schema = z
         code: "custom",
         path: ["SMTP_HOST"],
         message: "SMTP_FROM and SMTP_TO are required when SMTP_HOST is set",
+      });
+    }
+    if (Boolean(env.SMTP_USER) !== Boolean(env.SMTP_PASSWORD)) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["SMTP_USER"],
+        message: "SMTP_USER and SMTP_PASSWORD must both be set when using SMTP authentication",
+      });
+    }
+    if (env.DRILL_MONGODB_URI && env.DRILL_MONGODB_URI.trim() === env.MONGODB_URI.trim()) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["DRILL_MONGODB_URI"],
+        message: "DRILL_MONGODB_URI must not be identical to MONGODB_URI",
+      });
+    }
+    if (env.S3_OBJECT_LOCK_ENABLED && env.STORAGE_TYPE !== "s3") {
+      ctx.addIssue({
+        code: "custom",
+        path: ["S3_OBJECT_LOCK_ENABLED"],
+        message: "S3_OBJECT_LOCK_ENABLED is only supported when STORAGE_TYPE is s3",
       });
     }
     if (env.DRILL_CRON && !env.DRILL_MONGODB_URI) {
