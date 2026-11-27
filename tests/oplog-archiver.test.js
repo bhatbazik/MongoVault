@@ -47,10 +47,11 @@ describe("Oplog Archiver & Timestamp Helpers (oplog.ts)", () => {
       });
 
       archiver.start();
-      await new Promise((r) => setTimeout(r, 60));
+      await vi.waitFor(() =>
+        expect(notifier.notifyFailure).toHaveBeenCalledWith("pitr-oplog", expect.any(Error)),
+      );
       await archiver.stop();
 
-      expect(notifier.notifyFailure).toHaveBeenCalledWith("pitr-oplog", expect.any(Error));
       expect(storage.releaseLock).toHaveBeenCalled();
 
       // When lock is held by another process
@@ -69,9 +70,8 @@ describe("Oplog Archiver & Timestamp Helpers (oplog.ts)", () => {
         logger,
       });
       archiver2.start();
-      await new Promise((r) => setTimeout(r, 30));
+      await vi.waitFor(() => expect(logger.debug).toHaveBeenCalled());
       await archiver2.stop();
-      expect(logger.debug).toHaveBeenCalled();
     } finally {
       await fs.rm(workDir, { recursive: true, force: true });
     }
