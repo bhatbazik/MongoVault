@@ -72,6 +72,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Build TypeScript artifacts
+        run: npm run build
+
       - name: Run full test & coverage suite (Unit + Integration + Real MongoDB ${{ matrix.mongodb-version }} E2E)
         run: npm run test:coverage
 
